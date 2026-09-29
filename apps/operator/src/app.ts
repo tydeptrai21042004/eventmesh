@@ -250,6 +250,72 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     return transcript;
   };
 
+  const getEvidenceSummary: Handler = async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const record = store.getSession(req.params.id);
+    if (!record) return reply.code(404).send({ error: "SESSION_NOT_FOUND" });
+
+    const events = store.listEvents(req.params.id);
+    const paymentEvidence = store.listPaymentEvidence(req.params.id);
+    const conflicts = store.listConflicts(req.params.id);
+    const acceptedPayments = acceptedFiberPaymentHashes(events);
+    const evidencePaymentHashes = new Set(paymentEvidence.map((item) => item.claim.paymentHash.toLowerCase()));
+    const finalEvents = events.filter((item) => item.status === "FINAL" && !!item.ack);
+    const acceptedEvents = finalEvents.filter((item) => item.ack?.decision === "ACCEPT");
+    const rejectedEvents = finalEvents.filter((item) => item.ack?.decision === "REJECT");
+    const pendingEvents = events.filter((item) => item.status !== "FINAL" || !item.ack);
+    const closeDualSigned = !!record.close?.signatureA && !!record.close?.signatureB;
+    const fiberEvidenceComplete = acceptedPayments.every((hash) => evidencePaymentHashes.has(hash.toLowerCase()));
+
+    return {
+      sessionId: req.params.id,
+      protocol: record.signed.session.protocol,
+      status: record.status,
+      operators: {
+        distinct: record.signed.session.operatorA.toLowerCase() !== record.signed.session.operatorB.toLowerCase(),
+        bilateralSessionSigned: !!record.signed.signatureA && !!record.signed.signatureB
+      },
+      events: {
+        total: events.length,
+        final: finalEvents.length,
+        accepted: acceptedEvents.length,
+        rejected: rejectedEvents.length,
+        pending: pendingEvents.length
+      },
+      payments: {
+        acceptedClaims: acceptedPayments.length,
+        receiverEvidence: paymentEvidence.length,
+        evidenceComplete: acceptedPayments.length > 0 && fiberEvidenceComplete
+      },
+      conflicts: {
+        count: conflicts.length,
+        kinds: [...new Set(conflicts.map((item) => item.kind))]
+      },
+      close: {
+        present: !!record.close,
+        dualSigned: closeDualSigned,
+        transcriptRoot: record.close?.close.transcriptRoot,
+        finalStateHash: record.close?.close.finalStateHash,
+        paymentEvidenceRoot: record.close?.close.paymentEvidenceRoot
+      },
+      ckb: {
+        anchorStatus: record.anchor?.status ?? "NONE",
+        txHash: record.anchor?.txHash
+      },
+      readiness: {
+        bilateralSession: !!record.signed.signatureA && !!record.signed.signatureB,
+        allEventsFinal: events.length > 0 && pendingEvents.length === 0,
+        allEventsAccepted: events.length > 0 && pendingEvents.length === 0 && rejectedEvents.length === 0,
+        receiverPaymentEvidenceComplete: acceptedPayments.length > 0 && fiberEvidenceComplete,
+        fiberBound: acceptedPayments.length > 0 && fiberEvidenceComplete,
+        noRecordedConflicts: conflicts.length === 0,
+        closeDualSigned,
+        ckbCommitted: record.anchor?.status === "COMMITTED"
+      }
+    };
+  };
+
+
   const createSession: Handler = async (req, reply) => {
     if (!requireAdmin(req, reply)) return;
     const body = z.object({
@@ -662,6 +728,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.get("/admin/sessions", listSessions);
   app.get("/admin/sessions/:id", getSession);
   app.get("/admin/sessions/:id/transcript", getTranscript);
+  app.get("/admin/sessions/:id/evidence-summary", getEvidenceSummary);
   app.post("/admin/sessions", createSession);
   app.post("/admin/sessions/:id/events", proposeEvent);
   app.post("/admin/sessions/:id/events/:eventHash/retry", retryEvent);

@@ -1,44 +1,44 @@
-# EventMesh v0.2 — CKB/Fiber ecosystem merge patch
+# EventMesh v0.2 — Funding-Readiness Changelog
 
-This patch is intentionally a **validation/hardening release**, not a product-scope expansion.
+This patch intentionally improves **adoptability, validation, and reviewer evidence** without broadening EventMesh into adjacent CKB/Fiber products.
 
-## Protocol and evidence
+## Product / demo
 
-- upgraded the protocol to `eventmesh-v0.2.0` and CKB domain to `EVENTMESH_V02`;
-- retained immutable session/event/ACK/close behavior and durable conflict evidence;
-- distinguishes cross-operator same-sequence `PROPOSAL_COLLISION` from same-sender equivocation;
-- blocks normal close when an event is rejected;
-- binds the supplied final state to `finalStateHash`;
-- adds deterministic `paymentEvidenceRoot` over accepted canonical Fiber payment claims.
+- reframed project around cross-operator reconciliation after payment/application partial failures;
+- replaced stale v0.1/generic JSON demo with a v0.2 guided paid-service scenario;
+- added real receiver-invoice → sender-payment → receiver-FNN-verification UI path;
+- added evidence-summary UI, CKB lifecycle controls, transcript export, and safe replay/retry failure lab.
 
-## Fiber
+## Application semantics
 
-- keeps receiver-owned `get_invoice` + `Paid` as the acceptance authority;
-- verifies exact payment hash, session marker, amount and currency;
-- verifies the exact UDT type script when one is claimed, rather than carrying an unverified asset field;
-- keeps sender `get_payment == Success` only as optional corroboration;
-- persists receiver verification evidence and prevents one payment hash from satisfying multiple EventMesh sessions/events.
+- added `paidServiceReferenceAdapter`;
+- validates ordered event workflow and cross-event `requestId`/session invariants;
+- derives deterministic final state;
+- standalone verifier accepts `--adapter paid-service-reference` and checks close-state equivalence.
 
-## CKB
+## Reviewer evidence
 
-- CKB commitment now covers `SHA256(sessionId)`, `transcriptRoot`, `finalStateHash` and `paymentEvidenceRoot`;
-- peer/verifier reconstructs expected commitment bytes locally;
-- committed status and exact output data are required;
-- adds explicit PENDING -> COMMITTED reconciliation and peer-notification retry.
+- added `/admin/sessions/:id/evidence-summary`;
+- added strict grant-closure evidence manifest checker;
+- requires external integration, restart/no-manual-edit/exactly-once statements, and validation-interview conclusion;
+- added adopter integration guide and funding-readiness checklist.
 
-## Engineering and reviewability
+## Operations / reproducibility
 
-- restores a testable Fastify `buildOperatorApp` application factory;
-- separates canonical `/admin/*`, `/peer/*` and minimal public APIs while keeping v0.1 compatibility aliases;
-- adds stronger peer URL/SSRF, timeout, redirect, CORS and admin-token controls;
-- adds a small `@eventmesh/adapter-sdk` boundary instead of embedding game/device/business semantics in core;
-- expands core, Fiber, CKB, store, security and two-operator integration regression tests;
-- adds CI, `.env.example`, ecosystem positioning, protocol, threat-model and verification docs.
+- added environment template and ignore files;
+- pinned Docker runtime to Node 22.16.0;
+- added CI workflow;
+- gave Operator B CKB RPC verification access while keeping anchor broadcasting disabled on B;
+- updated smoke script to canonical v0.2 admin routes and evidence-summary assertions.
 
-## Ecosystem scope decision
+## Funding / ecosystem positioning
 
-EventMesh remains a bilateral application-evidence layer above Fiber and CKB. It deliberately does not add wallet permissions, routing/LSP/liquidity, generic paid HTTP, metering, escrow, reputation, marketplace, AI-agent orchestration, token issuance, multilateral consensus or per-event on-chain storage.
+- changed the proposal into a $1,000 validation milestone;
+- moved one independently maintained application integration inside funded scope;
+- made receiver restart/lost-response recovery the primary proof;
+- documented non-overlap with Fiber, Clasp, FiberLatch Access, Myelin, and generic event buses;
+- added continue/narrow/stop criteria instead of assuming demand.
 
-## Validation note
+## Intentionally not added
 
-The patch is designed for Node 22. In the artifact-generation environment, registry access returned DNS `EAI_AGAIN`, so dependency-backed Vitest/typecheck/build execution could not be completed. Syntax-level TypeScript transpilation, JSON/YAML parsing and archive integrity are checked before packaging. Run `npm install --no-audit --no-fund && npm run verify:all` on a networked machine before tagging or publishing Testnet evidence.
+No wallet permissions, Fiber routing/LSP/liquidity, metering, generic paid HTTP, access tokens, escrow, marketplace, reputation, DID, AI-agent framework, arbitration, custom token, custom CKB script, on-chain event log, or multilateral consensus.

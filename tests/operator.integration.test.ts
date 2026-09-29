@@ -139,3 +139,45 @@ describe("two-operator HTTP + separate SQLite protocol", () => {
     expect(a.store.listConflicts(id).filter((conflict) => conflict.kind === "ACK")).toHaveLength(1);
   });
 });
+
+describe("reviewer evidence summary", () => {
+  it("reports bilateral acceptance and a dual-signed close without pretending local smoke is Fiber-bound", async () => {
+    const { a, b } = await pair();
+    const signed = await createSession(a);
+    const id = signed.session.sessionId;
+
+    const eventResponse = await a.app.inject({
+      method: "POST",
+      url: `/admin/sessions/${id}/events`,
+      payload: { type: "SERVICE_REQUESTED", payload: { requestId: "req-summary", service: "demo" } }
+    });
+    expect(eventResponse.statusCode).toBe(201);
+    const event = eventResponse.json();
+    expect((await b.app.inject({
+      method: "POST",
+      url: `/admin/sessions/${id}/events/${event.eventHash}/ack`,
+      payload: { decision: "ACCEPT" }
+    })).statusCode).toBe(200);
+
+    expect((await a.app.inject({
+      method: "POST",
+      url: `/admin/sessions/${id}/close`,
+      payload: { finalState: { requestId: "req-summary", completed: true } }
+    })).statusCode).toBe(200);
+
+    const response = await a.app.inject({ method: "GET", url: `/admin/sessions/${id}/evidence-summary` });
+    expect(response.statusCode).toBe(200);
+    const summary = response.json();
+    expect(summary.events).toMatchObject({ total: 1, final: 1, accepted: 1, rejected: 0, pending: 0 });
+    expect(summary.readiness).toMatchObject({
+      bilateralSession: true,
+      allEventsFinal: true,
+      allEventsAccepted: true,
+      fiberBound: false,
+      noRecordedConflicts: true,
+      closeDualSigned: true,
+      ckbCommitted: false
+    });
+    expect(summary.ckb.anchorStatus).toBe("NONE");
+  });
+});

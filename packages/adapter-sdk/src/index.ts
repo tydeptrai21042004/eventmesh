@@ -11,6 +11,7 @@ export interface EventMeshAdapter<TState = unknown> {
   name: string;
   eventTypes: readonly string[];
   validateEvent(event: SignedEvent): AdapterValidation;
+  validateTranscript?(transcript: TranscriptExport): AdapterValidation;
   deriveFinalState(transcript: TranscriptExport): TState;
 }
 
@@ -28,6 +29,12 @@ export function validateTranscriptWithAdapter<TState>(
     const result = adapter.validateEvent(event);
     if (!result.ok) errors.push(`Event ${event.sequence}: ${result.reason}`);
   }
+  if (!errors.length && adapter.validateTranscript) {
+    const result = adapter.validateTranscript(transcript);
+    if (!result.ok) errors.push(result.reason);
+  }
   if (errors.length) return { ok: false, errors };
   return { ok: true, errors, finalState: adapter.deriveFinalState(transcript) };
 }
+
+export { paidServiceReferenceAdapter, PAID_SERVICE_EVENT_TYPES } from "./paid-service.js";

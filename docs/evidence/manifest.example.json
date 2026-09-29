@@ -1,0 +1,24 @@
+{
+  "sessionId": "ses_replace_me",
+  "operatorAUrl": "https://operator-a.example",
+  "operatorBUrl": "https://operator-b.example",
+  "fiberPaymentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "ckbTxHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "transcriptFile": "transcript.json",
+  "externalIntegration": {
+    "repository": "https://github.com/replace/independent-project",
+    "commit": "replace-with-commit-sha",
+    "maintainer": "replace-with-maintainer-or-org"
+  },
+  "failureScenario": {
+    "name": "receiver restart after Fiber payment before application ACK",
+    "result": "replace-with-observed-result",
+    "receiverRestarted": true,
+    "manualDatabaseEdits": false,
+    "exactlyOneBusinessTransition": true
+  },
+  "validation": {
+    "interviewCount": 3,
+    "conclusion": "replace with evidence-based continue / narrow / stop conclusion"
+  }
+}

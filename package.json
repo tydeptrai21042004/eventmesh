@@ -20,7 +20,9 @@
     "verify": "tsx apps/verifier/src/index.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build",
-    "verify:all": "npm run check"
+    "verify:all": "npm run check",
+    "smoke": "node scripts/smoke.mjs",
+    "evidence:check": "node scripts/evidence-check.mjs"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
@@ -28,5 +30,6 @@
     "tsx": "4.20.5",
     "typescript": "5.9.2",
     "vitest": "3.2.4"
-  }
+  },
+  "packageManager": "npm@10.9.2"
 }

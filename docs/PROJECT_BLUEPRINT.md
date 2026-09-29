@@ -1,63 +1,100 @@
-# EventMesh v0.2 Final Blueprint
+# EventMesh v0.2 — Funding-Ready Blueprint
 
 ## Product identity
 
-EventMesh is a reusable bilateral evidence layer between independent application operators on CKB/Fiber.
+EventMesh is a **bilateral application reconciliation layer** for independently operated CKB/Fiber applications.
 
 ```text
-applications
-    |
-EventMesh
-    |\
-    | \-- Fiber: optional value transfer + receiver verification
-    |
-    \---- CKB: compact durable final commitment
+Application A                         Application B
+      |                                     |
+      +------ EventMesh reconciliation -----+
+                    |              |
+                    |              +-- Fiber: value/payment evidence
+                    |
+                    +----------------- CKB: durable final checkpoint
 ```
 
-The project is intentionally application-neutral and deliberately avoids duplicating wallet/payment/routing/escrow infrastructure.
+The project should not be marketed as a generic event bus. Its narrow product question is whether two independent operators can recover and prove the same payment-linked application state after retries, crashes, or partial failures.
 
-## v0.2 architecture decisions
+## Core protocol responsibilities
 
-### Keep in core
+Keep in core:
 
 - `SignedSession`;
 - `SignedEvent`;
 - `SignedAck`;
 - `SignedClose`;
-- deterministic hash chain and transcript root;
+- deterministic hash chain/transcript root;
+- durable conflict evidence;
 - deterministic Fiber claim root;
 - standalone verification.
 
-### Keep as adapters
+## Adapter responsibilities
+
+Keep as adapters:
 
 - Fiber JSON-RPC;
 - CKB/CCC anchoring;
-- application semantics (`@eventmesh/adapter-sdk`).
+- application semantic validation/final-state derivation through `@eventmesh/adapter-sdk`.
 
-### Keep outside EventMesh
+The reference paid-service adapter additionally proves that transcript-level invariants can be checked without moving application execution into EventMesh.
 
-Wallet permissions, x402 gateways, generic metering, routing/LSP/liquidity, escrow, marketplaces, reputation, DID, AI-agent orchestration, token issuance and multilateral consensus.
+## Keep outside EventMesh
+
+- wallet permissions and spending policy;
+- x402 gateways and generic paid HTTP;
+- access receipts/redemption;
+- generic usage metering;
+- routing/LSP/liquidity operations;
+- escrow, marketplace, reputation, DID;
+- AI-agent orchestration;
+- application VM/runtime/finality/court;
+- token issuance;
+- multilateral consensus.
 
 ## Evidence model
 
 ```text
-A proposes signed event
+A proposes signed business event
         |
         v
 B validates application semantics
         |
         +-- if PAYMENT_SETTLED:
         |      B -> own FNN -> get_invoice
-        |      verify Paid/hash/amount/currency/session/UDT
+        |      require Paid/hash/amount/currency/session/UDT
         |
         v
 B signs ACCEPT ACK
         |
         v
-both stores contain same final event + ACK
+both durable stores converge on same final event + ACK
+        |
+        v
+both sign same close
 ```
 
-Payment claims are then Merkleized into `paymentEvidenceRoot`, so the CKB commitment covers the complete claimed economic context rather than only payment hashes.
+Sender-side payment status may be retained for debugging but is not an acceptance authority.
+
+## Reviewer evidence model
+
+The operator exposes:
+
+```text
+GET /admin/sessions/:id/evidence-summary
+```
+
+which summarizes:
+
+- bilateral session signatures;
+- event/final/accepted/rejected/pending counts;
+- accepted Fiber claims and receiver evidence;
+- conflict count/kinds;
+- close roots and dual-signature state;
+- CKB anchor state;
+- readiness flags.
+
+This makes demonstrations legible while keeping trust-minimized verification in the standalone verifier.
 
 ## CKB commitment
 
@@ -69,20 +106,23 @@ EVENTMESH_V02
 || paymentEvidenceRoot
 ```
 
-No custom CKB script is required for this validation milestone. A custom script should be considered only if a later application requires on-chain enforcement rather than evidence anchoring.
+No custom CKB script is required for the validation milestone. CKB is the durable verification/checkpoint layer, not the execution layer.
 
-## Repository direction
+For production-scale traffic, evaluate batching session commitments into a higher-level root only after real demand appears.
+
+## Repository structure
 
 ```text
 apps/
   operator/
   verifier/
-  demo/
+  demo/                 # guided reconciliation + failure lab
 packages/
   core/
   fiber/
   ckb/
   adapter-sdk/
+    src/paid-service.ts # reference semantics only
 tests/
   core.test.ts
   fiber.test.ts
@@ -90,45 +130,57 @@ tests/
   store.test.ts
   security.test.ts
   operator.integration.test.ts
+  adapter.test.ts
+scripts/
+  smoke.mjs
+  evidence-check.mjs
 docs/
   PROTOCOL.md
   THREAT_MODEL.md
   HOW_TO_VERIFY.md
   ECOSYSTEM_POSITIONING.md
+  MARKET_GAP_AND_VALIDATION.md
+  FUNDING_PROPOSAL_DRAFT.md
+  FUNDING_READINESS_CHECKLIST.md
+  evidence/manifest.example.json
 ```
 
-The operator now exposes a `buildOperatorApp` application factory, so HTTP-level bilateral integration tests can run with ephemeral ports and separate SQLite stores without spawning shell processes. The next structural work should be operational rather than architectural: independent-host deployment, real FNN evidence, and CKB reconciliation measurements.
+## Funded milestone sequence
 
-## Milestones
+### M1 — independent adopter
 
-### M1 — protocol/evidence hardening (implemented in this patch)
+Integrate a 3–5-event adapter into one independently maintained CKB/Fiber application/service and record the baseline pain.
 
-- v0.2 domain and commitment;
-- rich Fiber claim;
-- receiver-owned verification;
-- exact optional UDT verification;
-- payment reuse protection;
-- payment evidence persistence/root;
-- rejected-event close prevention;
-- independent CKB verification/reconciliation;
-- stronger verifier/tests/CI.
+### M2 — real Fiber partial failure
 
-### M2 — real Fiber Testnet proof
+Two independent operator/FNN environments execute a payment; receiver crashes or loses the response before application settlement completes; restart and recover without DB edits or duplicate accepted state.
 
-Publish invoice/payment hash and a sanitized transcript showing receiver-owned `Paid` verification.
+### M3 — CKB committed proof
 
-### M3 — real CKB Testnet proof
+Dual-sign the close, publish `EVENTMESH_V02`, reconcile to COMMITTED, and let the peer + standalone verifier independently reconstruct the proof.
 
-Publish committed tx hash and standalone verifier output.
+### M4 — user validation
 
-### M4 — independent hosts
+Interview/use-test 3–5 relevant builders, preserve negative feedback, measure integration/recovery overhead, and decide continue/narrow/stop.
 
-A and B must use separate machines, keys, stores and FNN nodes.
+## The funding demo should emphasize failure
 
-### M5 — one external CKBuilder application adapter
+The strongest demo is not:
 
-Integrate only 3–5 meaningful game/device/service event types. Avoid creating another EventMesh-owned application solely for the demo.
+```text
+request → payment → close
+```
 
-### M6 — reliability measurements
+It is:
 
-Measure delivery retry, process restart, temporary FNN failure, temporary CKB RPC failure and anchor-notification recovery. Publish the failures and recovery behavior rather than only screenshots.
+```text
+payment succeeds
+→ receiver state/response becomes uncertain
+→ receiver restarts
+→ payment is re-verified
+→ duplicate/replay does not create a second business transition
+→ both operators converge
+→ third party verifies final proof
+```
+
+That is the market pain the protocol is designed to test.

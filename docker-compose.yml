@@ -9,6 +9,7 @@ services:
       SELF_URL: http://operator-a:4000
       DEFAULT_PEER_URL: http://operator-b:4000
       DATA_DIR: /data
+      OPERATOR_PRIVATE_KEY: ${OPERATOR_A_PRIVATE_KEY:-}
       PUBLIC_MODE: ${PUBLIC_MODE:-false}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
@@ -17,7 +18,8 @@ services:
       PEER_REQUEST_TIMEOUT_MS: ${PEER_REQUEST_TIMEOUT_MS:-10000}
       FIBER_ENABLED: ${FIBER_ENABLED:-false}
       FIBER_RPC_URL: ${OPERATOR_A_FIBER_RPC_URL:-}
-      FIBER_RPC_TOKEN: ${FIBER_RPC_TOKEN:-}
+      FIBER_RPC_TOKEN: ${OPERATOR_A_FIBER_RPC_TOKEN:-}
+      FIBER_RPC_TIMEOUT_MS: ${FIBER_RPC_TIMEOUT_MS:-10000}
       CKB_ENABLED: ${CKB_ENABLED:-false}
       CKB_PRIVATE_KEY: ${CKB_PRIVATE_KEY:-}
       CKB_RPC_URL: ${CKB_RPC_URL:-}
@@ -37,6 +39,7 @@ services:
       SELF_URL: http://operator-b:4000
       DEFAULT_PEER_URL: http://operator-a:4000
       DATA_DIR: /data
+      OPERATOR_PRIVATE_KEY: ${OPERATOR_B_PRIVATE_KEY:-}
       PUBLIC_MODE: ${PUBLIC_MODE:-false}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
@@ -45,8 +48,10 @@ services:
       PEER_REQUEST_TIMEOUT_MS: ${PEER_REQUEST_TIMEOUT_MS:-10000}
       FIBER_ENABLED: ${FIBER_ENABLED:-false}
       FIBER_RPC_URL: ${OPERATOR_B_FIBER_RPC_URL:-}
-      FIBER_RPC_TOKEN: ${FIBER_RPC_TOKEN:-}
+      FIBER_RPC_TOKEN: ${OPERATOR_B_FIBER_RPC_TOKEN:-}
+      FIBER_RPC_TIMEOUT_MS: ${FIBER_RPC_TIMEOUT_MS:-10000}
       CKB_ENABLED: "false"
+      CKB_RPC_URL: ${CKB_RPC_URL:-}
     volumes: ["operator-b-data:/data"]
     ports: ["4002:4000"]
     extra_hosts: ["host.docker.internal:host-gateway"]

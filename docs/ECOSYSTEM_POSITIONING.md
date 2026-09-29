@@ -2,124 +2,132 @@
 
 _Last reviewed: 2026-09-29._
 
-## Final project boundary
+## Product boundary
 
-EventMesh is **not** a Fiber payment SDK and **not** a generic event bus anchored to a blockchain.
-
-It is an application-neutral **bilateral cross-operator evidence layer**:
-
-1. two independently operated applications exchange signed, hash-linked events;
-2. the counterparty explicitly ACCEPTs or REJECTs each exact event hash;
-3. a `PAYMENT_SETTLED` event can be accepted only after the receiver independently queries its own Fiber node and verifies the invoice;
-4. both operators sign one final transcript/state commitment;
-5. a compact commitment is published to CKB and can be independently reconstructed and verified.
+EventMesh should be described as **cross-operator application reconciliation**, not a generic event protocol.
 
 ```text
-application A                                      application B
-     |                                                  |
-operator A  <---- signed event / signed ACK ---->  operator B
-     |                                                  |
-   FNN A  -------- optional Fiber value --------->    FNN B
-                                                        |
-                                      receiver get_invoice verification
-                         \                              /
-                          +---- dual-signed close -----+
-                                      |
-                           compact EVENTMESH_V02
-                                      |
-                                     CKB
-                                      |
-                            standalone verifier
+Fiber:      payment state
+EventMesh:  mutually accepted application state around that payment
+CKB:        durable public checkpoint of the final bilateral proof
 ```
+
+The concrete question is:
+
+> After a payment, retry, timeout, or restart, can two independently operated applications prove which exact business event and final state they both accepted without treating either local database as unilateral truth?
 
 ## Why this boundary fits the current ecosystem
 
-Fiber v0.9 is already a serious payment network. Its current development direction includes payment reliability/recovery, hosted-LSP/mobile architecture, browser/WASM integration, liquidity work and programmable conditional payments. EventMesh should consume Fiber rather than reimplement those areas.
+Fiber v0.9 is already focused on payment/channel reliability, recovery, reconnect behavior, mobile/hosted-LSP architecture, routing and broader payment infrastructure. Reimplementing those layers would create overlap rather than ecosystem value.
 
-The July 2026 "Gone in 60ms" infrastructure hackathon reported 66 submissions across wallet/payment UX, node/routing/diagnostics and merchant/liquidity/LSP tooling. That makes another generic payment wrapper, router, wallet policy engine or metering product a weak differentiation strategy.
+The August 2026 ecosystem opportunity map explicitly places generic metering and paid-access receipts in **reuse existing components** territory, while **cross-operator game/device events** remain a frontier hypothesis whose user/trust model needs evidence.
 
-CKB itself describes L1 as a Universal Verification Layer: computation can remain above L1 while durable verification/common knowledge is committed to CKB. EventMesh follows that shape: application interaction and payment verification happen off-chain; CKB receives one compact final commitment.
+EventMesh should therefore validate that frontier instead of adding another wallet, metering, paid-HTTP, or receipt product.
 
-The CKBuilder tracker also contains real applications such as CKB Arcade, Dragon Rush and CKB Geo-Wars. The strongest external validation for EventMesh is therefore one small adapter into an independently maintained game/device/service application, not another EventMesh-owned toy product.
+## Neighbor boundaries
 
-## What EventMesh deliberately does not own
+### Fiber
 
-Do not add these to the core project:
+Owns payment/channel/network state. EventMesh consumes invoice/payment evidence; it never becomes a payment rail or router.
 
-- wallet/spending permission policy;
-- Fiber routing, LSP or liquidity management;
-- generic x402 or paid-HTTP gateway;
-- generic usage metering;
-- escrow, milestones or arbitration;
-- marketplace/reputation/DID;
-- AI-agent framework;
-- token issuance;
-- multilateral consensus;
-- per-event on-chain storage.
+### Clasp
 
-Those can be applications or neighboring components. EventMesh should remain the evidence boundary between independently operated applications.
+Clasp provides scoped, revocable application authority over Fiber wallets with permission/spending policy. EventMesh must not add wallet session permissions, budgets, delegation, or revocation.
 
-## CKB-native economic/evidence loop
+### FiberLatch Access
 
-The important CKB/Fiber-specific story is the full loop, not "we anchor a hash":
+FiberLatch Access takes a payment/business decision the host already trusts and issues/redeems signed access receipts. EventMesh must not add paid-resource receipts or access-token redemption.
+
+### Myelin
+
+Myelin is an off-chain CKB-aligned state-execution/session runtime with finality/dispute evidence. EventMesh must not execute arbitrary application state, implement a court/challenge system, or claim consensus/finality.
+
+### Generic event middleware
+
+EventMesh is not pub/sub, routing, fan-out, consumer groups, or event storage infrastructure. It is intentionally bilateral and evidence-oriented.
+
+## The CKB/Fiber-native loop
 
 ```text
-CKB / UDT value
+application event
       |
       v
-Fiber invoice/payment
+signed exact counterparty ACK
       |
       v
-receiver-owned verification
+optional Fiber payment claim
       |
       v
-PAYMENT_SETTLED application event
+receiver independently queries own FNN
       |
       v
-signed counterparty ACK
+PAYMENT_SETTLED accepted
       |
       v
 paymentEvidenceRoot + transcriptRoot + finalStateHash
       |
       v
-EVENTMESH_V02 CKB commitment
+dual-signed close
+      |
+      v
+EVENTMESH_V02 checkpoint on CKB
+      |
+      v
+third-party standalone verification
 ```
 
-## v0.2 proof target
+The story is the complete loop, not merely "store a hash on CKB."
 
-A funding-grade proof should demonstrate all of the following at once:
+## What funding should validate
+
+The strongest evidence is not another EventMesh-owned application. It is:
 
 ```text
-different operator organizations/owners
-+ different machines
-+ different private keys
-+ different SQLite databases
-+ different FNN nodes
-+ real Fiber Testnet value
-+ receiver-owned invoice verification
-+ one mutually accepted transcript
+one independently maintained CKB/Fiber application
++ tiny 3–5-event adapter
++ two separately operated EventMesh/FNN environments
++ real Fiber payment
++ real restart/lost-response failure
++ recovery without manual DB edit
 + one dual-signed close
-+ one committed CKB Testnet transaction
-+ one standalone verifier reproducing the result
++ one committed CKB Testnet checkpoint
++ one fresh-machine verifier run
++ adopter feedback
 ```
 
-## Suggested first external adapter
+## Do not add to core
 
-Prefer one existing CKBuilder game/device project because cross-operator game/device events naturally demonstrate bilateral application evidence. Keep the integration intentionally small: 3–5 application event types are enough.
+- wallet/spending policy;
+- Fiber routing, LSP, liquidity management;
+- x402/paid HTTP gateway;
+- access receipts/redemption;
+- usage metering;
+- escrow, milestone or arbitration logic;
+- marketplace, provider discovery or reputation;
+- DID/agent framework;
+- application VM or off-chain consensus;
+- custom token;
+- per-event CKB storage.
 
-The new `@eventmesh/adapter-sdk` package therefore exposes only two responsibilities:
+## When EventMesh is not needed
 
-- validate application events;
-- deterministically derive final application state.
+EventMesh is probably unnecessary when:
 
-It does not expose payment authority, wallets, routing, escrow or consensus.
+- one backend is already trusted as authoritative;
+- ordinary database idempotency and webhook retry semantics are sufficient;
+- no independent operator needs to sign acceptance;
+- no later third-party verification matters;
+- the interaction is a simple one-shot checkout with no cross-operator application state.
 
-## Primary public references
+Publishing this negative boundary strengthens the funding case because it prevents the project from pretending to be universal infrastructure.
 
-- Fiber repository / roadmap: https://github.com/nervosnetwork/fiber
-- Fiber v0.9 dev log: https://github.com/nervosnetwork/fiber/discussions/1631
-- Fiber invoice specification: https://github.com/nervosnetwork/fiber/blob/develop/docs/specs/payment-invoice.md
-- Fiber public-node payment examples: https://github.com/nervosnetwork/fiber/blob/develop/docs/public-nodes.md
-- Gone in 60ms results: https://talk.nervos.org/t/gone-in-60ms-fiber-network-infrastructure-hackathon-results/10671
-- CKBuilder tracker: https://github.com/Nervos-Community-Catalyst/CKBuilder-projects
-- CKB repository / Universal Verification Layer description: https://github.com/nervosnetwork/ckb
+## Public references
+
+- Opportunity map: https://talk.nervos.org/t/ai-machine-payments-and-fiber-in-2026-an-opportunity-map-for-ckb-and-fiber-developers/10665
+- Fiber: https://github.com/nervosnetwork/fiber
+- Fiber v0.9 recovery: https://github.com/nervosnetwork/fiber/discussions/1610
+- Fiber post-v0.9 direction: https://github.com/nervosnetwork/fiber/discussions/1631
+- Fiber invoice/payment examples: https://github.com/nervosnetwork/fiber/blob/develop/docs/public-nodes.md
+- Clasp: https://github.com/Enoch208/Clasp
+- FiberLatch Access: https://talk.nervos.org/t/dis-fiberlatch-access-open-source-access-control-for-fiber-payments/10414
+- Myelin: https://talk.nervos.org/t/introducing-myelin-a-ckb-aligned-off-chain-cell-session-runtime/10498

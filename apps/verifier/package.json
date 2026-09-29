@@ -6,6 +6,7 @@
   "dependencies": {
     "@eventmesh/core": "0.2.0",
     "@eventmesh/ckb": "0.2.0",
-    "@eventmesh/fiber": "0.2.0"
+    "@eventmesh/fiber": "0.2.0",
+    "@eventmesh/adapter-sdk": "0.2.0"
   }
 }

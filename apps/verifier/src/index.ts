@@ -2,11 +2,13 @@ import { readFileSync } from "node:fs";
 import {
   acceptedFiberPaymentClaims,
   buildAnchorDataHex,
+  canonical,
   verifyTranscript,
   type TranscriptExport
 } from "@eventmesh/core";
 import { verifyAnchorRpcDetailed } from "@eventmesh/ckb";
 import { FiberRpcClient } from "@eventmesh/fiber";
+import { paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
 
 function usage() {
   console.error(`Usage:
@@ -16,6 +18,7 @@ Options:
   --ckb-rpc <url>              Independently query CKB get_transaction
   --receiver-fiber-rpc <url>   Independently query receiver FNN get_invoice
   --fiber-token <token>        Optional FNN bearer token
+  --adapter <name>             Validate application semantics (paid-service-reference)
   --require-close              Fail unless a dual-signed close exists
   --require-fiber              Fail unless at least one Fiber claim exists and all are receiver-verified
   --require-ckb                Fail unless a committed matching CKB anchor is independently verified
@@ -56,6 +59,29 @@ let failed = !offline.ok;
 console.log("EventMesh v0.2 Independent Verification");
 console.log(`[${offline.ok ? "PASS" : "FAIL"}] offline transcript invariants`);
 for (const error of offline.errors) console.log(`       ${error}`);
+
+const adapterName = flags.get("--adapter");
+if (adapterName) {
+  if (adapterName !== "paid-service-reference" && adapterName !== "paid-service") {
+    console.log(`[FAIL] unknown adapter ${String(adapterName)}`);
+    failed = true;
+  } else {
+    const appResult = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    if (!appResult.ok) {
+      console.log("[FAIL] paid-service application semantics");
+      for (const error of appResult.errors) console.log(`       ${error}`);
+      failed = true;
+    } else {
+      console.log("[PASS] paid-service application event semantics");
+      if (transcript.close?.finalState !== undefined && canonical(transcript.close.finalState) !== canonical(appResult.finalState)) {
+        console.log("[FAIL] close finalState differs from adapter-derived final state");
+        failed = true;
+      } else if (transcript.close?.finalState !== undefined) {
+        console.log("[PASS] close finalState matches adapter-derived final state");
+      }
+    }
+  }
+}
 
 if (flags.has("--require-close") && !transcript.close) {
   console.log("[FAIL] dual-signed close required but missing");

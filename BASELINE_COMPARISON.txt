@@ -1,6 +1,10 @@
-Baseline archive: eventmesh-main (1)(1).zip
+Baseline archive: eventmesh-main(5).zip
+Baseline SHA-256: c201cbcfb9a9e8d23ae7118e8a0600a8677137665abc18d4e99dde570f2b00e5
 Patch semantics: changed/new files only; overlay at repository root.
-Deleted baseline files: none.
-Changed/new repository files: 43.
+Deleted baseline files: 0.
+Added repository files: 11.
+Modified baseline files: 24.
+Total changed/new files: 35.
 Target protocol: eventmesh-v0.2.0
 Target CKB commitment domain: EVENTMESH_V02
+Funding direction: cross-operator reconciliation validation with one independent adopter.
