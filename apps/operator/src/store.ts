@@ -1,97 +1,19 @@
 import Database from "better-sqlite3";
-import type { SignedAck, SignedClose, SignedEvent, SignedSession, TranscriptExport } from "@eventmesh/core";
-
-export class Store {
-  private db: Database.Database;
-  constructor(path: string) {
-    this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        signed_session_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        signed_close_json TEXT,
-        ckb_anchor_json TEXT
-      );
-      CREATE TABLE IF NOT EXISTS events (
-        event_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        event_json TEXT NOT NULL,
-        ack_json TEXT,
-        status TEXT NOT NULL,
-        UNIQUE(session_id, sequence)
-      );
-    `);
-  }
-
-  saveSession(signed: SignedSession, status = "ACTIVE") {
-    this.db.prepare(`INSERT INTO sessions(session_id,signed_session_json,status) VALUES(?,?,?)
-      ON CONFLICT(session_id) DO UPDATE SET signed_session_json=excluded.signed_session_json,status=excluded.status`)
-      .run(signed.session.sessionId, JSON.stringify(signed), status);
-  }
-
-  getSession(id: string): { signed: SignedSession; status: string; close?: SignedClose; anchor?: { txHash: string; dataHex: string } } | undefined {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE session_id=?").get(id) as any;
-    if (!row) return undefined;
-    return {
-      signed: JSON.parse(row.signed_session_json),
-      status: row.status,
-      close: row.signed_close_json ? JSON.parse(row.signed_close_json) : undefined,
-      anchor: row.ckb_anchor_json ? JSON.parse(row.ckb_anchor_json) : undefined
-    };
-  }
-
-  listSessions() {
-    return (this.db.prepare("SELECT session_id,status,signed_session_json,signed_close_json,ckb_anchor_json FROM sessions ORDER BY rowid DESC").all() as any[]).map((row) => ({
-      sessionId: row.session_id,
-      status: row.status,
-      session: JSON.parse(row.signed_session_json).session,
-      close: row.signed_close_json ? JSON.parse(row.signed_close_json) : undefined,
-      anchor: row.ckb_anchor_json ? JSON.parse(row.ckb_anchor_json) : undefined
-    }));
-  }
-
-  saveEvent(event: SignedEvent, status = "PROPOSED") {
-    this.db.prepare(`INSERT INTO events(event_hash,session_id,sequence,event_json,status) VALUES(?,?,?,?,?)
-      ON CONFLICT(event_hash) DO NOTHING`).run(event.eventHash, event.sessionId, event.sequence, JSON.stringify(event), status);
-  }
-
-  getEvent(hash: string): { event: SignedEvent; ack?: SignedAck; status: string } | undefined {
-    const row = this.db.prepare("SELECT * FROM events WHERE event_hash=?").get(hash) as any;
-    if (!row) return undefined;
-    return { event: JSON.parse(row.event_json), ack: row.ack_json ? JSON.parse(row.ack_json) : undefined, status: row.status };
-  }
-
-  listEvents(sessionId: string): Array<{ event: SignedEvent; ack?: SignedAck; status: string }> {
-    return (this.db.prepare("SELECT * FROM events WHERE session_id=? ORDER BY sequence ASC").all(sessionId) as any[]).map((row) => ({
-      event: JSON.parse(row.event_json),
-      ack: row.ack_json ? JSON.parse(row.ack_json) : undefined,
-      status: row.status
-    }));
-  }
-
-  saveAck(ack: SignedAck) {
-    this.db.prepare("UPDATE events SET ack_json=?, status=? WHERE event_hash=?").run(JSON.stringify(ack), ack.decision === "ACCEPT" ? "FINAL" : "REJECTED", ack.eventHash);
-  }
-
-  saveClose(sessionId: string, close: SignedClose) {
-    this.db.prepare("UPDATE sessions SET signed_close_json=?, status='CLOSED' WHERE session_id=?").run(JSON.stringify(close), sessionId);
-  }
-
-  saveAnchor(sessionId: string, anchor: { txHash: string; dataHex: string }) {
-    this.db.prepare("UPDATE sessions SET ckb_anchor_json=? WHERE session_id=?").run(JSON.stringify(anchor), sessionId);
-  }
-
-  exportTranscript(sessionId: string): TranscriptExport | undefined {
-    const session = this.getSession(sessionId);
-    if (!session) return undefined;
-    return {
-      session: session.signed,
-      events: this.listEvents(sessionId).map(({ event, ack }) => ({ event, ack })),
-      close: session.close,
-      ckbAnchor: session.anchor
-    };
-  }
+import { canonical, type FiberPaymentClaim, type SignedAck, type SignedClose, type SignedEvent, type SignedSession, type TranscriptExport, type ConflictEvidence } from "@eventmesh/core";
+export type WriteResult="INSERTED"|"IDEMPOTENT"|"CONFLICT"|"NOT_FOUND";
+export class Store{private db:Database.Database;constructor(path:string){this.db=new Database(path);this.db.pragma("journal_mode = WAL");this.db.pragma("foreign_keys = ON");this.db.exec(`CREATE TABLE IF NOT EXISTS sessions(session_id TEXT PRIMARY KEY,signed_session_json TEXT NOT NULL,status TEXT NOT NULL,close_proposal_json TEXT,signed_close_json TEXT,ckb_anchor_json TEXT);CREATE TABLE IF NOT EXISTS events(event_hash TEXT PRIMARY KEY,session_id TEXT NOT NULL,sequence INTEGER NOT NULL,event_json TEXT NOT NULL,ack_json TEXT,status TEXT NOT NULL,UNIQUE(session_id,sequence));CREATE TABLE IF NOT EXISTS conflicts(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,kind TEXT NOT NULL,existing_json TEXT NOT NULL,incoming_json TEXT NOT NULL,observed_at TEXT NOT NULL);CREATE TABLE IF NOT EXISTS payment_claims(payment_hash TEXT PRIMARY KEY,session_id TEXT NOT NULL,event_hash TEXT NOT NULL,claim_json TEXT NOT NULL);`)}
+private conflict(id:string,kind:ConflictEvidence["kind"],a:unknown,b:unknown){this.db.prepare("INSERT INTO conflicts(session_id,kind,existing_json,incoming_json,observed_at) VALUES(?,?,?,?,?)").run(id,kind,JSON.stringify(a),JSON.stringify(b),new Date().toISOString());this.db.prepare("UPDATE sessions SET status='DISPUTED' WHERE session_id=?").run(id)}
+saveSession(s:SignedSession,status="ACTIVE"):WriteResult{const e=this.getSession(s.session.sessionId);if(!e){this.db.prepare("INSERT INTO sessions(session_id,signed_session_json,status) VALUES(?,?,?)").run(s.session.sessionId,JSON.stringify(s),status);return"INSERTED"}if(canonical(e.signed.session)===canonical(s.session)&&e.signed.signatureA===s.signatureA){if(!e.signed.signatureB&&s.signatureB)this.db.prepare("UPDATE sessions SET signed_session_json=? WHERE session_id=?").run(JSON.stringify({...e.signed,signatureB:s.signatureB}),s.session.sessionId);return"IDEMPOTENT"}this.conflict(s.session.sessionId,"SESSION",e.signed,s);return"CONFLICT"}
+getSession(id:string){const r=this.db.prepare("SELECT * FROM sessions WHERE session_id=?").get(id) as any;if(!r)return;return{signed:JSON.parse(r.signed_session_json) as SignedSession,status:r.status,closeProposal:r.close_proposal_json?JSON.parse(r.close_proposal_json):undefined,close:r.signed_close_json?JSON.parse(r.signed_close_json):undefined,anchor:r.ckb_anchor_json?JSON.parse(r.ckb_anchor_json):undefined}}
+listSessions(){return(this.db.prepare("SELECT * FROM sessions ORDER BY rowid DESC").all() as any[]).map(r=>({sessionId:r.session_id,status:r.status,session:JSON.parse(r.signed_session_json).session,close:r.signed_close_json?JSON.parse(r.signed_close_json):undefined,anchor:r.ckb_anchor_json?JSON.parse(r.ckb_anchor_json):undefined}))}
+saveEvent(e:SignedEvent,status="PROPOSED"):WriteResult{const h=this.getEvent(e.eventHash);if(h)return canonical(h.event)===canonical(e)?"IDEMPOTENT":"CONFLICT";const q=this.db.prepare("SELECT event_json FROM events WHERE session_id=? AND sequence=?").get(e.sessionId,e.sequence) as any;if(q){this.conflict(e.sessionId,"EVENT",JSON.parse(q.event_json),e);return"CONFLICT"}this.db.prepare("INSERT INTO events VALUES(?,?,?,?,?,?)").run(e.eventHash,e.sessionId,e.sequence,JSON.stringify(e),null,status);return"INSERTED"}
+getEvent(h:string){const r=this.db.prepare("SELECT * FROM events WHERE event_hash=?").get(h) as any;if(!r)return;return{event:JSON.parse(r.event_json) as SignedEvent,ack:r.ack_json?JSON.parse(r.ack_json) as SignedAck:undefined,status:r.status}}
+listEvents(id:string){return(this.db.prepare("SELECT * FROM events WHERE session_id=? ORDER BY sequence").all(id) as any[]).map(r=>({event:JSON.parse(r.event_json) as SignedEvent,ack:r.ack_json?JSON.parse(r.ack_json) as SignedAck:undefined,status:r.status}))}
+saveAck(a:SignedAck):WriteResult{const r=this.db.prepare("SELECT session_id,ack_json FROM events WHERE event_hash=?").get(a.eventHash) as any;if(!r)return"NOT_FOUND";if(!r.ack_json){this.db.prepare("UPDATE events SET ack_json=?,status='FINAL' WHERE event_hash=?").run(JSON.stringify(a),a.eventHash);return"INSERTED"}const e=JSON.parse(r.ack_json) as SignedAck;if(canonical(e)===canonical(a))return"IDEMPOTENT";this.conflict(r.session_id,"ACK",e,a);return"CONFLICT"}
+saveCloseProposal(id:string,c:SignedClose):WriteResult{const e=this.getSession(id);if(!e)return"NOT_FOUND";if(e.closeProposal)return canonical(e.closeProposal)===canonical(c)?"IDEMPOTENT":(this.conflict(id,"CLOSE",e.closeProposal,c),"CONFLICT");this.db.prepare("UPDATE sessions SET close_proposal_json=?,status='CLOSING' WHERE session_id=?").run(JSON.stringify(c),id);return"INSERTED"}
+saveClose(id:string,c:SignedClose):WriteResult{const e=this.getSession(id);if(!e)return"NOT_FOUND";if(e.close)return canonical(e.close)===canonical(c)?"IDEMPOTENT":(this.conflict(id,"CLOSE",e.close,c),"CONFLICT");this.db.prepare("UPDATE sessions SET signed_close_json=?,close_proposal_json=COALESCE(close_proposal_json,?),status='CLOSED' WHERE session_id=?").run(JSON.stringify(c),JSON.stringify(c),id);return"INSERTED"}
+saveAnchor(id:string,a:any):WriteResult{const e=this.getSession(id);if(!e)return"NOT_FOUND";if(e.anchor){if(e.anchor.txHash===a.txHash&&e.anchor.dataHex===a.dataHex){this.db.prepare("UPDATE sessions SET ckb_anchor_json=? WHERE session_id=?").run(JSON.stringify(a),id);return"IDEMPOTENT"}this.conflict(id,"ANCHOR",e.anchor,a);return"CONFLICT"}this.db.prepare("UPDATE sessions SET ckb_anchor_json=? WHERE session_id=?").run(JSON.stringify(a),id);return"INSERTED"}
+claimPayment(id:string,c:FiberPaymentClaim,eventHash:string):WriteResult{const h=c.paymentHash.toLowerCase();const r=this.db.prepare("SELECT * FROM payment_claims WHERE payment_hash=?").get(h) as any;if(!r){this.db.prepare("INSERT INTO payment_claims VALUES(?,?,?,?)").run(h,id,eventHash.toLowerCase(),JSON.stringify(c));return"INSERTED"}if(r.session_id===id&&r.event_hash===eventHash.toLowerCase()&&canonical(JSON.parse(r.claim_json))===canonical(c))return"IDEMPOTENT";this.conflict(id,"PAYMENT",r,{sessionId:id,eventHash,claim:c});return"CONFLICT"}
+listConflicts(id:string):ConflictEvidence[]{return(this.db.prepare("SELECT kind,existing_json,incoming_json,observed_at FROM conflicts WHERE session_id=? ORDER BY id").all(id) as any[]).map(r=>({kind:r.kind,existing:JSON.parse(r.existing_json),incoming:JSON.parse(r.incoming_json),observedAt:r.observed_at}))}
+exportTranscript(id:string):TranscriptExport|undefined{const s=this.getSession(id);if(!s)return;const c=this.listConflicts(id);return{session:s.signed,events:this.listEvents(id).map(x=>({event:x.event,ack:x.ack})),close:s.close,ckbAnchor:s.anchor,...(c.length?{conflicts:c}:{})}}
 }

@@ -1,51 +1,9 @@
-import { randomBytes } from "node:crypto";
-
-type JsonRpcEnvelope<T> = { jsonrpc: "2.0"; id: number; result?: T; error?: { code: number; message: string; data?: unknown } };
-
-export class FiberRpcClient {
-  constructor(private readonly url: string, private readonly token?: string) {}
-
-  private async call<T>(method: string, params: unknown[]): Promise<T> {
-    const headers: Record<string, string> = { "content-type": "application/json" };
-    if (this.token) headers.authorization = `Bearer ${this.token}`;
-    const response = await fetch(this.url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params })
-    });
-    if (!response.ok) throw new Error(`Fiber HTTP ${response.status}`);
-    const body = (await response.json()) as JsonRpcEnvelope<T>;
-    if (body.error) throw new Error(`Fiber RPC ${body.error.code}: ${body.error.message}`);
-    if (body.result === undefined) throw new Error("Fiber RPC returned no result");
-    return body.result;
-  }
-
-  async newInvoice(input: {
-    amount: string;
-    currency?: string;
-    description?: string;
-    expiry?: string;
-    finalCltv?: string;
-    udtTypeScript?: { code_hash: string; hash_type: "type" | "data" | "data1" | "data2"; args: string };
-  }): Promise<unknown> {
-    const paymentPreimage = `0x${randomBytes(32).toString("hex")}`;
-    return this.call("new_invoice", [{
-      amount: input.amount,
-      currency: input.currency ?? "Fibt",
-      description: input.description ?? "EventMesh payment",
-      expiry: input.expiry ?? "0xe10",
-      final_cltv: input.finalCltv ?? "0x28",
-      payment_preimage: paymentPreimage,
-      hash_algorithm: "sha256",
-      ...(input.udtTypeScript ? { udt_type_script: input.udtTypeScript } : {})
-    }]);
-  }
-
-  async sendPayment(invoice: string): Promise<unknown> {
-    return this.call("send_payment", [{ invoice }]);
-  }
-
-  async getPayment(paymentHash: string): Promise<unknown> {
-    return this.call("get_payment", [{ payment_hash: paymentHash }]);
-  }
+import { FiberPaymentClaimSchema, type FiberPaymentClaim } from "@eventmesh/core";
+type Env<T>={jsonrpc:"2.0";id:number;result?:T;error?:{code:number;message:string}};
+const qty=(v:string)=>`0x${BigInt(v).toString(16)}`; const n=(v:unknown)=>{try{return typeof v==="string"||typeof v==="number"?BigInt(v):undefined}catch{return undefined}};
+export class FiberRpcClient{constructor(private url:string,private token?:string,private timeout=10000){}private async call<T>(method:string,params:unknown[]):Promise<T>{const headers:Record<string,string>={"content-type":"application/json"};if(this.token)headers.authorization=`Bearer ${this.token}`;const r=await fetch(this.url,{method:"POST",headers,body:JSON.stringify({jsonrpc:"2.0",id:Date.now(),method,params}),signal:AbortSignal.timeout(this.timeout)});if(!r.ok)throw new Error(`Fiber HTTP ${r.status}`);const b=await r.json() as Env<T>;if(b.error)throw new Error(`Fiber RPC ${b.error.code}: ${b.error.message}`);if(b.result===undefined)throw new Error("Fiber RPC returned no result");return b.result}
+async newInvoice(i:{amount:string;currency?:"Fibb"|"Fibt"|"Fibd";description?:string;sessionId?:string;expirySeconds?:number;udtTypeScript?:any}){const description=[i.description??"EventMesh payment",i.sessionId?`eventmesh:${i.sessionId}`:undefined].filter(Boolean).join(" | ");const r=await this.call<any>("new_invoice",[{amount:qty(i.amount),currency:i.currency??"Fibt",description,expiry:qty(String(i.expirySeconds??3600)),...(i.udtTypeScript?{udt_type_script:i.udtTypeScript}:{})}]);if(i.sessionId&&r.invoice?.data?.payment_hash)r.eventMeshClaim=FiberPaymentClaimSchema.parse({paymentHash:r.invoice.data.payment_hash,sessionId:i.sessionId,amount:r.invoice.amount,currency:r.invoice.currency});return r}
+sendPayment(invoice:string){return this.call("send_payment",[{invoice}])} getPayment(h:string){return this.call<any>("get_payment",[h])} getInvoice(h:string){return this.call<any>("get_invoice",[h])}
+async verifySentPaymentClaim(c:FiberPaymentClaim){const p=await this.getPayment(c.paymentHash);if(p.status!=="Success")return{ok:false,reason:`PAYMENT_STATUS_${p.status??"UNKNOWN"}`,payment:p};if(p.payment_hash&&p.payment_hash.toLowerCase()!==c.paymentHash.toLowerCase())return{ok:false,reason:"PAYMENT_HASH_MISMATCH",payment:p};if(n(p.amount)!==undefined&&n(p.amount)!==n(c.amount))return{ok:false,reason:"FIBER_AMOUNT_MISMATCH",payment:p};return{ok:true,payment:p}}
+async verifyReceivedPaymentClaim(c:FiberPaymentClaim){const r=await this.getInvoice(c.paymentHash);if(r.status!=="Paid")return{ok:false,reason:"FIBER_INVOICE_NOT_PAID",invoice:r};const i=r.invoice;if(!i)return{ok:false,reason:"FIBER_INVOICE_MISSING",invoice:r};if(i.data?.payment_hash?.toLowerCase()!==c.paymentHash.toLowerCase())return{ok:false,reason:"FIBER_PAYMENT_HASH_MISMATCH",invoice:r};if(i.currency!==c.currency||n(i.amount)!==n(c.amount))return{ok:false,reason:"FIBER_AMOUNT_OR_CURRENCY_MISMATCH",invoice:r};const marker=`eventmesh:${c.sessionId}`;const attrs=Array.isArray(i.data?.attrs)?i.data.attrs:[];const descriptions=attrs.flatMap((x:any)=>[x?.description,x?.Description,x?.type==="description"?x?.value:undefined]).filter((x:any)=>typeof x==="string");if(!descriptions.some((d:string)=>d.split(/\s*\|\s*/).includes(marker)))return{ok:false,reason:"FIBER_SESSION_BINDING_MISMATCH",invoice:r};return{ok:true,invoice:r}}
 }

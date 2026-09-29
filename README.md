@@ -170,3 +170,9 @@ The current suite is a protocol-core baseline. The required integration-test mat
 ## Project status
 
 **Reference implementation / Testnet-oriented MVP. Not audited. Do not use production keys or mainnet funds.**
+
+## v0.1.1 funding-readiness notes
+
+The hardened patch adds immutable conflict evidence, signature-domain separation, receiver-side Fiber settlement checks, CKB committed-state verification, public-mode/admin controls, and reviewer/funding docs. See `docs/FUNDING_PROPOSAL_DRAFT.md`, `docs/HOW_TO_VERIFY.md`, `docs/THREAT_MODEL.md`, and `CHANGELOG_FUNDING_PATCH.md`.
+
+Do not claim a public independent-host Fiber/CKB proof until a real Testnet payment, committed CKB tx, transcript, and standalone-verifier output have been published.

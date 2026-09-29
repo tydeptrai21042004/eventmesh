@@ -4,247 +4,39 @@ import { secp256k1 } from "@noble/curves/secp256k1";
 import { z } from "zod";
 
 export const ZERO_HASH = `0x${"00".repeat(32)}`;
-export const PROTOCOL = "eventmesh-v0.1";
+export const PROTOCOL = "eventmesh-v0.1.1";
+export const SIGNING_DOMAIN = { SESSION:"session", EVENT:"event", ACK:"ack", CLOSE:"close", ANCHOR_NOTICE:"anchor-notice" } as const;
+export type SigningDomain = (typeof SIGNING_DOMAIN)[keyof typeof SIGNING_DOMAIN];
+const Pub=z.string().regex(/^0x[0-9a-f]{66}$/i), H32=z.string().regex(/^0x[0-9a-f]{64}$/i), Sig=z.string().regex(/^0x[0-9a-f]{128}$/i);
 
-export const SessionSchema = z.object({
-  sessionId: z.string().min(1),
-  protocol: z.literal(PROTOCOL),
-  operatorA: z.string().regex(/^0x[0-9a-f]{66}$/i),
-  operatorB: z.string().regex(/^0x[0-9a-f]{66}$/i),
-  operatorAUrl: z.string().url(),
-  operatorBUrl: z.string().url(),
-  createdAt: z.string().datetime(),
-  expiresAt: z.string().datetime(),
-  maxEvents: z.number().int().positive().max(10000)
-});
-export type Session = z.infer<typeof SessionSchema>;
+export const SessionSchema=z.object({sessionId:z.string().min(1).max(128),protocol:z.literal(PROTOCOL),operatorA:Pub,operatorB:Pub,operatorAUrl:z.string().url(),operatorBUrl:z.string().url(),createdAt:z.string().datetime(),expiresAt:z.string().datetime(),maxEvents:z.number().int().positive().max(10000)}).superRefine((s,c)=>{if(s.operatorA.toLowerCase()===s.operatorB.toLowerCase())c.addIssue({code:"custom",message:"operators must be distinct",path:["operatorB"]});if(Date.parse(s.expiresAt)<=Date.parse(s.createdAt))c.addIssue({code:"custom",message:"expiresAt must be after createdAt",path:["expiresAt"]});});
+export type Session=z.infer<typeof SessionSchema>;
+export const SignedSessionSchema=z.object({session:SessionSchema,signatureA:Sig,signatureB:Sig.optional()}); export type SignedSession=z.infer<typeof SignedSessionSchema>;
+export const EventBodySchema=z.object({sessionId:z.string().min(1),sequence:z.number().int().positive(),previousHash:H32,type:z.string().min(1).max(80),payload:z.unknown(),sender:Pub,createdAt:z.string().datetime()}); export type EventBody=z.infer<typeof EventBodySchema>;
+export const SignedEventSchema=EventBodySchema.extend({eventHash:H32,signature:Sig}); export type SignedEvent=z.infer<typeof SignedEventSchema>;
+export const AckBodySchema=z.object({eventHash:H32,decision:z.enum(["ACCEPT","REJECT"]),operator:Pub,createdAt:z.string().datetime()}); export type AckBody=z.infer<typeof AckBodySchema>;
+export const SignedAckSchema=AckBodySchema.extend({ackHash:H32,signature:Sig}); export type SignedAck=z.infer<typeof SignedAckSchema>;
+export const FiberPaymentClaimSchema=z.object({paymentHash:H32,sessionId:z.string().min(1),amount:z.string().regex(/^(?:0x[0-9a-f]+|[0-9]+)$/i),currency:z.enum(["Fibb","Fibt","Fibd"]),udtScript:z.string().regex(/^0x[0-9a-f]*$/i).optional()}).strict(); export type FiberPaymentClaim=z.infer<typeof FiberPaymentClaimSchema>;
+export const CloseBodySchema=z.object({sessionId:z.string().min(1),eventCount:z.number().int().nonnegative(),transcriptRoot:H32,finalStateHash:H32,fiberPayments:z.array(H32),closedAt:z.string().datetime()}); export type CloseBody=z.infer<typeof CloseBodySchema>;
+export const SignedCloseSchema=z.object({close:CloseBodySchema,finalState:z.unknown().optional(),signatureA:Sig.optional(),signatureB:Sig.optional()}); export type SignedClose=z.infer<typeof SignedCloseSchema>;
+export type ConflictEvidence={kind:"SESSION"|"EVENT"|"ACK"|"CLOSE"|"ANCHOR"|"PAYMENT";observedAt:string;existing:unknown;incoming:unknown};
+export type TranscriptExport={session:SignedSession;events:Array<{event:SignedEvent;ack?:SignedAck}>;close?:SignedClose;ckbAnchor?:{txHash:string;dataHex:string;status?:"PENDING"|"COMMITTED";blockHash?:string};conflicts?:ConflictEvidence[]};
 
-export const SignedSessionSchema = z.object({
-  session: SessionSchema,
-  signatureA: z.string().regex(/^0x[0-9a-f]{128}$/i),
-  signatureB: z.string().regex(/^0x[0-9a-f]{128}$/i).optional()
-});
-export type SignedSession = z.infer<typeof SignedSessionSchema>;
-
-export const EventBodySchema = z.object({
-  sessionId: z.string(),
-  sequence: z.number().int().positive(),
-  previousHash: z.string().regex(/^0x[0-9a-f]{64}$/i),
-  type: z.string().min(1).max(80),
-  payload: z.unknown(),
-  sender: z.string().regex(/^0x[0-9a-f]{66}$/i),
-  createdAt: z.string().datetime()
-});
-export type EventBody = z.infer<typeof EventBodySchema>;
-
-export const SignedEventSchema = EventBodySchema.extend({
-  eventHash: z.string().regex(/^0x[0-9a-f]{64}$/i),
-  signature: z.string().regex(/^0x[0-9a-f]{128}$/i)
-});
-export type SignedEvent = z.infer<typeof SignedEventSchema>;
-
-export const AckBodySchema = z.object({
-  eventHash: z.string().regex(/^0x[0-9a-f]{64}$/i),
-  decision: z.enum(["ACCEPT", "REJECT"]),
-  operator: z.string().regex(/^0x[0-9a-f]{66}$/i),
-  createdAt: z.string().datetime()
-});
-export type AckBody = z.infer<typeof AckBodySchema>;
-
-export const SignedAckSchema = AckBodySchema.extend({
-  ackHash: z.string().regex(/^0x[0-9a-f]{64}$/i),
-  signature: z.string().regex(/^0x[0-9a-f]{128}$/i)
-});
-export type SignedAck = z.infer<typeof SignedAckSchema>;
-
-export const CloseBodySchema = z.object({
-  sessionId: z.string(),
-  eventCount: z.number().int().nonnegative(),
-  transcriptRoot: z.string().regex(/^0x[0-9a-f]{64}$/i),
-  finalStateHash: z.string().regex(/^0x[0-9a-f]{64}$/i),
-  fiberPayments: z.array(z.string()),
-  closedAt: z.string().datetime()
-});
-export type CloseBody = z.infer<typeof CloseBodySchema>;
-
-export const SignedCloseSchema = z.object({
-  close: CloseBodySchema,
-  signatureA: z.string().regex(/^0x[0-9a-f]{128}$/i).optional(),
-  signatureB: z.string().regex(/^0x[0-9a-f]{128}$/i).optional()
-});
-export type SignedClose = z.infer<typeof SignedCloseSchema>;
-
-export type TranscriptExport = {
-  session: SignedSession;
-  events: Array<{ event: SignedEvent; ack?: SignedAck }>;
-  close?: SignedClose;
-  ckbAnchor?: { txHash: string; dataHex: string };
-};
-
-export function canonical(value: unknown): string {
-  return stableStringify(value) ?? "null";
-}
-
-export function sha256Hex(value: string | Uint8Array): string {
-  const hash = createHash("sha256");
-  hash.update(value);
-  return `0x${hash.digest("hex")}`;
-}
-
-export function strip0x(value: string): string {
-  return value.startsWith("0x") ? value.slice(2) : value;
-}
-
-export function bytesToHex(bytes: Uint8Array): string {
-  return `0x${Buffer.from(bytes).toString("hex")}`;
-}
-
-export function hexToBytes(hex: string): Uint8Array {
-  return Uint8Array.from(Buffer.from(strip0x(hex), "hex"));
-}
-
-export function randomPrivateKeyHex(): string {
-  return bytesToHex(secp256k1.utils.randomPrivateKey());
-}
-
-export function publicKeyFromPrivate(privateKeyHex: string): string {
-  return bytesToHex(secp256k1.getPublicKey(hexToBytes(privateKeyHex), true));
-}
-
-export function signObject(value: unknown, privateKeyHex: string): string {
-  const digest = hexToBytes(sha256Hex(canonical(value)));
-  const signature = secp256k1.sign(digest, hexToBytes(privateKeyHex));
-  return bytesToHex(signature.toCompactRawBytes());
-}
-
-export function verifyObject(value: unknown, signatureHex: string, publicKeyHex: string): boolean {
-  try {
-    const digest = hexToBytes(sha256Hex(canonical(value)));
-    return secp256k1.verify(hexToBytes(signatureHex), digest, hexToBytes(publicKeyHex));
-  } catch {
-    return false;
-  }
-}
-
-export function createSessionId(): string {
-  return `ses_${randomBytes(10).toString("hex")}`;
-}
-
-export function eventHash(body: EventBody): string {
-  return sha256Hex(canonical(body));
-}
-
-export function ackHash(body: AckBody): string {
-  return sha256Hex(canonical(body));
-}
-
-export function signEvent(body: EventBody, privateKeyHex: string): SignedEvent {
-  const parsed = EventBodySchema.parse(body);
-  return { ...parsed, eventHash: eventHash(parsed), signature: signObject(parsed, privateKeyHex) };
-}
-
-export function verifyEvent(event: SignedEvent): boolean {
-  const parsed = SignedEventSchema.safeParse(event);
-  if (!parsed.success) return false;
-  const { eventHash: suppliedHash, signature, ...body } = parsed.data;
-  return suppliedHash === eventHash(body) && verifyObject(body, signature, body.sender);
-}
-
-export function signAck(body: AckBody, privateKeyHex: string): SignedAck {
-  const parsed = AckBodySchema.parse(body);
-  return { ...parsed, ackHash: ackHash(parsed), signature: signObject(parsed, privateKeyHex) };
-}
-
-export function verifyAck(ack: SignedAck): boolean {
-  const parsed = SignedAckSchema.safeParse(ack);
-  if (!parsed.success) return false;
-  const { ackHash: suppliedHash, signature, ...body } = parsed.data;
-  return suppliedHash === ackHash(body) && verifyObject(body, signature, body.operator);
-}
-
-export function transcriptLeaf(event: SignedEvent, ack: SignedAck): string {
-  return sha256Hex(`${event.eventHash}:${ack.ackHash}`);
-}
-
-export function merkleRoot(leaves: string[]): string {
-  if (leaves.length === 0) return sha256Hex("EVENTMESH_EMPTY_TRANSCRIPT");
-  let level = leaves.map((leaf) => leaf.toLowerCase());
-  while (level.length > 1) {
-    const next: string[] = [];
-    for (let i = 0; i < level.length; i += 2) {
-      const left = level[i];
-      const right = level[i + 1] ?? left;
-      next.push(sha256Hex(`${left}:${right}`));
-    }
-    level = next;
-  }
-  return level[0];
-}
-
-export function computeTranscriptRoot(items: Array<{ event: SignedEvent; ack: SignedAck }>): string {
-  const ordered = [...items].sort((a, b) => a.event.sequence - b.event.sequence);
-  return merkleRoot(ordered.map(({ event, ack }) => transcriptLeaf(event, ack)));
-}
-
-export function finalStateHashFrom(value: unknown): string {
-  return sha256Hex(canonical(value));
-}
-
-export function verifyTranscript(exported: TranscriptExport): { ok: boolean; errors: string[] } {
-  const errors: string[] = [];
-  const sessionParsed = SignedSessionSchema.safeParse(exported.session);
-  if (!sessionParsed.success) return { ok: false, errors: ["Invalid session schema"] };
-  const { session, signatureA, signatureB } = sessionParsed.data;
-  if (!verifyObject(session, signatureA, session.operatorA)) errors.push("Invalid operator A session signature");
-  if (!signatureB || !verifyObject(session, signatureB, session.operatorB)) errors.push("Invalid or missing operator B session signature");
-
-  let previousHash = ZERO_HASH;
-  const finalItems: Array<{ event: SignedEvent; ack: SignedAck }> = [];
-  const seenHashes = new Set<string>();
-  const ordered = [...exported.events].sort((a, b) => a.event.sequence - b.event.sequence);
-
-  for (let i = 0; i < ordered.length; i++) {
-    const { event, ack } = ordered[i];
-    if (event.sessionId !== session.sessionId) errors.push(`Event ${event.sequence} wrong session`);
-    if (event.sequence !== i + 1) errors.push(`Non-contiguous sequence at ${event.sequence}`);
-    if (event.previousHash !== previousHash) errors.push(`Broken previousHash at event ${event.sequence}`);
-    if (!verifyEvent(event)) errors.push(`Invalid event signature/hash at ${event.sequence}`);
-    if (seenHashes.has(event.eventHash)) errors.push(`Duplicate event hash at ${event.sequence}`);
-    seenHashes.add(event.eventHash);
-    if (!ack) {
-      errors.push(`Missing acknowledgement for event ${event.sequence}`);
-    } else {
-      if (ack.eventHash !== event.eventHash) errors.push(`ACK mismatch at event ${event.sequence}`);
-      if (!verifyAck(ack)) errors.push(`Invalid ACK at event ${event.sequence}`);
-      const expectedAckOperator = event.sender === session.operatorA ? session.operatorB : session.operatorA;
-      if (ack.operator !== expectedAckOperator) errors.push(`ACK signed by wrong operator at event ${event.sequence}`);
-      if (ack.decision !== "ACCEPT") errors.push(`Event ${event.sequence} was not accepted`);
-      finalItems.push({ event, ack });
-    }
-    previousHash = event.eventHash;
-  }
-
-  if (exported.close) {
-    const closeParsed = SignedCloseSchema.safeParse(exported.close);
-    if (!closeParsed.success) errors.push("Invalid close schema");
-    else {
-      const { close, signatureA: closeA, signatureB: closeB } = closeParsed.data;
-      if (close.sessionId !== session.sessionId) errors.push("Close references wrong session");
-      if (close.eventCount !== finalItems.length) errors.push("Close eventCount mismatch");
-      const root = computeTranscriptRoot(finalItems);
-      if (root !== close.transcriptRoot) errors.push("Close transcriptRoot mismatch");
-      if (!closeA || !verifyObject(close, closeA, session.operatorA)) errors.push("Invalid/missing close signature A");
-      if (!closeB || !verifyObject(close, closeB, session.operatorB)) errors.push("Invalid/missing close signature B");
-    }
-  }
-
-  return { ok: errors.length === 0, errors };
-}
-
-export function buildAnchorDataHex(sessionId: string, transcriptRoot: string, finalStateHash: string): string {
-  const prefix = Buffer.from("EVENTMESH_V01", "utf8");
-  const sessionHash = Buffer.from(strip0x(sha256Hex(sessionId)), "hex");
-  const root = Buffer.from(strip0x(transcriptRoot), "hex");
-  const state = Buffer.from(strip0x(finalStateHash), "hex");
-  return `0x${Buffer.concat([prefix, sessionHash, root, state]).toString("hex")}`;
-}
+export const canonical=(v:unknown)=>stableStringify(v)??"null";
+export function sha256Hex(v:string|Uint8Array){const h=createHash("sha256");h.update(v);return `0x${h.digest("hex")}`;}
+export const strip0x=(v:string)=>v.startsWith("0x")?v.slice(2):v; export const bytesToHex=(b:Uint8Array)=>`0x${Buffer.from(b).toString("hex")}`; export const hexToBytes=(h:string)=>Uint8Array.from(Buffer.from(strip0x(h),"hex"));
+export const randomPrivateKeyHex=()=>bytesToHex(secp256k1.utils.randomPrivateKey()); export const publicKeyFromPrivate=(k:string)=>bytesToHex(secp256k1.getPublicKey(hexToBytes(k),true));
+export function signObject(v:unknown,k:string){return bytesToHex(secp256k1.sign(hexToBytes(sha256Hex(canonical(v))),hexToBytes(k)).toCompactRawBytes());}
+export function verifyObject(v:unknown,s:string,p:string){try{return secp256k1.verify(hexToBytes(s),hexToBytes(sha256Hex(canonical(v))),hexToBytes(p));}catch{return false;}}
+export const signingEnvelope=(d:SigningDomain,v:unknown)=>({domain:`EventMesh/${PROTOCOL}/${d}`,value:v}); export const signProtocolObject=(d:SigningDomain,v:unknown,k:string)=>signObject(signingEnvelope(d,v),k); export const verifyProtocolObject=(d:SigningDomain,v:unknown,s:string,p:string)=>verifyObject(signingEnvelope(d,v),s,p);
+export const createSessionId=()=>`ses_${randomBytes(10).toString("hex")}`; export const eventHash=(b:EventBody)=>sha256Hex(canonical(b)); export const ackHash=(b:AckBody)=>sha256Hex(canonical(b));
+export function signEvent(b:EventBody,k:string):SignedEvent{const p=EventBodySchema.parse(b);return {...p,eventHash:eventHash(p),signature:signProtocolObject(SIGNING_DOMAIN.EVENT,p,k)}}
+export function verifyEvent(e:SignedEvent){const p=SignedEventSchema.safeParse(e);if(!p.success)return false;const {eventHash:h,signature,...b}=p.data;return h.toLowerCase()===eventHash(b).toLowerCase()&&verifyProtocolObject(SIGNING_DOMAIN.EVENT,b,signature,b.sender)}
+export function signAck(b:AckBody,k:string):SignedAck{const p=AckBodySchema.parse(b);return {...p,ackHash:ackHash(p),signature:signProtocolObject(SIGNING_DOMAIN.ACK,p,k)}}
+export function verifyAck(a:SignedAck){const p=SignedAckSchema.safeParse(a);if(!p.success)return false;const {ackHash:h,signature,...b}=p.data;return h.toLowerCase()===ackHash(b).toLowerCase()&&verifyProtocolObject(SIGNING_DOMAIN.ACK,b,signature,b.operator)}
+export const transcriptLeaf=(e:SignedEvent,a:SignedAck)=>sha256Hex(`${e.eventHash.toLowerCase()}:${a.ackHash.toLowerCase()}`);
+export function merkleRoot(l:string[]){if(!l.length)return sha256Hex("EVENTMESH_EMPTY_TRANSCRIPT");let x=l.map(v=>v.toLowerCase());while(x.length>1){const n:string[]=[];for(let i=0;i<x.length;i+=2)n.push(sha256Hex(`${x[i]}:${x[i+1]??x[i]}`));x=n;}return x[0]}
+export const computeTranscriptRoot=(i:Array<{event:SignedEvent;ack:SignedAck}>)=>merkleRoot([...i].sort((a,b)=>a.event.sequence-b.event.sequence).map(x=>transcriptLeaf(x.event,x.ack))); export const finalStateHashFrom=(v:unknown)=>sha256Hex(canonical(v));
+export function acceptedFiberPaymentHashes(items:Array<{event:SignedEvent;ack?:SignedAck}>){const s=new Set<string>();for(const x of items){if(x.event.type!=="PAYMENT_SETTLED"||x.ack?.decision!=="ACCEPT")continue;const p=FiberPaymentClaimSchema.safeParse(x.event.payload);if(p.success)s.add(p.data.paymentHash.toLowerCase())}return [...s].sort()}
+export function buildAnchorDataHex(id:string,root:string,state:string){return `0x${Buffer.concat([Buffer.from("EVENTMESH_V01"),Buffer.from(strip0x(sha256Hex(id)),"hex"),Buffer.from(strip0x(root),"hex"),Buffer.from(strip0x(state),"hex")]).toString("hex")}`}
+export function verifyTranscript(t:TranscriptExport){const errors:string[]=[];const sp=SignedSessionSchema.safeParse(t.session);if(!sp.success)return{ok:false,errors:["Invalid session schema"]};const {session,signatureA,signatureB}=sp.data;if(!verifyProtocolObject(SIGNING_DOMAIN.SESSION,session,signatureA,session.operatorA))errors.push("Invalid operator A session signature");if(!signatureB||!verifyProtocolObject(SIGNING_DOMAIN.SESSION,session,signatureB,session.operatorB))errors.push("Invalid or missing operator B session signature");let prev=ZERO_HASH;const finals:Array<{event:SignedEvent;ack:SignedAck}>=[];const pay=new Map<string,string>();for(const [i,x] of [...t.events].sort((a,b)=>a.event.sequence-b.event.sequence).entries()){const e=x.event,a=x.ack;if(e.sessionId!==session.sessionId)errors.push(`Event ${e.sequence} wrong session`);if(e.sequence!==i+1)errors.push(`Non-contiguous sequence at ${e.sequence}`);if(e.previousHash.toLowerCase()!==prev.toLowerCase())errors.push(`Broken previousHash at event ${e.sequence}`);if(e.sender!==session.operatorA&&e.sender!==session.operatorB)errors.push(`Event ${e.sequence} sender is not a session participant`);if(!verifyEvent(e))errors.push(`Invalid event signature/hash at ${e.sequence}`);if(!a)errors.push(`Missing acknowledgement for event ${e.sequence}`);else{if(a.eventHash.toLowerCase()!==e.eventHash.toLowerCase())errors.push(`ACK mismatch at event ${e.sequence}`);if(!verifyAck(a))errors.push(`Invalid ACK at event ${e.sequence}`);const exp=e.sender===session.operatorA?session.operatorB:session.operatorA;if(a.operator!==exp)errors.push(`ACK signed by wrong operator at event ${e.sequence}`);if(a.decision==="ACCEPT"&&e.type==="PAYMENT_SETTLED"){const p=FiberPaymentClaimSchema.safeParse(e.payload);if(!p.success)errors.push(`Invalid PAYMENT_SETTLED payload at event ${e.sequence}`);else{if(p.data.sessionId!==session.sessionId)errors.push(`PAYMENT_SETTLED wrong session at event ${e.sequence}`);const h=p.data.paymentHash.toLowerCase();if(pay.has(h)&&pay.get(h)!==e.eventHash.toLowerCase())errors.push(`Fiber payment hash reused at event ${e.sequence}`);else pay.set(h,e.eventHash.toLowerCase())}}finals.push({event:e,ack:a})}prev=e.eventHash}if(t.close){const cp=SignedCloseSchema.safeParse(t.close);if(!cp.success)errors.push("Invalid close schema");else{const {close,finalState,signatureA:a,signatureB:b}=cp.data;if(close.sessionId!==session.sessionId)errors.push("Close references wrong session");if(close.eventCount!==finals.length)errors.push("Close eventCount mismatch");if(computeTranscriptRoot(finals).toLowerCase()!==close.transcriptRoot.toLowerCase())errors.push("Close transcriptRoot mismatch");if(canonical(acceptedFiberPaymentHashes(finals))!==canonical([...new Set(close.fiberPayments.map(x=>x.toLowerCase()))].sort()))errors.push("Close fiberPayments mismatch");if(finalState!==undefined&&finalStateHashFrom(finalState).toLowerCase()!==close.finalStateHash.toLowerCase())errors.push("Close finalStateHash mismatch");if(!a||!verifyProtocolObject(SIGNING_DOMAIN.CLOSE,close,a,session.operatorA))errors.push("Invalid/missing close signature A");if(!b||!verifyProtocolObject(SIGNING_DOMAIN.CLOSE,close,b,session.operatorB))errors.push("Invalid/missing close signature B");if(t.ckbAnchor&&t.ckbAnchor.dataHex.toLowerCase()!==buildAnchorDataHex(session.sessionId,close.transcriptRoot,close.finalStateHash).toLowerCase())errors.push("CKB anchor data does not match close")}}else if(t.ckbAnchor)errors.push("CKB anchor without close");if(t.conflicts?.length)errors.push(`Transcript contains ${t.conflicts.length} conflict item(s)`);return{ok:errors.length===0,errors}}
