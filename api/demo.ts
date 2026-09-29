@@ -23,13 +23,7 @@ import {
   type SignedSession
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
-import {
-  DEMO_STORAGE_DURABLE,
-  DEMO_STORAGE_MODE,
-  DEMO_STATE_PATH,
-  mutateDemoStore,
-  readDemoStore
-} from "./demo-store.js";
+import { mutateDemoStore, readDemoStore } from "./demo-store.js";
 
 const CKB_TESTNET_RPC_URL = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
@@ -404,32 +398,18 @@ export default async function handler(req: any, res: ServerResponse) {
       const sessionId = url.searchParams.get("sessionId");
       if (sessionId) return json(res, 200, await loadState(sessionId));
 
-      const recent = await readDemoStore((store) => Object.entries(store.sessions)
-        .map(([id, row]: any) => ({ sessionId: id, status: row.status, createdAt: row.createdAt }))
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-        .slice(0, 10));
-
       return json(res, 200, {
         ok: !!configuredMasterSecret() && configurationErrors.length === 0,
         protocol: PROTOCOL,
-        version: "0.4.1-demo-json",
+        version: "0.4.1",
+        network: "CKB Testnet",
         operatorA: pubA,
         operatorB: pubB,
-        storage: {
-          mode: DEMO_STORAGE_MODE,
-          durable: DEMO_STORAGE_DURABLE,
-          path: process.env.VERCEL ? "/tmp/eventmesh-demo-state.json" : DEMO_STATE_PATH,
-          warning: process.env.VERCEL ? "Ephemeral per Vercel function instance; state can disappear or diverge across instances." : "Local JSON demo state; not intended for multi-process production use."
-        },
-        fiberReceiverVerification: !!process.env.FIBER_RECEIVER_RPC_URL,
-        ckbAnchoring: ckbBroadcastEnabled(),
-        ckbSignerConfigured: !!process.env.CKB_PRIVATE_KEY,
-        ckbBroadcastEnabled: process.env.DEMO_ALLOW_CKB_BROADCAST === "true",
-        ckbReconciliation: true,
-        ckbRpcUrl: process.env.CKB_RPC_URL ? "configured" : "default-testnet",
-        masterSecretConfigured: !!configuredMasterSecret(),
-        configurationErrors,
-        recent
+        capabilities: {
+          fiberPayments: !!process.env.FIBER_RECEIVER_RPC_URL,
+          ckbAnchoring: ckbBroadcastEnabled(),
+          ckbReconciliation: true
+        }
       });
     }
 

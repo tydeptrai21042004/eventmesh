@@ -71,8 +71,14 @@ export default async function handler(req: any, res: ServerResponse) {
   };
 
   if (!deep) {
-    status.ok = status.security.masterSecretConfigured;
-    return json(res, 200, status);
+    const ready = status.security.masterSecretConfigured;
+    return json(res, 200, {
+      ok: ready,
+      service: "eventmesh",
+      version: "0.4.1",
+      status: ready ? "ready" : "unavailable",
+      network: "CKB Testnet"
+    });
   }
 
   try {
