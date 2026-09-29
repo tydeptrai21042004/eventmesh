@@ -6,6 +6,7 @@
 ./FILES.txt
 ./LICENSE
 ./README.md
+./SECURITY.md
 ./apps/demo/index.html
 ./apps/demo/package.json
 ./apps/demo/src/main.tsx
@@ -17,6 +18,7 @@
 ./apps/verifier/package.json
 ./apps/verifier/src/index.ts
 ./docker-compose.yml
+./docs/PROJECT_BLUEPRINT.md
 ./package.json
 ./packages/ckb/package.json
 ./packages/ckb/src/index.ts

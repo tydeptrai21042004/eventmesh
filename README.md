@@ -1,24 +1,43 @@
-# EventMesh v0.1 — Two-Operator Session Proof
+# EventMesh for CKB/Fiber — v0.1 Two-Operator Session Proof
 
-EventMesh v0.1 is a small CKB/Fiber-oriented reference implementation for **cross-operator application sessions**. Two independently keyed nodes maintain separate SQLite databases, exchange signed hash-linked events, explicitly acknowledge each other's events, close on a mutually signed transcript root, and can optionally attach real Fiber Testnet payments and anchor the final commitment to CKB Testnet.
+EventMesh is a small CKB/Fiber-oriented reference implementation for **cross-operator application sessions**. Two independently keyed nodes maintain separate SQLite databases, exchange signed hash-linked events, explicitly acknowledge each other's events, close on a mutually signed transcript commitment, and can optionally attach Fiber Testnet payments and anchor the final commitment to CKB Testnet.
+
+> **Scope:** EventMesh records what two independent operators explicitly accepted during a session. It is not a consensus protocol, game engine, payment router, wallet, marketplace, or proof that an external physical event was objectively true.
+
+## Architecture and next-step plan
+
+Read **[`docs/PROJECT_BLUEPRINT.md`](docs/PROJECT_BLUEPRINT.md)** before extending the protocol. It defines:
+
+- the project's non-overlap boundary;
+- the ideal v0.2 repository structure;
+- peer API vs admin API separation;
+- session/ACK immutability rules;
+- Fiber payment evidence verification;
+- CKB anchor verification;
+- SSRF/CORS/admin-auth hardening;
+- integration-test requirements;
+- the v0.1 → v0.2 roadmap.
+
+Security limitations are documented in **[`SECURITY.md`](SECURITY.md)**.
 
 ## MVP boundary
 
 Included:
+
 - two independent operator keys and SQLite stores;
 - signed ordered events with `previousHash` chaining;
 - explicit ACCEPT/REJECT ACKs from the counterparty;
 - replay/sequence/previous-hash checks;
 - restart persistence through SQLite/WAL;
-- transcript Merkle root and two close signatures;
+- transcript root and two close signatures;
 - standalone transcript verifier;
-- optional Fiber JSON-RPC adapter (`new_invoice`, `send_payment`, `get_payment`);
-- optional real CKB Testnet anchor using `@ckb-ccc/shell`;
+- optional Fiber JSON-RPC adapter;
+- optional CKB Testnet anchor;
 - one-page demo UI and Docker Compose.
 
 Explicitly **not** in v0.1: discovery, marketplace, reputation, multilateral sessions, conditional payments, custom CKB scripts, mobile wallet, AI-agent framework, or mainnet automation.
 
-## 1. Run local mode
+## Quick start — local mode
 
 Prerequisites: Docker + Docker Compose.
 
@@ -31,9 +50,7 @@ Open **http://localhost:3000**.
 
 Local mode requires no CKB and no Fiber funds. Operator A is exposed at `http://localhost:4001`; Operator B at `http://localhost:4002`.
 
-### Fast smoke test
-
-With the compose stack running:
+### Smoke test
 
 ```bash
 node scripts/smoke.mjs
@@ -41,34 +58,27 @@ node scripts/smoke.mjs
 
 This creates a session, exchanges two events + ACKs, and closes the session.
 
-## 2. Verify a transcript independently
-
-Export from the UI, then on the host:
+## Independent transcript verification
 
 ```bash
 npm install
 npm run verify -- ./ses_xxx.json
 ```
 
-The verifier checks both session signatures, event signatures/hashes, ordering, previous-hash linkage, counterparty ACK signatures, transcript root, and both close signatures.
-
-If a CKB anchor is present, pass a Testnet RPC URL to verify that the expected anchor data appears in the committed transaction:
+With a CKB Testnet RPC URL:
 
 ```bash
 npm run verify -- ./ses_xxx.json https://your-testnet-ckb-rpc.example
 ```
 
-## 3. Enable real Fiber Testnet RPC
+## Optional Fiber Testnet integration
 
 EventMesh does not embed or fork FNN. It calls an existing FNN JSON-RPC endpoint.
-
-Set `.env`:
 
 ```env
 FIBER_ENABLED=true
 OPERATOR_A_FIBER_RPC_URL=http://host.docker.internal:8227
 OPERATOR_B_FIBER_RPC_URL=http://host.docker.internal:8237
-# Optional when your FNN RPC is protected by Biscuit/Bearer auth:
 FIBER_RPC_TOKEN=
 ```
 
@@ -78,53 +88,32 @@ Then restart:
 docker compose up --build
 ```
 
-Available operator endpoints:
+### Important v0.1 security note
 
-```text
-POST /fiber/new-invoice
-POST /fiber/send-payment
-GET  /fiber/payments/:paymentHash
-```
+The current v0.1 operator still places peer-facing routes and Fiber administrative routes in the same HTTP process. **Do not expose Fiber spending endpoints to untrusted networks.** Keep operator/FNN endpoints behind a trusted firewall or local environment until the v0.1.1 admin-auth/API split in the blueprint is complete.
 
-Example invoice request:
+## Optional CKB Testnet anchor
 
-```bash
-curl -s http://localhost:4002/fiber/new-invoice \
-  -H 'content-type: application/json' \
-  -d '{"amount":"0x5f5e100","currency":"Fibt","description":"EventMesh demo"}'
-```
-
-Then send the returned `invoice_address` from Operator A:
-
-```bash
-curl -s http://localhost:4001/fiber/send-payment \
-  -H 'content-type: application/json' \
-  -d '{"invoice":"fibt..."}'
-```
-
-After the payment succeeds, record a normal EventMesh event of type `PAYMENT_SETTLED` with payload `{ "paymentHash": "0x..." }`. EventMesh deliberately does not invent a second payment protocol.
-
-## 4. Enable CKB Testnet final anchor
-
-Only Operator A anchors in v0.1. Fund the Testnet key first; the anchor creates a self-owned cell containing a compact EventMesh commitment.
+Only Operator A anchors in v0.1.
 
 ```env
 CKB_ENABLED=true
 CKB_PRIVATE_KEY=<64-hex-testnet-private-key>
-# Optional; if empty CCC uses its public Testnet client defaults.
 CKB_RPC_URL=
 CKB_ANCHOR_CAPACITY_CKB=200
 ```
 
-The anchor data contains only:
+Use only a Testnet key.
+
+The compact commitment contains:
 
 ```text
 EVENTMESH_V01 || SHA256(sessionId) || transcriptRoot || finalStateHash
 ```
 
-It does **not** store every event on-chain and requires no custom lock/type script.
+No custom lock/type script is required.
 
-## API surface
+## Current API surface
 
 ```text
 GET  /health
@@ -142,29 +131,33 @@ POST /sessions/:id/acks/receive
 POST /sessions/:id/close
 POST /sessions/:id/close/receive
 POST /sessions/:id/anchor/receive
+
+# v0.1 administrative Fiber endpoints — keep private
+POST /fiber/new-invoice
+POST /fiber/send-payment
+GET  /fiber/payments/:paymentHash
 ```
+
+The target v0.2 API separation is documented in the project blueprint.
 
 ## Protocol notes
 
-- Only one event may be pending at a time in v0.1. This removes concurrency ambiguity and keeps the first implementation deterministic. If delivery is ambiguous, the sender retries the exact signed event with `/retry`; the receiver treats an already-seen event hash idempotently.
+- Only one event may be pending at a time in v0.1.
 - The sender cannot ACK its own event.
-- A new event is accepted only if its sequence and `previousHash` match the receiver's local transcript.
-- `REJECT` is recorded and prevents normal close; v0.1 intentionally has no dispute protocol.
-- Operator A initiates close in v0.1. Operator B independently recomputes the transcript root before signing.
-- Keys are generated once and persisted under each operator data directory if `OPERATOR_PRIVATE_KEY` is not supplied.
+- Sequence and `previousHash` must match the local transcript.
+- REJECT prevents normal close; v0.1 has no dispute protocol.
+- Operator A initiates close in v0.1.
+- Operator B independently recomputes the transcript root before signing.
+- Keys persist under each operator data directory if no explicit key is supplied.
 
 ## Development without Docker
 
 ```bash
 npm install
 npm run dev:a
-# another terminal
 npm run dev:b
-# another terminal
 npm run dev:demo
 ```
-
-The Vite demo defaults to ports 4001 and 4002.
 
 ## Tests
 
@@ -172,8 +165,8 @@ The Vite demo defaults to ports 4001 and 4002.
 npm test
 ```
 
-The core suite covers signatures, tamper rejection, ACK verification, deterministic roots, transcript validation, and broken-chain rejection.
+The current suite is a protocol-core baseline. The required integration-test matrix for v0.1.1/v0.2 is listed in [`docs/PROJECT_BLUEPRINT.md`](docs/PROJECT_BLUEPRINT.md).
 
-## Security status
+## Project status
 
-This is an MVP/reference implementation, **not audited software**. Do not use production keys or mainnet funds. The HTTP peer transport is not mutually authenticated beyond signed application objects; production deployments should add TLS and explicit peer endpoint pinning/authentication. Fiber RPC endpoints should remain private/protected rather than exposed directly to the public internet.
+**Reference implementation / Testnet-oriented MVP. Not audited. Do not use production keys or mainnet funds.**
