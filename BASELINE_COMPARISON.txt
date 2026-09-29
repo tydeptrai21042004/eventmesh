@@ -1,0 +1,6 @@
+Baseline archive: eventmesh-main (1)(1).zip
+Patch semantics: changed/new files only; overlay at repository root.
+Deleted baseline files: none.
+Changed/new repository files: 43.
+Target protocol: eventmesh-v0.2.0
+Target CKB commitment domain: EVENTMESH_V02

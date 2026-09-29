@@ -1,17 +1,190 @@
 import { describe, expect, it } from "vitest";
-import { ZERO_HASH, ackHash, computeTranscriptRoot, createSessionId, eventHash, finalStateHashFrom, publicKeyFromPrivate, randomPrivateKeyHex, signAck, signEvent, signObject, verifyAck, verifyEvent, verifyObject, verifyTranscript, type Session, type TranscriptExport } from "@eventmesh/core";
+import {
+  ANCHOR_DOMAIN,
+  PROTOCOL,
+  SIGNING_DOMAIN,
+  ZERO_HASH,
+  acceptedFiberPaymentHashes,
+  buildAnchorDataHex,
+  computePaymentEvidenceRoot,
+  computeTranscriptRoot,
+  createSessionId,
+  finalStateHashFrom,
+  publicKeyFromPrivate,
+  randomPrivateKeyHex,
+  signAck,
+  signEvent,
+  signProtocolObject,
+  verifyAck,
+  verifyEvent,
+  verifyProtocolObject,
+  verifyTranscript,
+  type FiberPaymentClaim,
+  type Session,
+  type TranscriptExport
+} from "@eventmesh/core";
 
-describe("EventMesh core", () => {
-  const aPriv=randomPrivateKeyHex(), bPriv=randomPrivateKeyHex(); const a=publicKeyFromPrivate(aPriv), b=publicKeyFromPrivate(bPriv);
-  const session:Session={sessionId:createSessionId(),protocol:"eventmesh-v0.1",operatorA:a,operatorB:b,operatorAUrl:"http://a.local:4000",operatorBUrl:"http://b.local:4000",createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+60000).toISOString(),maxEvents:10};
-  it("signs and verifies objects",()=>expect(verifyObject(session,signObject(session,aPriv),a)).toBe(true));
-  it("rejects wrong signer",()=>expect(verifyObject(session,signObject(session,bPriv),a)).toBe(false));
-  it("signs and verifies events",()=>{const e=signEvent({sessionId:session.sessionId,sequence:1,previousHash:ZERO_HASH,type:"WORK",payload:{x:1},sender:a,createdAt:new Date().toISOString()},aPriv);expect(verifyEvent(e)).toBe(true);});
-  it("detects event tampering",()=>{const e=signEvent({sessionId:session.sessionId,sequence:1,previousHash:ZERO_HASH,type:"WORK",payload:{x:1},sender:a,createdAt:new Date().toISOString()},aPriv);expect(verifyEvent({...e,payload:{x:2}} as any)).toBe(false);});
-  it("signs and verifies ACKs",()=>{const e=signEvent({sessionId:session.sessionId,sequence:1,previousHash:ZERO_HASH,type:"WORK",payload:{},sender:a,createdAt:new Date().toISOString()},aPriv);const ack=signAck({eventHash:e.eventHash,decision:"ACCEPT",operator:b,createdAt:new Date().toISOString()},bPriv);expect(verifyAck(ack)).toBe(true);expect(ack.ackHash).toBe(ackHash({eventHash:e.eventHash,decision:"ACCEPT",operator:b,createdAt:ack.createdAt}));});
-  it("builds deterministic transcript roots",()=>{const e=signEvent({sessionId:session.sessionId,sequence:1,previousHash:ZERO_HASH,type:"WORK",payload:{},sender:a,createdAt:new Date().toISOString()},aPriv);const ack=signAck({eventHash:e.eventHash,decision:"ACCEPT",operator:b,createdAt:new Date().toISOString()},bPriv);expect(computeTranscriptRoot([{event:e,ack}])).toBe(computeTranscriptRoot([{event:e,ack}]));});
-  it("validates complete transcript",()=>{const e=signEvent({sessionId:session.sessionId,sequence:1,previousHash:ZERO_HASH,type:"WORK",payload:{},sender:a,createdAt:new Date().toISOString()},aPriv);const ack=signAck({eventHash:e.eventHash,decision:"ACCEPT",operator:b,createdAt:new Date().toISOString()},bPriv);const root=computeTranscriptRoot([{event:e,ack}]);const close={sessionId:session.sessionId,eventCount:1,transcriptRoot:root,finalStateHash:finalStateHashFrom({done:true}),fiberPayments:[],closedAt:new Date().toISOString()};const t:TranscriptExport={session:{session,signatureA:signObject(session,aPriv),signatureB:signObject(session,bPriv)},events:[{event:e,ack}],close:{close,signatureA:signObject(close,aPriv),signatureB:signObject(close,bPriv)}};expect(verifyTranscript(t)).toEqual({ok:true,errors:[]});});
-  it("rejects broken hash chain",()=>{const e=signEvent({sessionId:session.sessionId,sequence:1,previousHash:`0x${"11".repeat(32)}`,type:"WORK",payload:{},sender:a,createdAt:new Date().toISOString()},aPriv);const ack=signAck({eventHash:e.eventHash,decision:"ACCEPT",operator:b,createdAt:new Date().toISOString()},bPriv);const t:TranscriptExport={session:{session,signatureA:signObject(session,aPriv),signatureB:signObject(session,bPriv)},events:[{event:e,ack}]};expect(verifyTranscript(t).ok).toBe(false);});
+function fixture() {
+  const aPriv = randomPrivateKeyHex();
+  const bPriv = randomPrivateKeyHex();
+  const a = publicKeyFromPrivate(aPriv);
+  const b = publicKeyFromPrivate(bPriv);
+  const session: Session = {
+    sessionId: createSessionId(),
+    protocol: PROTOCOL,
+    operatorA: a,
+    operatorB: b,
+    operatorAUrl: "http://a.local:4000",
+    operatorBUrl: "http://b.local:4000",
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    maxEvents: 10
+  };
+  return { aPriv, bPriv, a, b, session };
+}
+
+function signedSession(f: ReturnType<typeof fixture>) {
+  return {
+    session: f.session,
+    signatureA: signProtocolObject(SIGNING_DOMAIN.SESSION, f.session, f.aPriv),
+    signatureB: signProtocolObject(SIGNING_DOMAIN.SESSION, f.session, f.bPriv)
+  };
+}
+
+describe("EventMesh v0.2 core", () => {
+  it("uses the v0.2 protocol and anchor domain", () => {
+    expect(PROTOCOL).toBe("eventmesh-v0.2.0");
+    expect(ANCHOR_DOMAIN).toBe("EVENTMESH_V02");
+  });
+
+  it("domain-separates signatures", () => {
+    const f = fixture();
+    const signature = signProtocolObject(SIGNING_DOMAIN.SESSION, f.session, f.aPriv);
+    expect(verifyProtocolObject(SIGNING_DOMAIN.SESSION, f.session, signature, f.a)).toBe(true);
+    expect(verifyProtocolObject(SIGNING_DOMAIN.CLOSE, f.session, signature, f.a)).toBe(false);
+  });
+
+  it("signs events and ACKs and detects tampering", () => {
+    const f = fixture();
+    const event = signEvent({
+      sessionId: f.session.sessionId,
+      sequence: 1,
+      previousHash: ZERO_HASH,
+      type: "WORK",
+      payload: { x: 1 },
+      sender: f.a,
+      createdAt: new Date().toISOString()
+    }, f.aPriv);
+    const ack = signAck({
+      eventHash: event.eventHash,
+      decision: "ACCEPT",
+      operator: f.b,
+      createdAt: new Date().toISOString()
+    }, f.bPriv);
+    expect(verifyEvent(event)).toBe(true);
+    expect(verifyAck(ack)).toBe(true);
+    expect(verifyEvent({ ...event, payload: { x: 2 } } as any)).toBe(false);
+  });
+
+  it("binds rich Fiber claims into paymentEvidenceRoot", () => {
+    const f = fixture();
+    const claim: FiberPaymentClaim = {
+      paymentHash: `0x${"12".repeat(32)}`,
+      sessionId: f.session.sessionId,
+      amount: "0x5f5e100",
+      currency: "Fibt"
+    };
+    const event = signEvent({
+      sessionId: f.session.sessionId,
+      sequence: 1,
+      previousHash: ZERO_HASH,
+      type: "PAYMENT_SETTLED",
+      payload: claim,
+      sender: f.a,
+      createdAt: new Date().toISOString()
+    }, f.aPriv);
+    const ack = signAck({ eventHash: event.eventHash, decision: "ACCEPT", operator: f.b, createdAt: new Date().toISOString() }, f.bPriv);
+    const root1 = computePaymentEvidenceRoot([{ event, ack }]);
+
+    const changed = signEvent({ ...event, payload: { ...claim, amount: "0x5f5e101" } } as any, f.aPriv);
+    const changedAck = signAck({ eventHash: changed.eventHash, decision: "ACCEPT", operator: f.b, createdAt: new Date().toISOString() }, f.bPriv);
+    const root2 = computePaymentEvidenceRoot([{ event: changed, ack: changedAck }]);
+    expect(root1).not.toBe(root2);
+    expect(acceptedFiberPaymentHashes([{ event, ack }])).toEqual([claim.paymentHash.toLowerCase()]);
+  });
+
+  it("validates a dual-signed close and v0.2 CKB commitment", () => {
+    const f = fixture();
+    const event = signEvent({
+      sessionId: f.session.sessionId,
+      sequence: 1,
+      previousHash: ZERO_HASH,
+      type: "WORK",
+      payload: {},
+      sender: f.a,
+      createdAt: new Date().toISOString()
+    }, f.aPriv);
+    const ack = signAck({ eventHash: event.eventHash, decision: "ACCEPT", operator: f.b, createdAt: new Date().toISOString() }, f.bPriv);
+    const items = [{ event, ack }];
+    const finalState = { done: true };
+    const close = {
+      sessionId: f.session.sessionId,
+      eventCount: 1,
+      transcriptRoot: computeTranscriptRoot(items),
+      finalStateHash: finalStateHashFrom(finalState),
+      fiberPayments: [],
+      paymentEvidenceRoot: computePaymentEvidenceRoot(items),
+      closedAt: new Date().toISOString()
+    };
+    const transcript: TranscriptExport = {
+      session: signedSession(f),
+      events: items,
+      close: {
+        close,
+        finalState,
+        signatureA: signProtocolObject(SIGNING_DOMAIN.CLOSE, close, f.aPriv),
+        signatureB: signProtocolObject(SIGNING_DOMAIN.CLOSE, close, f.bPriv)
+      },
+      ckbAnchor: {
+        txHash: `0x${"ab".repeat(32)}`,
+        dataHex: buildAnchorDataHex(f.session.sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot)
+      }
+    };
+    expect(verifyTranscript(transcript)).toEqual({ ok: true, errors: [] });
+  });
+
+  it("rejects closing a transcript containing a REJECT ACK", () => {
+    const f = fixture();
+    const event = signEvent({ sessionId: f.session.sessionId, sequence: 1, previousHash: ZERO_HASH, type: "WORK", payload: {}, sender: f.a, createdAt: new Date().toISOString() }, f.aPriv);
+    const ack = signAck({ eventHash: event.eventHash, decision: "REJECT", operator: f.b, createdAt: new Date().toISOString() }, f.bPriv);
+    const items = [{ event, ack }];
+    const close = {
+      sessionId: f.session.sessionId,
+      eventCount: 1,
+      transcriptRoot: computeTranscriptRoot(items),
+      finalStateHash: finalStateHashFrom({ done: false }),
+      fiberPayments: [],
+      paymentEvidenceRoot: computePaymentEvidenceRoot(items),
+      closedAt: new Date().toISOString()
+    };
+    const transcript: TranscriptExport = {
+      session: signedSession(f),
+      events: items,
+      close: {
+        close,
+        finalState: { done: false },
+        signatureA: signProtocolObject(SIGNING_DOMAIN.CLOSE, close, f.aPriv),
+        signatureB: signProtocolObject(SIGNING_DOMAIN.CLOSE, close, f.bPriv)
+      }
+    };
+    expect(verifyTranscript(transcript).errors).toContain("Close contains a rejected event");
+  });
+
+  it("detects a broken hash chain", () => {
+    const f = fixture();
+    const event = signEvent({ sessionId: f.session.sessionId, sequence: 1, previousHash: `0x${"11".repeat(32)}`, type: "WORK", payload: {}, sender: f.a, createdAt: new Date().toISOString() }, f.aPriv);
+    const ack = signAck({ eventHash: event.eventHash, decision: "ACCEPT", operator: f.b, createdAt: new Date().toISOString() }, f.bPriv);
+    const transcript: TranscriptExport = { session: signedSession(f), events: [{ event, ack }] };
+    expect(verifyTranscript(transcript).ok).toBe(false);
+  });
 });
-
-// v0.1.1 funding-readiness regression checks are additionally exercised by the standalone verifier.

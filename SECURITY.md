@@ -1,54 +1,53 @@
-# EventMesh Security Policy and MVP Threat Model
+# EventMesh v0.2 Security Policy and Threat Model
 
-EventMesh v0.1 is a **reference implementation for CKB/Fiber Testnet experimentation**. It is not audited software and must not be used with mainnet keys or production funds.
+EventMesh v0.2 is a **reference implementation for CKB/Fiber Testnet validation**. It is not audited software and must not be used with production keys or mainnet funds.
 
 ## Security boundary
 
-EventMesh is intended to prove one narrow property:
+EventMesh proves a narrow bilateral statement:
 
-> Two independently keyed operators can maintain separate durable stores, exchange an ordered stream of signed application events, explicitly acknowledge those events, and produce a mutually signed transcript commitment.
+> Two configured operator keys maintained an immutable signed event/ACK transcript, accepted the same close, optionally bound receiver-verified Fiber payment claims to it, and can later verify the compact CKB commitment.
 
-EventMesh does **not** claim to prove that an external physical/digital event was objectively true. It proves only what the two configured operators signed and accepted.
+It does **not** prove that an external game, device, API or physical-world statement was objectively true. Application-specific validation belongs in an adapter or the application itself.
 
-## Current v0.1 risks
+## Implemented v0.2 controls
 
-The current operator application combines peer-facing and local administrative endpoints in one Fastify process. Until the v0.2 hardening refactor is complete:
+- domain-separated signatures for session/event/ACK/close objects;
+- immutable/idempotent evidence with durable conflict records;
+- cross-session and previous-hash checks;
+- separate `/admin/*` and `/peer/*` API namespaces;
+- admin-token requirement in public mode;
+- explicit CORS allowlist;
+- peer URL scheme/credential/path validation;
+- DNS/private-address SSRF blocking in public mode, redirect blocking and request timeouts;
+- receiver-owned Fiber `get_invoice` verification before an accepted `PAYMENT_SETTLED`;
+- payment hash + session + amount + currency + optional exact UDT type-script binding;
+- global payment-hash reuse protection;
+- `paymentEvidenceRoot` committed by both close signatures and CKB;
+- independent CKB RPC verification requiring `committed` and exact locally-derived output data;
+- standalone verifier that can independently re-query receiver FNN and CKB.
 
-- do not expose the operator ports directly to the public Internet;
-- do not expose `/fiber/send-payment` to untrusted clients;
-- keep FNN RPC endpoints private or token-protected;
-- use only Testnet keys/funds;
-- run behind a trusted local reverse proxy or firewall when Fiber is enabled;
-- treat `peerUrl` as trusted configuration rather than arbitrary user input;
-- do not treat a received CKB anchor notification as verified until independently checked by RPC.
+## Remaining operational risks
 
-## Required hardening before public Testnet service
+The peer/admin namespaces still run in one Fastify process/listener. Production deployment should place them behind network policy or separate ingress rules. Rate limiting, production key management, structured audit export, peer-key pinning/rotation, TLS termination and operational monitoring remain deployment responsibilities.
 
-P0 items:
+The protocol serializes each bilateral session to one unresolved event at a time. Same-sequence proposals from different operators are retained as `PROPOSAL_COLLISION`; EventMesh does not claim to provide general distributed consensus or automatic conflict resolution.
 
-1. Split peer and admin API surfaces.
-2. Require admin authentication for payment-spending operations.
-3. Replace wildcard CORS with an explicit allowlist.
-4. Validate/pin peer URLs and prevent SSRF in public mode.
-5. Make session creation immutable/idempotent by `sessionId`.
-6. Make ACKs immutable and detect ACK equivocation.
-7. Bind payment events to independently verified Fiber state.
-8. Verify CKB anchor transaction status and exact commitment before accepting it.
-9. Add integration tests covering restart, retry, duplicate delivery, and equivocation.
+## Testnet deployment rules
 
-See [`docs/PROJECT_BLUEPRINT.md`](docs/PROJECT_BLUEPRINT.md) for the target structure and implementation sequence.
+- use separate operator keys, stores and FNN nodes;
+- keep FNN RPC tokens private;
+- use HTTPS and `PUBLIC_MODE=true` for Internet-facing operators;
+- set an `ADMIN_TOKEN` and explicit `CORS_ORIGINS`;
+- leave `ALLOW_PRIVATE_PEER_URLS=false` in public mode;
+- optionally pin `PEER_HOST_ALLOWLIST`;
+- do not treat `PENDING` CKB anchors as final evidence;
+- verify real proof artifacts with the standalone verifier rather than screenshots.
 
 ## Secret handling
 
-Never commit:
+Never commit operator private keys, `CKB_PRIVATE_KEY`, FNN tokens, `.env`, or local SQLite databases. The supplied `.gitignore` excludes the expected local secret/state paths.
 
-- `CKB_PRIVATE_KEY`;
-- FNN bearer/Biscuit tokens;
-- production operator private keys;
-- local SQLite databases containing private material.
+## Vulnerability reporting
 
-The repository `.gitignore` excludes local `.env` files and `.data/`.
-
-## Reporting a vulnerability
-
-For now, please report security issues privately to the repository maintainer instead of opening a public exploit-details issue. Once the project has a stable release process, replace this section with a dedicated security contact/process.
+Report security issues privately to the repository maintainer rather than opening a public exploit-details issue. Replace this section with a dedicated security contact/process before any production deployment.

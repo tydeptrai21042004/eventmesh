@@ -1,8 +1,11 @@
 {
   "name": "eventmesh",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
   "workspaces": [
     "apps/*",
     "packages/*"
@@ -16,13 +19,14 @@
     "dev:demo": "npm --workspace @eventmesh/demo run dev",
     "verify": "tsx apps/verifier/src/index.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build",
+    "verify:all": "npm run check"
   },
   "devDependencies": {
-    "tsx": "^4.20.5",
-    "typescript": "^5.9.2",
-    "vitest": "^3.2.4",
-    "@types/node": "^22.15.0",
-    "@types/better-sqlite3": "^7.6.13"
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.15.0",
+    "tsx": "4.20.5",
+    "typescript": "5.9.2",
+    "vitest": "3.2.4"
   }
 }

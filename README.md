@@ -1,178 +1,108 @@
-# EventMesh for CKB/Fiber — v0.1 Two-Operator Session Proof
+# EventMesh for CKB/Fiber — v0.2 Independent Cross-Operator Proof
 
-EventMesh is a small CKB/Fiber-oriented reference implementation for **cross-operator application sessions**. Two independently keyed nodes maintain separate SQLite databases, exchange signed hash-linked events, explicitly acknowledge each other's events, close on a mutually signed transcript commitment, and can optionally attach Fiber Testnet payments and anchor the final commitment to CKB Testnet.
+EventMesh is an application-neutral **bilateral cross-operator evidence protocol** for CKB/Fiber. Two independently keyed operators exchange signed hash-linked application events, explicitly ACK or reject each other's events, optionally bind receiver-verified Fiber value transfers into the transcript, dual-sign the final state, and publish a compact commitment to CKB for later independent verification.
 
-> **Scope:** EventMesh records what two independent operators explicitly accepted during a session. It is not a consensus protocol, game engine, payment router, wallet, marketplace, or proof that an external physical event was objectively true.
+> EventMesh does **not** replace Fiber payments, wallets, spending permissions, routing, metering, escrow, marketplaces, application logic or consensus.
 
-## Architecture and next-step plan
+Read [`docs/ECOSYSTEM_POSITIONING.md`](docs/ECOSYSTEM_POSITIONING.md) for the ecosystem rationale and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the exact v0.2 evidence rules.
 
-Read **[`docs/PROJECT_BLUEPRINT.md`](docs/PROJECT_BLUEPRINT.md)** before extending the protocol. It defines:
+## What changed in v0.2
 
-- the project's non-overlap boundary;
-- the ideal v0.2 repository structure;
-- peer API vs admin API separation;
-- session/ACK immutability rules;
-- Fiber payment evidence verification;
-- CKB anchor verification;
-- SSRF/CORS/admin-auth hardening;
-- integration-test requirements;
-- the v0.1 → v0.2 roadmap.
+- protocol/signing domain upgraded to `eventmesh-v0.2.0`;
+- CKB commitment upgraded to `EVENTMESH_V02`;
+- `PAYMENT_SETTLED` binds payment hash + session + amount + currency + optional exact UDT type script;
+- receiver-owned `get_invoice` + `Paid` is authoritative for ACCEPT;
+- sender `get_payment == Success` is only corroborating evidence;
+- verified receiver evidence is persisted for audit/export;
+- deterministic `paymentEvidenceRoot` is dual-signed and committed to CKB;
+- payment-hash reuse remains globally blocked;
+- REJECT ACKs prevent a normal close;
+- same-sequence cross-operator proposals are recorded as collisions, not mislabeled equivocation;
+- CKB anchors have an explicit PENDING → COMMITTED reconciliation route;
+- verifier can independently re-query receiver FNN and CKB;
+- tiny `@eventmesh/adapter-sdk` added for real application integration;
+- CI, pinned direct dependencies, environment template and broader regression tests added.
 
-Security limitations are documented in **[`SECURITY.md`](SECURITY.md)**.
+## Architecture
 
-## MVP boundary
+```text
+Application A                                      Application B
+     |                                                  |
+ Operator A <------ signed event / signed ACK ------> Operator B
+     |                                                  |
+   FNN A  ----------- optional Fiber value --------->  FNN B
+                                                        |
+                                           receiver-owned verification
+                         \                              /
+                          +------ dual-signed close ---+
+                                      |
+                      transcriptRoot + finalStateHash
+                           + paymentEvidenceRoot
+                                      |
+                              EVENTMESH_V02
+                                      |
+                                     CKB
+                                      |
+                            standalone verifier
+```
 
-Included:
-
-- two independent operator keys and SQLite stores;
-- signed ordered events with `previousHash` chaining;
-- explicit ACCEPT/REJECT ACKs from the counterparty;
-- replay/sequence/previous-hash checks;
-- restart persistence through SQLite/WAL;
-- transcript root and two close signatures;
-- standalone transcript verifier;
-- optional Fiber JSON-RPC adapter;
-- optional CKB Testnet anchor;
-- one-page demo UI and Docker Compose.
-
-Explicitly **not** in v0.1: discovery, marketplace, reputation, multilateral sessions, conditional payments, custom CKB scripts, mobile wallet, AI-agent framework, or mainnet automation.
-
-## Quick start — local mode
-
-Prerequisites: Docker + Docker Compose.
+## Quick start
 
 ```bash
 cp .env.example .env
+npm install --no-audit --no-fund
+npm run verify:all
 docker compose up --build
-```
-
-Open **http://localhost:3000**.
-
-Local mode requires no CKB and no Fiber funds. Operator A is exposed at `http://localhost:4001`; Operator B at `http://localhost:4002`.
-
-### Smoke test
-
-```bash
 node scripts/smoke.mjs
 ```
 
-This creates a session, exchanges two events + ACKs, and closes the session.
+Local smoke mode does not require Fiber or CKB funds.
 
-## Independent transcript verification
-
-```bash
-npm install
-npm run verify -- ./ses_xxx.json
-```
-
-With a CKB Testnet RPC URL:
+## Full independent verification
 
 ```bash
-npm run verify -- ./ses_xxx.json https://your-testnet-ckb-rpc.example
+npm run verify -- transcript.json \
+  --receiver-fiber-rpc http://RECEIVER_FNN:8237 \
+  --ckb-rpc https://YOUR_CKB_TESTNET_RPC \
+  --require-close \
+  --require-fiber \
+  --require-ckb
 ```
 
-## Optional Fiber Testnet integration
+See [`docs/HOW_TO_VERIFY.md`](docs/HOW_TO_VERIFY.md).
 
-EventMesh does not embed or fork FNN. It calls an existing FNN JSON-RPC endpoint.
+## Fiber claim
 
-```env
-FIBER_ENABLED=true
-OPERATOR_A_FIBER_RPC_URL=http://host.docker.internal:8227
-OPERATOR_B_FIBER_RPC_URL=http://host.docker.internal:8237
-FIBER_RPC_TOKEN=
+```json
+{
+  "paymentHash": "0x...",
+  "sessionId": "ses_...",
+  "amount": "0x5f5e100",
+  "currency": "Fibt",
+  "udtTypeScript": {
+    "code_hash": "0x...",
+    "hash_type": "type",
+    "args": "0x..."
+  }
+}
 ```
 
-Then restart:
+`udtTypeScript` is optional. When present, the receiver must observe and exactly match it; EventMesh does not silently claim UDT verification when the FNN response does not expose the script.
 
-```bash
-docker compose up --build
-```
-
-### Important v0.1 security note
-
-The current v0.1 operator still places peer-facing routes and Fiber administrative routes in the same HTTP process. **Do not expose Fiber spending endpoints to untrusted networks.** Keep operator/FNN endpoints behind a trusted firewall or local environment until the v0.1.1 admin-auth/API split in the blueprint is complete.
-
-## Optional CKB Testnet anchor
-
-Only Operator A anchors in v0.1.
-
-```env
-CKB_ENABLED=true
-CKB_PRIVATE_KEY=<64-hex-testnet-private-key>
-CKB_RPC_URL=
-CKB_ANCHOR_CAPACITY_CKB=200
-```
-
-Use only a Testnet key.
-
-The compact commitment contains:
+## CKB commitment
 
 ```text
-EVENTMESH_V01 || SHA256(sessionId) || transcriptRoot || finalStateHash
+EVENTMESH_V02
+|| SHA256(sessionId)
+|| transcriptRoot
+|| finalStateHash
+|| paymentEvidenceRoot
 ```
 
-No custom lock/type script is required.
+The verifier derives these bytes itself and accepts the anchor only after CKB reports the transaction as committed and the exact output data is present. The v0.2 commitment is 141 bytes; the CKB adapter therefore enforces the standard secp output occupied-capacity minimum automatically (202 CKB for this exact payload) and defaults to a 220 CKB output margin.
 
-## Current API surface
+## Important status
 
-```text
-GET  /health
-GET  /identity
-GET  /sessions
-GET  /sessions/:id
-GET  /sessions/:id/transcript
-POST /sessions
-POST /sessions/:id/join
-POST /sessions/:id/events
-POST /sessions/:id/events/receive
-POST /sessions/:id/events/:eventHash/retry
-POST /sessions/:id/events/:eventHash/ack
-POST /sessions/:id/acks/receive
-POST /sessions/:id/close
-POST /sessions/:id/close/receive
-POST /sessions/:id/anchor/receive
+**Reference implementation / Testnet validation project. Not audited. Do not use production keys or mainnet funds.**
 
-# v0.1 administrative Fiber endpoints — keep private
-POST /fiber/new-invoice
-POST /fiber/send-payment
-GET  /fiber/payments/:paymentHash
-```
-
-The target v0.2 API separation is documented in the project blueprint.
-
-## Protocol notes
-
-- Only one event may be pending at a time in v0.1.
-- The sender cannot ACK its own event.
-- Sequence and `previousHash` must match the local transcript.
-- REJECT prevents normal close; v0.1 has no dispute protocol.
-- Operator A initiates close in v0.1.
-- Operator B independently recomputes the transcript root before signing.
-- Keys persist under each operator data directory if no explicit key is supplied.
-
-## Development without Docker
-
-```bash
-npm install
-npm run dev:a
-npm run dev:b
-npm run dev:demo
-```
-
-## Tests
-
-```bash
-npm test
-```
-
-The current suite is a protocol-core baseline. The required integration-test matrix for v0.1.1/v0.2 is listed in [`docs/PROJECT_BLUEPRINT.md`](docs/PROJECT_BLUEPRINT.md).
-
-## Project status
-
-**Reference implementation / Testnet-oriented MVP. Not audited. Do not use production keys or mainnet funds.**
-
-## v0.1.1 funding-readiness notes
-
-The hardened patch adds immutable conflict evidence, signature-domain separation, receiver-side Fiber settlement checks, CKB committed-state verification, public-mode/admin controls, and reviewer/funding docs. See `docs/FUNDING_PROPOSAL_DRAFT.md`, `docs/HOW_TO_VERIFY.md`, `docs/THREAT_MODEL.md`, and `CHANGELOG_FUNDING_PATCH.md`.
-
-Do not claim a public independent-host Fiber/CKB proof until a real Testnet payment, committed CKB tx, transcript, and standalone-verifier output have been published.
+The next strongest milestone is not another dashboard feature. It is a public proof with two genuinely independent hosts/FNN nodes followed by one small adapter into an independently maintained CKBuilder application.

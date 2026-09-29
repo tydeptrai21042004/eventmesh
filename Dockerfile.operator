@@ -6,6 +6,7 @@ COPY apps/operator/package.json apps/operator/package.json
 COPY packages/core/package.json packages/core/package.json
 COPY packages/fiber/package.json packages/fiber/package.json
 COPY packages/ckb/package.json packages/ckb/package.json
+COPY packages/adapter-sdk/package.json packages/adapter-sdk/package.json
 COPY apps/verifier/package.json apps/verifier/package.json
 RUN npm install
 COPY packages ./packages
