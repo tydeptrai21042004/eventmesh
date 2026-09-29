@@ -205,3 +205,24 @@ independent application
 + third-party verification
 + documented adopter feedback
 ```
+
+## One-project Vercel demo (v0.3 path)
+
+This repository now includes a public-demo deployment path that does **not** expose an admin token or operator private keys in the browser.
+
+- Frontend: `apps/demo`
+- Same-origin API: `api/demo.ts`
+- Durable state: Postgres (`DATABASE_URL`, `POSTGRES_URL`, or `POSTGRES_PRISMA_URL`)
+- Operator A/B identities: server-only, derived from `DEMO_MASTER_SECRET` or explicit private-key env vars
+- Real `PAYMENT_SETTLED`: refused unless `FIBER_RECEIVER_RPC_URL` is configured and the receiver FNN reports a matching paid invoice
+- CKB anchoring: optional; broadcast state is persisted before submission and ambiguous failures become `BROADCAST_UNKNOWN` rather than being blindly retried
+
+### Deploy
+
+```bash
+./scripts/bootstrap-vercel.sh
+```
+
+Then import the repository root into a single Vercel project, attach Postgres, set `DEMO_MASTER_SECRET`, and deploy. `vercel.json` builds the Vite app and exposes `/api/demo` from the same project.
+
+This Vercel surface is intentionally a reviewer/demo surface. The original `apps/operator` two-process implementation remains available for independent-host protocol testing.

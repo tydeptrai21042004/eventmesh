@@ -250,12 +250,25 @@ export class Store {
         .run(paymentHash, sessionId, eventHash.toLowerCase(), JSON.stringify(evidence), evidence.verifiedAt);
       return "INSERTED";
     }
+    const previous = JSON.parse(row.evidence_json) as FiberPaymentEvidence;
+    const stableIdentity = (item: FiberPaymentEvidence) => canonical({
+      claim: item.claim,
+      verifier: item.verifier,
+      invoiceStatus: item.invoiceStatus,
+      payeePublicKey: item.payeePublicKey,
+      observedUdtTypeScript: item.observedUdtTypeScript
+    });
     if (
       row.session_id === sessionId
       && row.event_hash === eventHash.toLowerCase()
-      && canonical(JSON.parse(row.evidence_json)) === canonical(evidence)
-    ) return "IDEMPOTENT";
-    this.conflict(sessionId, "PAYMENT", JSON.parse(row.evidence_json), evidence);
+      && stableIdentity(previous) === stableIdentity(evidence)
+    ) {
+      // Re-verification after a crash/retry is idempotent even though verifiedAt changes.
+      this.db.prepare("UPDATE payment_evidence SET evidence_json=?,verified_at=? WHERE payment_hash=?")
+        .run(JSON.stringify(evidence), evidence.verifiedAt, paymentHash);
+      return "IDEMPOTENT";
+    }
+    this.conflict(sessionId, "PAYMENT", previous, evidence);
     return "CONFLICT";
   }
 

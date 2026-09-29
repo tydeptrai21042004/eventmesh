@@ -22,7 +22,9 @@
     "check": "npm run typecheck && npm test && npm run build",
     "verify:all": "npm run check",
     "smoke": "node scripts/smoke.mjs",
-    "evidence:check": "node scripts/evidence-check.mjs"
+    "evidence:check": "node scripts/evidence-check.mjs",
+    "build:demo": "npm --workspace @eventmesh/demo run build",
+    "vercel-build": "npm run build:demo"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",
@@ -31,5 +33,8 @@
     "typescript": "5.9.2",
     "vitest": "3.2.4"
   },
-  "packageManager": "npm@10.9.2"
+  "packageManager": "npm@10.9.2",
+  "dependencies": {
+    "postgres": "3.4.7"
+  }
 }
