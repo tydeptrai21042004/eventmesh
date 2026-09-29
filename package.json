@@ -1,6 +1,6 @@
 {
   "name": "eventmesh",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -11,20 +11,22 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
-    "test": "vitest run",
+    "build": "npm run build:runtime && npm run build:demo",
+    "test": "npm run build:runtime && vitest run",
     "test:watch": "vitest",
     "dev:a": "OPERATOR_NAME=operator-a PORT=4001 SELF_URL=http://localhost:4001 DEFAULT_PEER_URL=http://localhost:4002 DATA_DIR=.data/operator-a tsx apps/operator/src/index.ts",
     "dev:b": "OPERATOR_NAME=operator-b PORT=4002 SELF_URL=http://localhost:4002 DEFAULT_PEER_URL=http://localhost:4001 DATA_DIR=.data/operator-b tsx apps/operator/src/index.ts",
     "dev:demo": "npm --workspace @eventmesh/demo run dev",
     "verify": "tsx apps/verifier/src/index.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm test && npm run build",
+    "check": "npm run build:runtime && npm run typecheck && vitest run && npm run build:demo",
     "verify:all": "npm run check",
     "smoke": "node scripts/smoke.mjs",
     "evidence:check": "node scripts/evidence-check.mjs",
     "build:demo": "npm --workspace @eventmesh/demo run build",
-    "vercel-build": "npm run build:demo"
+    "vercel-build": "npm run build:runtime && npm run build:demo",
+    "build:runtime": "npm --workspace @eventmesh/core run build && npm --workspace @eventmesh/fiber run build && npm --workspace @eventmesh/ckb run build && npm --workspace @eventmesh/adapter-sdk run build",
+    "health:remote": "node scripts/verify-deployment.mjs"
   },
   "devDependencies": {
     "@types/better-sqlite3": "7.6.13",

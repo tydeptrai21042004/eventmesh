@@ -1,10 +1,20 @@
 {
   "name": "@eventmesh/ckb",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "type": "module",
-  "exports": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
   "dependencies": {
     "@ckb-ccc/shell": "1.3.5",
-    "@eventmesh/core": "0.2.0"
+    "@eventmesh/core": "0.4.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
   }
 }

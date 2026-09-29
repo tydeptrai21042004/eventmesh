@@ -1,12 +1,12 @@
 {
   "name": "@eventmesh/operator",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@eventmesh/ckb": "0.2.0",
-    "@eventmesh/core": "0.2.0",
-    "@eventmesh/fiber": "0.2.0",
+    "@eventmesh/ckb": "0.4.0",
+    "@eventmesh/core": "0.4.0",
+    "@eventmesh/fiber": "0.4.0",
     "@fastify/cors": "11.1.0",
     "better-sqlite3": "12.2.0",
     "fastify": "5.5.0",

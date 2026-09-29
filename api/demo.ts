@@ -26,7 +26,13 @@ import {
 import { FiberRpcClient } from "@eventmesh/fiber";
 
 const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
-const sql = databaseUrl ? postgres(databaseUrl, { max: 3, idle_timeout: 10, connect_timeout: 10 }) : undefined;
+const CKB_TESTNET_RPC_URL = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
+const sql = databaseUrl ? postgres(databaseUrl, {
+  max: 3,
+  idle_timeout: 10,
+  connect_timeout: 10,
+  prepare: false
+}) : undefined;
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
 
 function derivedKey(label: string) {
@@ -35,8 +41,25 @@ function derivedKey(label: string) {
   const scalar = (BigInt(`0x${raw}`) % (SECP256K1_N - 1n)) + 1n;
   return `0x${scalar.toString(16).padStart(64, "0")}`;
 }
-const keyA = process.env.OPERATOR_A_PRIVATE_KEY || derivedKey("operator-a");
-const keyB = process.env.OPERATOR_B_PRIVATE_KEY || derivedKey("operator-b");
+
+const configurationErrors: string[] = [];
+function operatorKey(name: "OPERATOR_A_PRIVATE_KEY" | "OPERATOR_B_PRIVATE_KEY", label: string) {
+  const value = process.env[name]?.trim();
+  if (!value) return derivedKey(label);
+  if (!/^0x[0-9a-fA-F]{64}$/.test(value)) {
+    configurationErrors.push(`${name}_INVALID_FORMAT`);
+    return derivedKey(label);
+  }
+  const scalar = BigInt(value);
+  if (scalar <= 0n || scalar >= SECP256K1_N) {
+    configurationErrors.push(`${name}_OUT_OF_RANGE`);
+    return derivedKey(label);
+  }
+  return value;
+}
+
+const keyA = operatorKey("OPERATOR_A_PRIVATE_KEY", "operator-a");
+const keyB = operatorKey("OPERATOR_B_PRIVATE_KEY", "operator-b");
 const pubA = publicKeyFromPrivate(keyA);
 const pubB = publicKeyFromPrivate(keyB);
 
@@ -102,7 +125,10 @@ async function ensureSchema() {
       );
       CREATE INDEX IF NOT EXISTS em_demo_events_session_idx ON em_demo_events(session_id, sequence);
     `);
-  })();
+  })().catch((error) => {
+    schemaReady = undefined;
+    throw error;
+  });
   return schemaReady;
 }
 
@@ -115,10 +141,22 @@ function json(res: ServerResponse, status: number, body: unknown) {
 }
 
 async function bodyOf(req: any) {
+  const maxBytes = 64 * 1024;
+  const contentLength = Number(req.headers?.["content-length"] || 0);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new Error("REQUEST_BODY_TOO_LARGE");
   if (req.body && typeof req.body === "object") return req.body;
-  if (typeof req.body === "string") return JSON.parse(req.body || "{}");
+  if (typeof req.body === "string") {
+    if (Buffer.byteLength(req.body) > maxBytes) throw new Error("REQUEST_BODY_TOO_LARGE");
+    return JSON.parse(req.body || "{}");
+  }
   const chunks: Buffer[] = [];
-  for await (const chunk of req as IncomingMessage) chunks.push(Buffer.from(chunk));
+  let total = 0;
+  for await (const chunk of req as IncomingMessage) {
+    const buffer = Buffer.from(chunk);
+    total += buffer.length;
+    if (total > maxBytes) throw new Error("REQUEST_BODY_TOO_LARGE");
+    chunks.push(buffer);
+  }
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
@@ -185,14 +223,20 @@ async function createSession(req: any, input: any) {
   const idem = String(input.idempotencyKey || "");
   return withIdempotency(`create:${idem}`, input, async (tx) => {
     const now = new Date();
+    const requestedTtl = Number(input.ttlSeconds ?? 3600);
+    const requestedMaxEvents = Number(input.maxEvents ?? 100);
+    if (!Number.isFinite(requestedTtl) || requestedTtl <= 0) throw new Error("INVALID_TTL_SECONDS");
+    if (!Number.isFinite(requestedMaxEvents) || !Number.isInteger(requestedMaxEvents)) throw new Error("INVALID_MAX_EVENTS");
+    const ttlSeconds = Math.min(Math.max(requestedTtl, 1), 86400);
+    const maxEvents = Math.min(Math.max(requestedMaxEvents, 1), 1000);
     const session = {
       sessionId: createSessionId(), protocol: PROTOCOL,
       operatorA: pubA, operatorB: pubB,
       operatorAUrl: `${baseUrl(req)}/api/demo?operator=A`,
       operatorBUrl: `${baseUrl(req)}/api/demo?operator=B`,
       createdAt: now.toISOString(),
-      expiresAt: new Date(now.getTime() + Math.min(Number(input.ttlSeconds || 3600), 86400) * 1000).toISOString(),
-      maxEvents: Math.min(Math.max(Number(input.maxEvents || 100), 1), 1000)
+      expiresAt: new Date(now.getTime() + ttlSeconds * 1000).toISOString(),
+      maxEvents
     };
     const signed: SignedSession = {
       session,
@@ -226,7 +270,9 @@ async function appendEvent(input: any) {
     const existing = await tx`SELECT signed_event,ack FROM em_demo_events WHERE session_id=${sessionId} ORDER BY sequence DESC LIMIT 1`;
     const sequence = existing.length ? Number(existing[0].signed_event.sequence) + 1 : 1;
     if (sequence > signedSession.session.maxEvents) throw new Error("SESSION_MAX_EVENTS_REACHED");
-    const sender = String(input.sender || "A").toUpperCase() === "B" ? "B" : "A";
+    const senderInput = String(input.sender || "A").toUpperCase();
+    if (senderInput !== "A" && senderInput !== "B") throw new Error("INVALID_SENDER");
+    const sender = senderInput as "A" | "B";
     const senderKey = sender === "A" ? keyA : keyB;
     const receiverKey = sender === "A" ? keyB : keyA;
     const receiverPub = sender === "A" ? pubB : pubA;
@@ -242,6 +288,7 @@ async function appendEvent(input: any) {
     let paymentEvidence: FiberPaymentEvidence | undefined;
     if (event.type === "PAYMENT_SETTLED") {
       const claim = event.payload as FiberPaymentClaim;
+      if (String(claim?.sessionId || "") !== sessionId) throw new Error("FIBER_PAYMENT_SESSION_MISMATCH");
       if (!process.env.FIBER_RECEIVER_RPC_URL) throw new Error("FIBER_RECEIVER_RPC_REQUIRED_FOR_PAYMENT_ACCEPT");
       const fiber = new FiberRpcClient(process.env.FIBER_RECEIVER_RPC_URL, process.env.FIBER_RECEIVER_RPC_TOKEN || undefined);
       const verified = await fiber.verifyReceivedPaymentClaim(claim);
@@ -321,30 +368,33 @@ async function anchorSession(input: any) {
     INSERT INTO em_demo_anchor_ops(session_id,commitment_hash,status,data_hex) VALUES(${sessionId},${commitmentHash},'BROADCASTING',${dataHex})
     ON CONFLICT(session_id) DO UPDATE SET commitment_hash=EXCLUDED.commitment_hash,status='BROADCASTING',data_hex=EXCLUDED.data_hex,error=NULL,updated_at=NOW()
   `;
+  let broadcasted: { txHash: string; dataHex: string; status: "PENDING" } | undefined;
   try {
     const { CkbAnchorClient } = await import("@eventmesh/ckb");
-    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY, process.env.CKB_RPC_URL || undefined, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
-    const anchor = await client.anchor({ sessionId, transcriptRoot: close.transcriptRoot, finalStateHash: close.finalStateHash, paymentEvidenceRoot: close.paymentEvidenceRoot });
+    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY, CKB_TESTNET_RPC_URL, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
+    broadcasted = await client.anchor({ sessionId, transcriptRoot: close.transcriptRoot, finalStateHash: close.finalStateHash, paymentEvidenceRoot: close.paymentEvidenceRoot });
     await sql.begin(async (tx: any) => {
-      await tx`UPDATE em_demo_anchor_ops SET status='PENDING',tx_hash=${anchor.txHash},data_hex=${anchor.dataHex},updated_at=NOW() WHERE session_id=${sessionId}`;
-      await tx`UPDATE em_demo_sessions SET anchor=${tx.json(anchor)} WHERE session_id=${sessionId}`;
+      await tx`UPDATE em_demo_anchor_ops SET status='PENDING',tx_hash=${broadcasted!.txHash},data_hex=${broadcasted!.dataHex},updated_at=NOW() WHERE session_id=${sessionId}`;
+      await tx`UPDATE em_demo_sessions SET anchor=${tx.json(broadcasted)} WHERE session_id=${sessionId}`;
     });
-    return { ok: true, anchor };
+    return { ok: true, anchor: broadcasted };
   } catch (error) {
-    await sql`UPDATE em_demo_anchor_ops SET status='BROADCAST_UNKNOWN',error=${String(error)},updated_at=NOW() WHERE session_id=${sessionId}`;
-    throw new Error("ANCHOR_BROADCAST_UNKNOWN: transaction may have been submitted; automatic retry blocked");
+    const txHash = broadcasted?.txHash || null;
+    await sql`UPDATE em_demo_anchor_ops SET status='BROADCAST_UNKNOWN',tx_hash=COALESCE(tx_hash,${txHash}),error=${safeErrorMessage(error)},updated_at=NOW() WHERE session_id=${sessionId}`;
+    throw new Error(txHash
+      ? "ANCHOR_BROADCAST_UNKNOWN: tx hash was recovered; run reconcile before any retry"
+      : "ANCHOR_BROADCAST_UNKNOWN: transaction may have been submitted; automatic retry blocked");
   }
 }
 
 async function reconcileAnchor(input: any) {
   if (!sql) throw new Error("DATABASE_URL_REQUIRED");
   const sessionId = String(input.sessionId || "");
-  if (!process.env.CKB_RPC_URL) throw new Error("CKB_RPC_URL_REQUIRED");
   const ops = await sql`SELECT * FROM em_demo_anchor_ops WHERE session_id=${sessionId}`;
   if (!ops.length) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
   if (!ops[0].tx_hash) return { ok: false, status: ops[0].status, requiresManualReview: true, reason: "TX_HASH_UNKNOWN" };
   const { inspectAnchorRpc } = await import("@eventmesh/ckb");
-  const inspected = await inspectAnchorRpc(process.env.CKB_RPC_URL, ops[0].tx_hash, ops[0].data_hex);
+  const inspected = await inspectAnchorRpc(CKB_TESTNET_RPC_URL, ops[0].tx_hash, ops[0].data_hex);
   if (inspected.ok) {
     const anchor = { txHash: ops[0].tx_hash, dataHex: ops[0].data_hex, status: "COMMITTED", blockHash: inspected.blockHash };
     await sql.begin(async (tx: any) => {
@@ -356,28 +406,63 @@ async function reconcileAnchor(input: any) {
   return { ok: false, status: "PENDING", verification: inspected };
 }
 
+function safeErrorMessage(error: unknown) {
+  const raw = String((error as any)?.message || error || "UNKNOWN_ERROR");
+  return raw
+    .replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "postgresql://[redacted]")
+    .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
+    .slice(0, 500);
+}
+
 export default async function handler(req: any, res: ServerResponse) {
   try {
-    await ensureSchema();
     if (req.method === "GET") {
       const url = new URL(req.url || "/api/demo", baseUrl(req));
       const sessionId = url.searchParams.get("sessionId");
-      if (sessionId) return json(res, 200, await loadState(sessionId));
-      const db = sql!;
-      const recent = await db`SELECT session_id,status,created_at FROM em_demo_sessions ORDER BY created_at DESC LIMIT 10`;
+      if (sessionId) {
+        await ensureSchema();
+        return json(res, 200, await loadState(sessionId));
+      }
+
+      let database = false;
+      let databaseError: string | undefined;
+      let recent: any[] = [];
+      if (!sql) {
+        databaseError = "DATABASE_URL_NOT_CONFIGURED";
+      } else {
+        try {
+          await ensureSchema();
+          await sql`SELECT 1 AS ok`;
+          database = true;
+          recent = await sql`SELECT session_id,status,created_at FROM em_demo_sessions ORDER BY created_at DESC LIMIT 10`;
+        } catch (error) {
+          databaseError = safeErrorMessage(error);
+        }
+      }
+
       return json(res, 200, {
-        ok: true,
+        ok: database,
         protocol: PROTOCOL,
+        version: "0.4.0",
         operatorA: pubA,
         operatorB: pubB,
-        database: true,
+        database,
+        databaseConfigured: !!sql,
+        databaseError,
         fiberReceiverVerification: !!process.env.FIBER_RECEIVER_RPC_URL,
         ckbAnchoring: !!process.env.CKB_PRIVATE_KEY,
-        ckbReconciliation: !!process.env.CKB_RPC_URL,
+        ckbReconciliation: true,
+        ckbRpcUrl: process.env.CKB_RPC_URL ? "configured" : "default-testnet",
+        masterSecretConfigured: !!process.env.DEMO_MASTER_SECRET,
+        configurationErrors,
         recent
       });
     }
+
     if (req.method !== "POST") return json(res, 405, { error: "METHOD_NOT_ALLOWED" });
+    if (!process.env.DEMO_MASTER_SECRET) throw new Error("DEMO_MASTER_SECRET_REQUIRED");
+    if (configurationErrors.length) throw new Error(configurationErrors.join(","));
+    await ensureSchema();
     await rateLimit(req);
     const input = await bodyOf(req);
     let result: any;
@@ -392,8 +477,11 @@ export default async function handler(req: any, res: ServerResponse) {
     const state = result?.sessionId ? await loadState(result.sessionId) : input.sessionId ? await loadState(String(input.sessionId)) : undefined;
     return json(res, 200, { ...result, state });
   } catch (error: any) {
-    const message = String(error?.message || error);
-    const status = message === "RATE_LIMITED" ? 429 : message.includes("NOT_FOUND") ? 404 : message.includes("REQUIRED") ? 503 : 400;
+    const message = safeErrorMessage(error);
+    const status = message === "RATE_LIMITED" ? 429
+      : message.includes("NOT_FOUND") ? 404
+      : message.includes("REQUIRED") || message.includes("DATABASE") ? 503
+      : 400;
     return json(res, status, { error: message });
   }
 }

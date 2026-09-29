@@ -13,16 +13,34 @@ const createKey = () => {
   return next;
 };
 
+async function parseApiResponse(response: Response, label: string) {
+  const text = await response.text();
+  let payload: any = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    const snippet = text.replace(/\s+/g, " ").trim().slice(0, 180);
+    const platformHint = response.status >= 500
+      ? " The Vercel function likely failed before EventMesh could return JSON; open the deployment Function Logs."
+      : "";
+    throw new Error(`${label} returned non-JSON (HTTP ${response.status}).${platformHint}${snippet ? ` Response: ${snippet}` : ""}`);
+  }
+  if (!response.ok) throw new Error(payload.error || `${label} HTTP ${response.status}`);
+  return payload;
+}
+
 async function call(body?: any, sessionId?: string) {
   const response = await fetch(sessionId ? `/api/demo?sessionId=${encodeURIComponent(sessionId)}` : "/api/demo", body ? {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify(body)
-  } : undefined);
-  const text = await response.text();
-  const payload = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-  return payload;
+  } : { headers: { accept: "application/json" } });
+  return parseApiResponse(response, "/api/demo");
+}
+
+async function callHealth() {
+  const response = await fetch("/api/health?deep=1", { headers: { accept: "application/json" } });
+  return parseApiResponse(response, "/api/health");
 }
 
 function short(value?: string, n = 13) {
@@ -32,6 +50,7 @@ function short(value?: string, n = 13) {
 
 function App() {
   const [health, setHealth] = useState<any>();
+  const [diagnostics, setDiagnostics] = useState<any>();
   const [state, setState] = useState<State>();
   const [sessionId, setSessionId] = useState("");
   const [busy, setBusy] = useState("");
@@ -49,7 +68,22 @@ function App() {
     setState(await call(undefined, id));
   };
 
-  useEffect(() => { call().then(setHealth).catch(e => setError(e.message)); }, []);
+  const reloadReadiness = async () => {
+    setError("");
+    const [diagResult, demoResult] = await Promise.allSettled([callHealth(), call()]);
+    if (diagResult.status === "fulfilled") setDiagnostics(diagResult.value);
+    if (demoResult.status === "fulfilled") setHealth(demoResult.value);
+    if (demoResult.status === "rejected") {
+      const fallback = diagResult.status === "fulfilled"
+        ? " Deployment health is reachable, but /api/demo failed. Check the Vercel Function Logs for api/demo."
+        : "";
+      setError(`${demoResult.reason?.message || String(demoResult.reason)}${fallback}`);
+    } else if (diagResult.status === "rejected") {
+      setError(diagResult.reason?.message || String(diagResult.reason));
+    }
+  };
+
+  useEffect(() => { void reloadReadiness(); }, []);
 
   const run = async (label: string, fn: () => Promise<any>) => {
     setBusy(label); setError(""); setNotice("");
@@ -99,20 +133,20 @@ function App() {
   };
 
   const readiness = useMemo(() => [
-    ["Postgres durable state", !!health?.database],
-    ["Receiver-side Fiber verification", !!health?.fiberReceiverVerification],
-    ["CKB anchor broadcast", !!health?.ckbAnchoring],
-    ["CKB reconciliation", !!health?.ckbReconciliation]
-  ], [health]);
+    ["Postgres durable state", !!health?.database || !!diagnostics?.database?.reachable],
+    ["Receiver-side Fiber verification", !!health?.fiberReceiverVerification && !!diagnostics?.fiber?.reachable],
+    ["CKB Testnet RPC", !!diagnostics?.ckb?.reachable],
+    ["CKB anchor signing", !!health?.ckbAnchoring || !!diagnostics?.ckb?.signerConfigured]
+  ], [health, diagnostics]);
 
   return <main>
     <header className="hero">
       <div>
-        <div className="eyebrow">CKB + Fiber · one-project Vercel demo</div>
-        <h1>EventMesh <span>v0.3 demo</span></h1>
+        <div className="eyebrow">CKB Testnet + Fiber · one-project Vercel demo</div>
+        <h1>EventMesh <span>v0.4 demo</span></h1>
         <p>Durable bilateral reconciliation for application events when payment, retries, crashes, or network ambiguity leave operators with different local views.</p>
       </div>
-      <button className="primary" disabled={!!busy} onClick={create}>{busy === "create" ? "Creating…" : "Start signed session"}</button>
+      <button className="primary" disabled={!!busy || !(health?.database || diagnostics?.database?.reachable) || !(health?.masterSecretConfigured || diagnostics?.security?.masterSecretConfigured) || !!health?.configurationErrors?.length} onClick={create}>{busy === "create" ? "Creating…" : "Start signed session"}</button>
     </header>
 
     {error && <div className="banner error"><b>Action failed</b><span>{error}</span></div>}
@@ -124,9 +158,14 @@ function App() {
     </section>
 
     <section className="card readiness">
-      <div className="section-head"><div><small>DEPLOYMENT</small><h2>Runtime readiness</h2></div><code>/api/demo</code></div>
+      <div className="section-head"><div><small>DEPLOYMENT</small><h2>Runtime readiness</h2></div><button onClick={() => void reloadReadiness()} disabled={!!busy}>Run self-test</button></div>
       <div className="readiness-grid">{readiness.map(([name, ready]: any) => <div key={name}><span className={ready ? "dot on" : "dot"}/><b>{name}</b><small>{ready ? "enabled" : "optional / not configured"}</small></div>)}</div>
-      <p className="muted">PAYMENT_SETTLED is intentionally refused unless the receiver Fiber RPC is configured. The public demo never fabricates payment acceptance.</p>
+      <p className="muted">PAYMENT_SETTLED is intentionally refused unless a reachable receiver Fiber RPC is configured. CKB reads default to the public Testnet RPC; broadcasting still requires your server-side Testnet private key.</p>
+      {diagnostics?.database?.error && <p className="warn"><b>Database:</b> {diagnostics.database.error}</p>}
+      {health?.databaseError && !diagnostics?.database?.reachable && <p className="warn"><b>/api/demo:</b> {health.databaseError}</p>}
+      {diagnostics && !diagnostics?.security?.masterSecretConfigured && <p className="warn"><b>Security:</b> set <code>DEMO_MASTER_SECRET</code> before public mutation endpoints are enabled.</p>}
+      {!!health?.configurationErrors?.length && <p className="warn"><b>Configuration:</b> {health.configurationErrors.join(", ")}</p>}
+      <details><summary>Deployment diagnostics</summary><pre>{JSON.stringify({ health: diagnostics, demo: health ? { ok: health.ok, version: health.version, database: health.database, databaseConfigured: health.databaseConfigured, ckbRpcUrl: health.ckbRpcUrl } : null }, null, 2)}</pre></details>
     </section>
 
     {!sessionId ? <section className="card empty"><h2>Start with one click</h2><p>The frontend and backend deploy from this single repository. Durable state is Postgres-backed and privileged operator keys remain server-side.</p></section> : <>
@@ -149,7 +188,7 @@ function App() {
           <div className="section-head"><div><small>OPTIONAL VALUE BINDING</small><h2>Real receiver Fiber proof</h2></div></div>
           <label>Payment hash<input value={paymentHash} onChange={e => setPaymentHash(e.target.value)}/></label>
           <div className="grid two compact"><label>Amount<input value={amount} onChange={e => setAmount(e.target.value)}/></label><label>Currency<select value={currency} onChange={e => setCurrency(e.target.value)}><option>Fibt</option><option>Fibb</option><option>Fibd</option></select></label></div>
-          <button disabled={!!busy || !health?.fiberReceiverVerification || has("PAYMENT_SETTLED") || closed} onClick={settle}>Verify receiver FNN + ACCEPT payment</button>
+          <button disabled={!!busy || !health?.fiberReceiverVerification || !diagnostics?.fiber?.reachable || has("PAYMENT_SETTLED") || closed} onClick={settle}>Verify receiver FNN + ACCEPT payment</button>
           {!health?.fiberReceiverVerification && <p className="warn">Set <code>FIBER_RECEIVER_RPC_URL</code> to enable this. This demo refuses to simulate a successful payment.</p>}
 
           <hr/>
