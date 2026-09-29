@@ -1,0 +1,7 @@
+{
+  "name": "@eventmesh/verifier",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@eventmesh/core": "0.1.0", "@eventmesh/ckb": "0.1.0" }
+}

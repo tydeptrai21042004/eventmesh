@@ -1,0 +1,53 @@
+services:
+  operator-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.operator
+    environment:
+      OPERATOR_NAME: operator-a
+      PORT: 4000
+      SELF_URL: http://operator-a:4000
+      DEFAULT_PEER_URL: http://operator-b:4000
+      DATA_DIR: /data
+      FIBER_ENABLED: ${FIBER_ENABLED:-false}
+      FIBER_RPC_URL: ${OPERATOR_A_FIBER_RPC_URL:-}
+      FIBER_RPC_TOKEN: ${FIBER_RPC_TOKEN:-}
+      CKB_ENABLED: ${CKB_ENABLED:-false}
+      CKB_PRIVATE_KEY: ${CKB_PRIVATE_KEY:-}
+      CKB_RPC_URL: ${CKB_RPC_URL:-}
+      CKB_ANCHOR_CAPACITY_CKB: ${CKB_ANCHOR_CAPACITY_CKB:-200}
+    volumes: ["operator-a-data:/data"]
+    ports: ["4001:4000"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  operator-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.operator
+    environment:
+      OPERATOR_NAME: operator-b
+      PORT: 4000
+      SELF_URL: http://operator-b:4000
+      DEFAULT_PEER_URL: http://operator-a:4000
+      DATA_DIR: /data
+      FIBER_ENABLED: ${FIBER_ENABLED:-false}
+      FIBER_RPC_URL: ${OPERATOR_B_FIBER_RPC_URL:-}
+      FIBER_RPC_TOKEN: ${FIBER_RPC_TOKEN:-}
+      CKB_ENABLED: "false"
+    volumes: ["operator-b-data:/data"]
+    ports: ["4002:4000"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile.demo
+      args:
+        VITE_OPERATOR_A_URL: http://localhost:4001
+        VITE_OPERATOR_B_URL: http://localhost:4002
+    ports: ["3000:80"]
+    depends_on: [operator-a, operator-b]
+
+volumes:
+  operator-a-data:
+  operator-b-data:
