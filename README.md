@@ -206,11 +206,11 @@ independent application
 + documented adopter feedback
 ```
 
-## One-project Vercel demo (v0.4 path)
+## One-project Vercel demo (v0.4.1 JSON path)
 
-The public demo deploys the Vite UI, `/api/demo`, `/api/health`, and durable Neon/Postgres state from one Vercel project. Browser code never receives operator private keys or an admin token.
+The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project. It requires no database: demo state is JSON-backed (`/tmp` on Vercel, `.data/` locally). Browser code never receives operator private keys or an admin token.
 
-The v0.4 path also fixes the previous opaque Vercel failure mode: internal workspace packages are compiled to JavaScript before function packaging, `/api/demo` can report database configuration failures as JSON, and the frontend handles non-JSON platform errors without crashing on `JSON.parse`.
+The v0.4.1 demo path keeps the runtime packages compiled before function packaging, reports JSON-storage readiness through `/api/demo` and `/api/health`, and handles non-JSON platform errors without crashing on `JSON.parse`. Vercel `/tmp` is explicitly treated as ephemeral demo storage, not durable persistence.
 
 ### Generate configuration and deploy
 
@@ -220,10 +220,10 @@ chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-The script pushes the Neon/runtime variables to Vercel, deploys, probes `/api/health?deep=1`, and performs a signed create → event → close smoke test against the deployed URL. CKB uses Testnet by default for RPC reads; broadcasting requires a funded Testnet-only `CKB_PRIVATE_KEY`.
+The script pushes the runtime variables to Vercel, deploys, probes `/api/health?deep=1`, and performs a signed create → event → close smoke test against the deployed URL. CKB uses Testnet by default for RPC reads; broadcasting requires both a funded Testnet-only `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true`.
 
 A native Fiber FNN should remain on a persistent host; set `FIBER_RECEIVER_RPC_URL` to that receiver-owned node. EventMesh intentionally refuses `PAYMENT_SETTLED` when the receiver RPC cannot prove the matching paid invoice.
 
-See `VERCEL_DEPLOYMENT.md` for exact Neon, CKB Testnet, Fiber, diagnostics, and recovery details.
+See `VERCEL_DEPLOYMENT.md` for the zero-database JSON demo, CKB Testnet, Fiber, diagnostics, and security details.
 
 This Vercel surface is intentionally a reviewer/demo surface. The original `apps/operator` two-process implementation remains available for independent-host protocol testing.

@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHmac } from "node:crypto";
-import postgres from "postgres";
+import { createHmac, randomBytes } from "node:crypto";
 import {
   PROTOCOL,
   SIGNING_DOMAIN,
@@ -24,25 +23,33 @@ import {
   type SignedSession
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
+import {
+  DEMO_STORAGE_DURABLE,
+  DEMO_STORAGE_MODE,
+  DEMO_STATE_PATH,
+  mutateDemoStore,
+  readDemoStore
+} from "./demo-store.js";
 
-const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
 const CKB_TESTNET_RPC_URL = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
-const sql = databaseUrl ? postgres(databaseUrl, {
-  max: 3,
-  idle_timeout: 10,
-  connect_timeout: 10,
-  prepare: false
-}) : undefined;
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+const processFallbackSecret = randomBytes(32).toString("hex");
+
+function configuredMasterSecret() {
+  const value = process.env.DEMO_MASTER_SECRET?.trim();
+  return value && value.length >= 32 ? value : undefined;
+}
 
 function derivedKey(label: string) {
-  const secret = process.env.DEMO_MASTER_SECRET || "eventmesh-local-demo-change-me";
+  const secret = configuredMasterSecret() || processFallbackSecret;
   const raw = createHmac("sha256", secret).update(label).digest("hex");
   const scalar = (BigInt(`0x${raw}`) % (SECP256K1_N - 1n)) + 1n;
   return `0x${scalar.toString(16).padStart(64, "0")}`;
 }
 
 const configurationErrors: string[] = [];
+if (process.env.DEMO_MASTER_SECRET && !configuredMasterSecret()) configurationErrors.push("DEMO_MASTER_SECRET_TOO_SHORT");
+
 function operatorKey(name: "OPERATOR_A_PRIVATE_KEY" | "OPERATOR_B_PRIVATE_KEY", label: string) {
   const value = process.env[name]?.trim();
   if (!value) return derivedKey(label);
@@ -63,85 +70,19 @@ const keyB = operatorKey("OPERATOR_B_PRIVATE_KEY", "operator-b");
 const pubA = publicKeyFromPrivate(keyA);
 const pubB = publicKeyFromPrivate(keyB);
 
-let schemaReady: Promise<void> | undefined;
-async function ensureSchema() {
-  if (!sql) throw new Error("DATABASE_URL_REQUIRED");
-  if (!schemaReady) schemaReady = (async () => {
-    await sql.unsafe(`
-      CREATE TABLE IF NOT EXISTS em_demo_sessions(
-        session_id TEXT PRIMARY KEY,
-        signed_session JSONB NOT NULL,
-        status TEXT NOT NULL,
-        signed_close JSONB,
-        anchor JSONB,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS em_demo_events(
-        event_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL REFERENCES em_demo_sessions(session_id) ON DELETE CASCADE,
-        sequence INTEGER NOT NULL,
-        signed_event JSONB NOT NULL,
-        ack JSONB,
-        status TEXT NOT NULL,
-        UNIQUE(session_id, sequence)
-      );
-      CREATE TABLE IF NOT EXISTS em_demo_payment_claims(
-        payment_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        event_hash TEXT NOT NULL,
-        claim JSONB NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS em_demo_payment_evidence(
-        payment_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        event_hash TEXT NOT NULL,
-        identity_hash TEXT NOT NULL,
-        evidence JSONB NOT NULL,
-        first_verified_at TIMESTAMPTZ NOT NULL,
-        last_verified_at TIMESTAMPTZ NOT NULL,
-        verification_count INTEGER NOT NULL DEFAULT 1
-      );
-      CREATE TABLE IF NOT EXISTS em_demo_idempotency(
-        idem_key TEXT PRIMARY KEY,
-        request_hash TEXT NOT NULL,
-        response JSONB NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS em_demo_anchor_ops(
-        session_id TEXT PRIMARY KEY REFERENCES em_demo_sessions(session_id) ON DELETE CASCADE,
-        commitment_hash TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL,
-        tx_hash TEXT,
-        data_hex TEXT,
-        block_hash TEXT,
-        error TEXT,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS em_demo_rate_limits(
-        actor_hash TEXT NOT NULL,
-        bucket TEXT NOT NULL,
-        count INTEGER NOT NULL,
-        PRIMARY KEY(actor_hash, bucket)
-      );
-      CREATE INDEX IF NOT EXISTS em_demo_events_session_idx ON em_demo_events(session_id, sequence);
-    `);
-  })().catch((error) => {
-    schemaReady = undefined;
-    throw error;
-  });
-  return schemaReady;
-}
-
 function json(res: ServerResponse, status: number, body: unknown) {
   res.statusCode = status;
   res.setHeader("content-type", "application/json; charset=utf-8");
   res.setHeader("cache-control", "no-store");
   res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("cross-origin-resource-policy", "same-origin");
   res.end(JSON.stringify(body));
 }
 
 async function bodyOf(req: any) {
   const maxBytes = 64 * 1024;
+  const contentType = String(req.headers?.["content-type"] || "").toLowerCase();
+  if (!contentType.startsWith("application/json")) throw new Error("CONTENT_TYPE_APPLICATION_JSON_REQUIRED");
   const contentLength = Number(req.headers?.["content-length"] || 0);
   if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new Error("REQUEST_BODY_TOO_LARGE");
   if (req.body && typeof req.body === "object") return req.body;
@@ -166,62 +107,74 @@ function baseUrl(req: any) {
   return `${proto}://${host}`;
 }
 
+function enforceSameOrigin(req: any) {
+  const origin = String(req.headers?.origin || "").trim();
+  if (!origin) return;
+  if (origin !== baseUrl(req)) throw new Error("CROSS_ORIGIN_MUTATION_REJECTED");
+}
+
 function actorHash(req: any) {
   const ip = String(req.headers?.["x-forwarded-for"] || req.socket?.remoteAddress || "unknown").split(",")[0].trim();
-  return sha256Hex(`${process.env.DEMO_MASTER_SECRET || "eventmesh"}:${ip}`);
+  return sha256Hex(`${configuredMasterSecret() || processFallbackSecret}:${ip}`);
 }
 
 async function rateLimit(req: any, limit = Number(process.env.DEMO_RATE_LIMIT_PER_MINUTE || 60)) {
-  if (!sql) return;
+  const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 5), 1000) : 60;
   const bucket = new Date().toISOString().slice(0, 16);
-  const actor = actorHash(req);
-  const rows = await sql`
-    INSERT INTO em_demo_rate_limits(actor_hash,bucket,count) VALUES(${actor},${bucket},1)
-    ON CONFLICT(actor_hash,bucket) DO UPDATE SET count=em_demo_rate_limits.count+1
-    RETURNING count
-  `;
-  if (Number(rows[0]?.count || 0) > limit) throw new Error("RATE_LIMITED");
+  const key = `${actorHash(req)}:${bucket}`;
+  await mutateDemoStore((store) => {
+    const row = store.rateLimits[key] || { count: 0, updatedAt: new Date().toISOString() };
+    row.count += 1;
+    row.updatedAt = new Date().toISOString();
+    store.rateLimits[key] = row;
+    if (row.count > safeLimit) throw new Error("RATE_LIMITED");
+  });
 }
 
 async function loadState(sessionId: string) {
-  if (!sql) throw new Error("DATABASE_URL_REQUIRED");
-  const sessions = await sql`SELECT * FROM em_demo_sessions WHERE session_id=${sessionId}`;
-  if (!sessions.length) throw new Error("SESSION_NOT_FOUND");
-  const events = await sql`SELECT * FROM em_demo_events WHERE session_id=${sessionId} ORDER BY sequence`;
-  const evidence = await sql`SELECT evidence, first_verified_at, last_verified_at, verification_count FROM em_demo_payment_evidence WHERE session_id=${sessionId} ORDER BY first_verified_at`;
-  const op = await sql`SELECT * FROM em_demo_anchor_ops WHERE session_id=${sessionId}`;
-  return {
-    sessionId,
-    status: sessions[0].status,
-    signedSession: sessions[0].signed_session,
-    events: events.map((r: any) => ({ event: r.signed_event, ack: r.ack, status: r.status })),
-    close: sessions[0].signed_close,
-    anchor: sessions[0].anchor,
-    anchorOperation: op[0] || null,
-    paymentEvidence: evidence.map((r: any) => ({ ...r.evidence, firstVerifiedAt: r.first_verified_at, lastVerifiedAt: r.last_verified_at, verificationCount: r.verification_count }))
-  };
+  return readDemoStore((store) => {
+    const session = store.sessions[sessionId];
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    const events = store.events[sessionId] || [];
+    const evidence = Object.values(store.paymentEvidence)
+      .filter((row: any) => row.sessionId === sessionId)
+      .sort((a: any, b: any) => Date.parse(a.firstVerifiedAt) - Date.parse(b.firstVerifiedAt));
+    return {
+      sessionId,
+      status: session.status,
+      signedSession: session.signedSession,
+      events: events.map((r: any) => ({ event: r.signedEvent, ack: r.ack, status: r.status })),
+      close: session.signedClose || null,
+      anchor: session.anchor || null,
+      anchorOperation: store.anchorOps[sessionId] || null,
+      paymentEvidence: evidence.map((r: any) => ({
+        ...r.evidence,
+        firstVerifiedAt: r.firstVerifiedAt,
+        lastVerifiedAt: r.lastVerifiedAt,
+        verificationCount: r.verificationCount
+      }))
+    };
+  });
 }
 
-async function withIdempotency(key: string, request: unknown, fn: (tx: any) => Promise<any>) {
-  if (!sql) throw new Error("DATABASE_URL_REQUIRED");
+async function withIdempotency(key: string, request: unknown, fn: (store: any) => Promise<any> | any) {
   if (!key || key.length > 160) throw new Error("IDEMPOTENCY_KEY_REQUIRED");
   const requestHash = sha256Hex(canonical(request));
-  return sql.begin(async (tx: any) => {
-    await tx`SELECT pg_advisory_xact_lock(hashtext(${key}))`;
-    const found = await tx`SELECT request_hash,response FROM em_demo_idempotency WHERE idem_key=${key}`;
-    if (found.length) {
-      if (found[0].request_hash !== requestHash) throw new Error("IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST");
-      return { ...found[0].response, duplicate: true };
+  return mutateDemoStore(async (store) => {
+    const found = store.idempotency[key];
+    if (found) {
+      if (found.requestHash !== requestHash) throw new Error("IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST");
+      return { ...found.response, duplicate: true };
     }
-    const result = await fn(tx);
-    await tx`INSERT INTO em_demo_idempotency(idem_key,request_hash,response) VALUES(${key},${requestHash},${tx.json(result)})`;
+    const result = await fn(store);
+    store.idempotency[key] = { requestHash, response: result, createdAt: new Date().toISOString() };
     return result;
   });
 }
 
 async function createSession(req: any, input: any) {
   const idem = String(input.idempotencyKey || "");
-  return withIdempotency(`create:${idem}`, input, async (tx) => {
+  return withIdempotency(`create:${idem}`, input, async (store) => {
     const now = new Date();
     const requestedTtl = Number(input.ttlSeconds ?? 3600);
     const requestedMaxEvents = Number(input.maxEvents ?? 100);
@@ -243,7 +196,8 @@ async function createSession(req: any, input: any) {
       signatureA: signProtocolObject(SIGNING_DOMAIN.SESSION, session, keyA),
       signatureB: signProtocolObject(SIGNING_DOMAIN.SESSION, session, keyB)
     };
-    await tx`INSERT INTO em_demo_sessions(session_id,signed_session,status) VALUES(${session.sessionId},${tx.json(signed)},'ACTIVE')`;
+    store.sessions[session.sessionId] = { signedSession: signed, status: "ACTIVE", createdAt: now.toISOString() };
+    store.events[session.sessionId] = [];
     return { ok: true, sessionId: session.sessionId, signedSession: signed };
   });
 }
@@ -261,14 +215,15 @@ function stableEvidenceIdentity(evidence: FiberPaymentEvidence) {
 async function appendEvent(input: any) {
   const sessionId = String(input.sessionId || "");
   const idem = String(input.idempotencyKey || "");
-  return withIdempotency(`event:${sessionId}:${idem}`, input, async (tx) => {
-    const rows = await tx`SELECT * FROM em_demo_sessions WHERE session_id=${sessionId} FOR UPDATE`;
-    if (!rows.length) throw new Error("SESSION_NOT_FOUND");
-    if (rows[0].status !== "ACTIVE") throw new Error("SESSION_NOT_ACTIVE");
-    const signedSession = rows[0].signed_session as SignedSession;
+  return withIdempotency(`event:${sessionId}:${idem}`, input, async (store) => {
+    const sessionRow = store.sessions[sessionId];
+    if (!sessionRow) throw new Error("SESSION_NOT_FOUND");
+    if (sessionRow.status !== "ACTIVE") throw new Error("SESSION_NOT_ACTIVE");
+    const signedSession = sessionRow.signedSession as SignedSession;
     if (Date.now() >= Date.parse(signedSession.session.expiresAt)) throw new Error("SESSION_EXPIRED");
-    const existing = await tx`SELECT signed_event,ack FROM em_demo_events WHERE session_id=${sessionId} ORDER BY sequence DESC LIMIT 1`;
-    const sequence = existing.length ? Number(existing[0].signed_event.sequence) + 1 : 1;
+    const existing = store.events[sessionId] || [];
+    const last = existing.at(-1);
+    const sequence = last ? Number(last.signedEvent.sequence) + 1 : 1;
     if (sequence > signedSession.session.maxEvents) throw new Error("SESSION_MAX_EVENTS_REACHED");
     const senderInput = String(input.sender || "A").toUpperCase();
     if (senderInput !== "A" && senderInput !== "B") throw new Error("INVALID_SENDER");
@@ -276,7 +231,7 @@ async function appendEvent(input: any) {
     const senderKey = sender === "A" ? keyA : keyB;
     const receiverKey = sender === "A" ? keyB : keyA;
     const receiverPub = sender === "A" ? pubB : pubA;
-    const previousHash = existing.length ? existing[0].signed_event.eventHash : ZERO_HASH;
+    const previousHash = last ? last.signedEvent.eventHash : ZERO_HASH;
     const event: SignedEvent = signEvent({
       sessionId, sequence, previousHash,
       type: String(input.type || "EVENT").slice(0, 80),
@@ -295,24 +250,35 @@ async function appendEvent(input: any) {
       if (!verified.ok) throw new Error(verified.reason);
       paymentEvidence = verified.evidence;
       const paymentHash = paymentEvidence.claim.paymentHash.toLowerCase();
-      const existingClaim = await tx`SELECT * FROM em_demo_payment_claims WHERE payment_hash=${paymentHash}`;
-      if (existingClaim.length && (existingClaim[0].session_id !== sessionId || existingClaim[0].event_hash !== event.eventHash.toLowerCase())) {
+      const existingClaim = store.paymentClaims[paymentHash];
+      if (existingClaim && (existingClaim.sessionId !== sessionId || existingClaim.eventHash !== event.eventHash.toLowerCase())) {
         throw new Error("FIBER_PAYMENT_HASH_REUSE");
       }
-      if (!existingClaim.length) await tx`INSERT INTO em_demo_payment_claims(payment_hash,session_id,event_hash,claim) VALUES(${paymentHash},${sessionId},${event.eventHash.toLowerCase()},${tx.json(paymentEvidence.claim)})`;
+      if (!existingClaim) store.paymentClaims[paymentHash] = { sessionId, eventHash: event.eventHash.toLowerCase(), claim: paymentEvidence.claim };
 
       const identityHash = stableEvidenceIdentity(paymentEvidence);
-      const priorEvidence = await tx`SELECT * FROM em_demo_payment_evidence WHERE payment_hash=${paymentHash}`;
-      if (priorEvidence.length && priorEvidence[0].identity_hash !== identityHash) throw new Error("FIBER_PAYMENT_EVIDENCE_CONFLICT");
-      if (priorEvidence.length) {
-        await tx`UPDATE em_demo_payment_evidence SET evidence=${tx.json(paymentEvidence)},last_verified_at=${paymentEvidence.verifiedAt},verification_count=verification_count+1 WHERE payment_hash=${paymentHash}`;
+      const priorEvidence = store.paymentEvidence[paymentHash];
+      if (priorEvidence && priorEvidence.identityHash !== identityHash) throw new Error("FIBER_PAYMENT_EVIDENCE_CONFLICT");
+      if (priorEvidence) {
+        priorEvidence.evidence = paymentEvidence;
+        priorEvidence.lastVerifiedAt = paymentEvidence.verifiedAt;
+        priorEvidence.verificationCount += 1;
       } else {
-        await tx`INSERT INTO em_demo_payment_evidence(payment_hash,session_id,event_hash,identity_hash,evidence,first_verified_at,last_verified_at) VALUES(${paymentHash},${sessionId},${event.eventHash.toLowerCase()},${identityHash},${tx.json(paymentEvidence)},${paymentEvidence.verifiedAt},${paymentEvidence.verifiedAt})`;
+        store.paymentEvidence[paymentHash] = {
+          sessionId,
+          eventHash: event.eventHash.toLowerCase(),
+          identityHash,
+          evidence: paymentEvidence,
+          firstVerifiedAt: paymentEvidence.verifiedAt,
+          lastVerifiedAt: paymentEvidence.verifiedAt,
+          verificationCount: 1
+        };
       }
     }
 
     const ack: SignedAck = signAck({ eventHash: event.eventHash, decision: "ACCEPT", operator: receiverPub, createdAt: new Date().toISOString() }, receiverKey);
-    await tx`INSERT INTO em_demo_events(event_hash,session_id,sequence,signed_event,ack,status) VALUES(${event.eventHash.toLowerCase()},${sessionId},${sequence},${tx.json(event)},${tx.json(ack)},'FINAL')`;
+    existing.push({ eventHash: event.eventHash.toLowerCase(), sequence, signedEvent: event, ack, status: "FINAL" });
+    store.events[sessionId] = existing;
     return { ok: true, event, ack, paymentEvidence };
   });
 }
@@ -320,13 +286,13 @@ async function appendEvent(input: any) {
 async function closeSession(input: any) {
   const sessionId = String(input.sessionId || "");
   const idem = String(input.idempotencyKey || "");
-  return withIdempotency(`close:${sessionId}:${idem}`, input, async (tx) => {
-    const sessions = await tx`SELECT * FROM em_demo_sessions WHERE session_id=${sessionId} FOR UPDATE`;
-    if (!sessions.length) throw new Error("SESSION_NOT_FOUND");
-    if (sessions[0].signed_close) return { ok: true, close: sessions[0].signed_close };
-    if (sessions[0].status !== "ACTIVE") throw new Error("SESSION_NOT_ACTIVE");
-    const rows = await tx`SELECT signed_event,ack,status FROM em_demo_events WHERE session_id=${sessionId} ORDER BY sequence`;
-    const items = rows.map((r: any) => ({ event: r.signed_event as SignedEvent, ack: r.ack as SignedAck }));
+  return withIdempotency(`close:${sessionId}:${idem}`, input, async (store) => {
+    const session = store.sessions[sessionId];
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    if (session.signedClose) return { ok: true, close: session.signedClose };
+    if (session.status !== "ACTIVE") throw new Error("SESSION_NOT_ACTIVE");
+    const rows = store.events[sessionId] || [];
+    const items = rows.map((r: any) => ({ event: r.signedEvent as SignedEvent, ack: r.ack as SignedAck }));
     if (items.some((x: any) => !x.ack || x.ack.decision !== "ACCEPT")) throw new Error("ALL_EVENTS_MUST_BE_ACCEPTED_BEFORE_CLOSE");
     const finalState = input.finalState ?? { completed: true, sessionId };
     const body = {
@@ -343,44 +309,62 @@ async function closeSession(input: any) {
       signatureA: signProtocolObject(SIGNING_DOMAIN.CLOSE, body, keyA),
       signatureB: signProtocolObject(SIGNING_DOMAIN.CLOSE, body, keyB)
     };
-    await tx`UPDATE em_demo_sessions SET signed_close=${tx.json(signedClose)},status='CLOSED' WHERE session_id=${sessionId}`;
+    session.signedClose = signedClose;
+    session.status = "CLOSED";
     return { ok: true, close: signedClose };
   });
 }
 
+function ckbBroadcastEnabled() {
+  return process.env.DEMO_ALLOW_CKB_BROADCAST === "true" && !!process.env.CKB_PRIVATE_KEY;
+}
+
 async function anchorSession(input: any) {
-  if (!sql) throw new Error("DATABASE_URL_REQUIRED");
   const sessionId = String(input.sessionId || "");
-  const sessions = await sql`SELECT signed_close,anchor FROM em_demo_sessions WHERE session_id=${sessionId}`;
-  if (!sessions.length) throw new Error("SESSION_NOT_FOUND");
-  if (!sessions[0].signed_close) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
-  if (sessions[0].anchor) return { ok: true, anchor: sessions[0].anchor, duplicate: true };
-  if (!process.env.CKB_PRIVATE_KEY) throw new Error("CKB_PRIVATE_KEY_REQUIRED");
-  const close = sessions[0].signed_close.close;
-  const dataHex = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
-  const commitmentHash = sha256Hex(dataHex);
-  const existing = await sql`SELECT * FROM em_demo_anchor_ops WHERE session_id=${sessionId}`;
-  if (existing.length) {
-    if (existing[0].tx_hash) return { ok: true, anchorOperation: existing[0], duplicate: true };
-    if (["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing[0].status)) throw new Error("ANCHOR_BROADCAST_STATE_UNCERTAIN_RECONCILE_OR_REVIEW_BEFORE_RETRY");
-  }
-  await sql`
-    INSERT INTO em_demo_anchor_ops(session_id,commitment_hash,status,data_hex) VALUES(${sessionId},${commitmentHash},'BROADCASTING',${dataHex})
-    ON CONFLICT(session_id) DO UPDATE SET commitment_hash=EXCLUDED.commitment_hash,status='BROADCASTING',data_hex=EXCLUDED.data_hex,error=NULL,updated_at=NOW()
-  `;
+  if (!ckbBroadcastEnabled()) throw new Error("CKB_BROADCAST_DISABLED");
+
+  const prepared = await mutateDemoStore((store) => {
+    const session = store.sessions[sessionId];
+    if (!session) throw new Error("SESSION_NOT_FOUND");
+    if (!session.signedClose) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
+    if (session.anchor) return { duplicateAnchor: session.anchor };
+    const close = session.signedClose.close;
+    const dataHex = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
+    const commitmentHash = sha256Hex(dataHex);
+    const existing = store.anchorOps[sessionId];
+    if (existing?.txHash) return { duplicateOperation: existing };
+    if (existing && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
+      throw new Error("ANCHOR_BROADCAST_STATE_UNCERTAIN_RECONCILE_OR_REVIEW_BEFORE_RETRY");
+    }
+    store.anchorOps[sessionId] = {
+      sessionId, commitmentHash, status: "BROADCASTING", dataHex,
+      updatedAt: new Date().toISOString()
+    };
+    return { close, dataHex };
+  });
+
+  if ((prepared as any).duplicateAnchor) return { ok: true, anchor: (prepared as any).duplicateAnchor, duplicate: true };
+  if ((prepared as any).duplicateOperation) return { ok: true, anchorOperation: (prepared as any).duplicateOperation, duplicate: true };
+
   let broadcasted: { txHash: string; dataHex: string; status: "PENDING" } | undefined;
   try {
     const { CkbAnchorClient } = await import("@eventmesh/ckb");
-    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY, CKB_TESTNET_RPC_URL, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
+    const close = (prepared as any).close;
+    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY!, CKB_TESTNET_RPC_URL, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
     broadcasted = await client.anchor({ sessionId, transcriptRoot: close.transcriptRoot, finalStateHash: close.finalStateHash, paymentEvidenceRoot: close.paymentEvidenceRoot });
-    await sql.begin(async (tx: any) => {
-      await tx`UPDATE em_demo_anchor_ops SET status='PENDING',tx_hash=${broadcasted!.txHash},data_hex=${broadcasted!.dataHex},updated_at=NOW() WHERE session_id=${sessionId}`;
-      await tx`UPDATE em_demo_sessions SET anchor=${tx.json(broadcasted)} WHERE session_id=${sessionId}`;
+    await mutateDemoStore((store) => {
+      const op = store.anchorOps[sessionId];
+      if (!op) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
+      Object.assign(op, { status: "PENDING", txHash: broadcasted!.txHash, dataHex: broadcasted!.dataHex, updatedAt: new Date().toISOString() });
+      store.sessions[sessionId].anchor = broadcasted;
     });
     return { ok: true, anchor: broadcasted };
   } catch (error) {
-    const txHash = broadcasted?.txHash || null;
-    await sql`UPDATE em_demo_anchor_ops SET status='BROADCAST_UNKNOWN',tx_hash=COALESCE(tx_hash,${txHash}),error=${safeErrorMessage(error)},updated_at=NOW() WHERE session_id=${sessionId}`;
+    const txHash = broadcasted?.txHash;
+    await mutateDemoStore((store) => {
+      const op = store.anchorOps[sessionId];
+      if (op) Object.assign(op, { status: "BROADCAST_UNKNOWN", txHash: op.txHash || txHash, error: safeErrorMessage(error), updatedAt: new Date().toISOString() });
+    });
     throw new Error(txHash
       ? "ANCHOR_BROADCAST_UNKNOWN: tx hash was recovered; run reconcile before any retry"
       : "ANCHOR_BROADCAST_UNKNOWN: transaction may have been submitted; automatic retry blocked");
@@ -388,18 +372,17 @@ async function anchorSession(input: any) {
 }
 
 async function reconcileAnchor(input: any) {
-  if (!sql) throw new Error("DATABASE_URL_REQUIRED");
   const sessionId = String(input.sessionId || "");
-  const ops = await sql`SELECT * FROM em_demo_anchor_ops WHERE session_id=${sessionId}`;
-  if (!ops.length) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
-  if (!ops[0].tx_hash) return { ok: false, status: ops[0].status, requiresManualReview: true, reason: "TX_HASH_UNKNOWN" };
+  const op = await readDemoStore((store) => store.anchorOps[sessionId]);
+  if (!op) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
+  if (!op.txHash) return { ok: false, status: op.status, requiresManualReview: true, reason: "TX_HASH_UNKNOWN" };
   const { inspectAnchorRpc } = await import("@eventmesh/ckb");
-  const inspected = await inspectAnchorRpc(CKB_TESTNET_RPC_URL, ops[0].tx_hash, ops[0].data_hex);
+  const inspected = await inspectAnchorRpc(CKB_TESTNET_RPC_URL, op.txHash, op.dataHex);
   if (inspected.ok) {
-    const anchor = { txHash: ops[0].tx_hash, dataHex: ops[0].data_hex, status: "COMMITTED", blockHash: inspected.blockHash };
-    await sql.begin(async (tx: any) => {
-      await tx`UPDATE em_demo_anchor_ops SET status='COMMITTED',block_hash=${inspected.blockHash || null},updated_at=NOW() WHERE session_id=${sessionId}`;
-      await tx`UPDATE em_demo_sessions SET anchor=${tx.json(anchor)} WHERE session_id=${sessionId}`;
+    const anchor = { txHash: op.txHash, dataHex: op.dataHex, status: "COMMITTED", blockHash: inspected.blockHash };
+    await mutateDemoStore((store) => {
+      Object.assign(store.anchorOps[sessionId], { status: "COMMITTED", blockHash: inspected.blockHash || null, updatedAt: new Date().toISOString() });
+      store.sessions[sessionId].anchor = anchor;
     });
     return { ok: true, anchor, verification: inspected };
   }
@@ -409,8 +392,8 @@ async function reconcileAnchor(input: any) {
 function safeErrorMessage(error: unknown) {
   const raw = String((error as any)?.message || error || "UNKNOWN_ERROR");
   return raw
-    .replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "postgresql://[redacted]")
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
+    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 500);
 }
 
@@ -419,50 +402,41 @@ export default async function handler(req: any, res: ServerResponse) {
     if (req.method === "GET") {
       const url = new URL(req.url || "/api/demo", baseUrl(req));
       const sessionId = url.searchParams.get("sessionId");
-      if (sessionId) {
-        await ensureSchema();
-        return json(res, 200, await loadState(sessionId));
-      }
+      if (sessionId) return json(res, 200, await loadState(sessionId));
 
-      let database = false;
-      let databaseError: string | undefined;
-      let recent: any[] = [];
-      if (!sql) {
-        databaseError = "DATABASE_URL_NOT_CONFIGURED";
-      } else {
-        try {
-          await ensureSchema();
-          await sql`SELECT 1 AS ok`;
-          database = true;
-          recent = await sql`SELECT session_id,status,created_at FROM em_demo_sessions ORDER BY created_at DESC LIMIT 10`;
-        } catch (error) {
-          databaseError = safeErrorMessage(error);
-        }
-      }
+      const recent = await readDemoStore((store) => Object.entries(store.sessions)
+        .map(([id, row]: any) => ({ sessionId: id, status: row.status, createdAt: row.createdAt }))
+        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+        .slice(0, 10));
 
       return json(res, 200, {
-        ok: database,
+        ok: !!configuredMasterSecret() && configurationErrors.length === 0,
         protocol: PROTOCOL,
-        version: "0.4.0",
+        version: "0.4.1-demo-json",
         operatorA: pubA,
         operatorB: pubB,
-        database,
-        databaseConfigured: !!sql,
-        databaseError,
+        storage: {
+          mode: DEMO_STORAGE_MODE,
+          durable: DEMO_STORAGE_DURABLE,
+          path: process.env.VERCEL ? "/tmp/eventmesh-demo-state.json" : DEMO_STATE_PATH,
+          warning: process.env.VERCEL ? "Ephemeral per Vercel function instance; state can disappear or diverge across instances." : "Local JSON demo state; not intended for multi-process production use."
+        },
         fiberReceiverVerification: !!process.env.FIBER_RECEIVER_RPC_URL,
-        ckbAnchoring: !!process.env.CKB_PRIVATE_KEY,
+        ckbAnchoring: ckbBroadcastEnabled(),
+        ckbSignerConfigured: !!process.env.CKB_PRIVATE_KEY,
+        ckbBroadcastEnabled: process.env.DEMO_ALLOW_CKB_BROADCAST === "true",
         ckbReconciliation: true,
         ckbRpcUrl: process.env.CKB_RPC_URL ? "configured" : "default-testnet",
-        masterSecretConfigured: !!process.env.DEMO_MASTER_SECRET,
+        masterSecretConfigured: !!configuredMasterSecret(),
         configurationErrors,
         recent
       });
     }
 
     if (req.method !== "POST") return json(res, 405, { error: "METHOD_NOT_ALLOWED" });
-    if (!process.env.DEMO_MASTER_SECRET) throw new Error("DEMO_MASTER_SECRET_REQUIRED");
+    if (!configuredMasterSecret()) throw new Error(process.env.DEMO_MASTER_SECRET ? "DEMO_MASTER_SECRET_TOO_SHORT" : "DEMO_MASTER_SECRET_REQUIRED");
     if (configurationErrors.length) throw new Error(configurationErrors.join(","));
-    await ensureSchema();
+    enforceSameOrigin(req);
     await rateLimit(req);
     const input = await bodyOf(req);
     let result: any;
@@ -480,7 +454,8 @@ export default async function handler(req: any, res: ServerResponse) {
     const message = safeErrorMessage(error);
     const status = message === "RATE_LIMITED" ? 429
       : message.includes("NOT_FOUND") ? 404
-      : message.includes("REQUIRED") || message.includes("DATABASE") ? 503
+      : message.includes("REQUIRED") || message.includes("DISABLED") ? 503
+      : message.includes("TOO_LARGE") ? 413
       : 400;
     return json(res, status, { error: message });
   }

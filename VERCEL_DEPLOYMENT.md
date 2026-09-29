@@ -1,6 +1,13 @@
-# EventMesh v0.4 — Vercel + Neon + CKB Testnet
+# EventMesh v0.4.1 — one-project Vercel demo without a database
 
-The reviewer demo is one Vercel project: Vite UI + same-origin serverless API + Neon/Postgres durable state. Operator signing keys stay server-side.
+The reviewer demo is one Vercel project: Vite UI + same-origin serverless API + signed EventMesh state. **No Postgres, Neon, Vercel Blob, or other database is required.**
+
+For this demo build, state is JSON-backed:
+
+- local development: `.data/eventmesh-demo-state.json`;
+- Vercel Functions: `/tmp/eventmesh-demo-state.json`.
+
+`/tmp` on Vercel is **ephemeral and instance-local**. It can disappear on a cold start and two concurrent function instances can have different files. This mode is intentionally for a reviewer/demo deployment, not durable production reconciliation.
 
 ## Fast path
 
@@ -10,62 +17,49 @@ chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-The deploy script:
+Only `DEMO_MASTER_SECRET` is required for mutation endpoints. The generator creates a random 32-byte secret automatically.
 
-1. installs dependencies;
-2. compiles all internal runtime packages to JavaScript;
-3. runs typecheck, tests, and the Vite build;
-4. links/creates the Vercel project;
-5. uploads required environment variables;
-6. deploys to Vercel;
-7. calls `/api/health?deep=1`;
-8. creates, appends to, and closes a real signed EventMesh smoke-test session through the deployed API.
-
-You still need to authenticate the Vercel CLI and provide a real Neon connection string. CKB anchoring additionally needs a funded **CKB Testnet** private key.
-
-## Required environment
+## Minimal environment
 
 ```dotenv
-DATABASE_URL="postgresql://...-pooler....neon.tech/neondb?sslmode=require"
-DEMO_MASTER_SECRET="64-or-more-random-hex-characters"
-```
-
-Use the Neon pooled/serverless URL. `DEMO_MASTER_SECRET` is required for public mutation endpoints; the API no longer silently accepts the built-in local-development secret on Vercel.
-
-## CKB Testnet
-
-```dotenv
+DEMO_MASTER_SECRET="<random 64 hex characters>"
+DEMO_RATE_LIMIT_PER_MINUTE=60
+DEMO_STATE_MAX_BYTES=4194304
 CKB_RPC_URL="https://testnet.ckbapp.dev/"
-CKB_PRIVATE_KEY="0x..."
-CKB_ANCHOR_CAPACITY_CKB="220"
+DEMO_ALLOW_CKB_BROADCAST=false
 ```
 
-`CKB_RPC_URL` is optional because v0.4 defaults reads/reconciliation to the public Testnet RPC above. Broadcasting is disabled until `CKB_PRIVATE_KEY` is configured. Use a Testnet-only key and fund it from a Testnet faucet; never reuse a Mainnet key.
-
-Anchor broadcast is deliberately conservative. EventMesh writes `BROADCASTING` before network submission. If a response is ambiguous, it changes to `BROADCAST_UNKNOWN` and does not blindly rebroadcast. If the transaction hash was already obtained, v0.4 preserves it so `reconcile_anchor` can inspect the chain before any retry.
-
-## Fiber receiver verification
+Optional server-side variables:
 
 ```dotenv
+OPERATOR_A_PRIVATE_KEY="0x..."
+OPERATOR_B_PRIVATE_KEY="0x..."
+CKB_PRIVATE_KEY="0x..."
+CKB_ANCHOR_CAPACITY_CKB=220
 FIBER_RECEIVER_RPC_URL="https://your-receiver-fnn.example/rpc"
 FIBER_RECEIVER_RPC_TOKEN="..."
 ```
 
-A native FNN is stateful, maintains channel data, and expects long-lived networking. Do not treat a Vercel Function as the FNN host. Point EventMesh at a receiver-owned FNN running on a suitable persistent host, or use a separate browser/WASM Fiber experiment. `PAYMENT_SETTLED` remains fail-closed until the configured receiver RPC is reachable and reports a matching paid invoice bound to the EventMesh session.
+## Security defaults
+
+- Requests that mutate demo state require `application/json`.
+- Browser mutation requests are restricted to the same origin.
+- Request bodies are limited to 64 KiB.
+- JSON state writes use a temporary file + atomic rename and restrictive file permissions.
+- A per-instance minute rate limit is applied.
+- Idempotency keys are persisted in the JSON state and conflicting reuse is rejected.
+- Missing `DEMO_MASTER_SECRET` disables public mutation endpoints; secrets shorter than 32 characters are rejected.
+- Operator signing keys remain server-side. If explicit operator keys are not supplied, deterministic demo keys are derived from `DEMO_MASTER_SECRET`.
+- CKB broadcasting is **off by default**. Supplying `CKB_PRIVATE_KEY` alone is not sufficient; `DEMO_ALLOW_CKB_BROADCAST=true` must also be set explicitly.
+- `PAYMENT_SETTLED` remains fail-closed until a receiver Fiber RPC is configured and verifies the payment claim.
 
 ## Diagnostics
 
 - `/api/health` — configuration-only health.
-- `/api/health?deep=1` — probes Neon, the CKB Testnet RPC, and the configured Fiber receiver RPC using `node_info`.
-- `/api/demo` — returns EventMesh runtime readiness even when the database is missing/unreachable instead of crashing the whole page.
-- `node scripts/verify-deployment.mjs https://your-deployment.vercel.app` — remote signed-session smoke test.
+- `/api/health?deep=1` — checks JSON storage writability, CKB Testnet RPC, and the optional Fiber receiver RPC.
+- `/api/demo` — reports runtime/storage readiness and recent demo sessions.
+- `node scripts/verify-deployment.mjs https://your-deployment.vercel.app` — creates, appends to, and closes a signed smoke-test session.
 
-The UI no longer blindly parses every Vercel response as JSON. If Vercel returns a platform text/HTML error, the page reports a useful non-JSON function failure and points you to Function Logs rather than showing `Unexpected token 'A'`.
+## Important limitation
 
-## Why v0.4 compiles the workspace packages first
-
-The previous deployment path exposed raw TypeScript files as package runtime exports while `vercel-build` only built the Vite frontend. v0.4 builds `@eventmesh/core`, `@eventmesh/fiber`, `@eventmesh/ckb`, and `@eventmesh/adapter-sdk` to `dist/*.js` before Vercel packages the serverless function. This removes dependence on runtime loading of workspace `.ts` files.
-
-## Scope
-
-The single-project Vercel surface contains two distinct signing identities but one deployment/admin boundary. It is a reviewer/demo deployment, not proof of two independently administered operators. For that stronger claim, run the two operator services on separate hosts/databases/FNNs and verify the exported transcript independently.
+This JSON mode deliberately trades durability for zero infrastructure. Do not describe it as durable storage on Vercel. For production, replace `api/demo-store.ts` with a durable store that provides multi-instance concurrency control while keeping the signing/protocol layer unchanged.

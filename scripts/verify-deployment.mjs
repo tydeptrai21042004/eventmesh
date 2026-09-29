@@ -30,11 +30,11 @@ async function post(body) {
 
 const health = await get("/api/health?deep=1");
 console.log("health", JSON.stringify(health, null, 2));
-if (!health.database?.reachable) throw new Error("Neon/Postgres is not reachable");
+if (!health.storage?.writable) throw new Error("JSON demo storage is not writable");
 if (!health.security?.masterSecretConfigured) throw new Error("DEMO_MASTER_SECRET is missing");
 
 const runtime = await get("/api/demo");
-console.log("demo", JSON.stringify({ ok: runtime.ok, version: runtime.version, database: runtime.database }, null, 2));
+console.log("demo", JSON.stringify({ ok: runtime.ok, version: runtime.version, storage: runtime.storage }, null, 2));
 
 const suffix = crypto.randomUUID();
 const created = await post({ action: "create_session", idempotencyKey: `deploy-smoke-${suffix}` });

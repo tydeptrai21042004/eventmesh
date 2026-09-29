@@ -22,18 +22,10 @@ ask() {
   printf '%s' "${value:-$default}"
 }
 
-DATABASE_URL="${DATABASE_URL:-}"
-if [[ -z "$DATABASE_URL" ]]; then
-  DATABASE_URL="$(ask 'Neon pooled DATABASE_URL')"
-fi
-if [[ ! "$DATABASE_URL" =~ ^postgres(ql)?:// ]]; then
-  echo "ERROR: DATABASE_URL must start with postgres:// or postgresql://" >&2
-  exit 2
-fi
-
 DEMO_MASTER_SECRET="${DEMO_MASTER_SECRET:-$(random_secret)}"
 CKB_RPC_URL="${CKB_RPC_URL:-$DEFAULT_CKB_RPC}"
 CKB_PRIVATE_KEY="${CKB_PRIVATE_KEY:-}"
+DEMO_ALLOW_CKB_BROADCAST="${DEMO_ALLOW_CKB_BROADCAST:-false}"
 FIBER_RECEIVER_RPC_URL="${FIBER_RECEIVER_RPC_URL:-}"
 FIBER_RECEIVER_RPC_TOKEN="${FIBER_RECEIVER_RPC_TOKEN:-}"
 
@@ -54,13 +46,20 @@ if [[ -n "$FIBER_RECEIVER_RPC_URL" && ! "$FIBER_RECEIVER_RPC_URL" =~ ^https?:// 
   exit 2
 fi
 
+# CKB broadcast stays off unless explicitly enabled after the Testnet key is funded.
+[[ "$DEMO_ALLOW_CKB_BROADCAST" == "true" || "$DEMO_ALLOW_CKB_BROADCAST" == "false" ]] || {
+  echo "ERROR: DEMO_ALLOW_CKB_BROADCAST must be true or false" >&2
+  exit 2
+}
+
 dotenv_quote() { local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s"' "$v"; }
 {
-  printf 'DATABASE_URL=%s\n' "$(dotenv_quote "$DATABASE_URL")"
   printf 'DEMO_MASTER_SECRET=%s\n' "$(dotenv_quote "$DEMO_MASTER_SECRET")"
   printf 'DEMO_RATE_LIMIT_PER_MINUTE=60\n'
+  printf 'DEMO_STATE_MAX_BYTES=4194304\n'
   printf 'CKB_RPC_URL=%s\n' "$(dotenv_quote "$CKB_RPC_URL")"
   printf 'CKB_PRIVATE_KEY=%s\n' "$(dotenv_quote "$CKB_PRIVATE_KEY")"
+  printf 'DEMO_ALLOW_CKB_BROADCAST=%s\n' "$DEMO_ALLOW_CKB_BROADCAST"
   printf 'CKB_ANCHOR_CAPACITY_CKB=220\n'
   printf 'FIBER_RECEIVER_RPC_URL=%s\n' "$(dotenv_quote "$FIBER_RECEIVER_RPC_URL")"
   printf 'FIBER_RECEIVER_RPC_TOKEN=%s\n' "$(dotenv_quote "$FIBER_RECEIVER_RPC_TOKEN")"
@@ -69,4 +68,5 @@ dotenv_quote() { local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s
 chmod 600 "$OUT"
 
 echo "Created $OUT (mode 600)."
-echo "CKB RPC defaults to Fiber/CKB Testnet; CKB anchoring remains disabled until CKB_PRIVATE_KEY is set."
+echo "No database is required. Vercel demo state uses ephemeral JSON in /tmp."
+echo "CKB broadcast is disabled by default even when CKB_PRIVATE_KEY is configured."

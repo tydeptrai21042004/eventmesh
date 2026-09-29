@@ -1,4 +1,5 @@
 import type { ServerResponse } from "node:http";
+import { ensureDemoStoreWritable, DEMO_STORAGE_DURABLE, DEMO_STORAGE_MODE } from "./demo-store.js";
 
 const DEFAULT_CKB_TESTNET_RPC = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
 
@@ -7,13 +8,14 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.setHeader("content-type", "application/json; charset=utf-8");
   res.setHeader("cache-control", "no-store");
   res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("cross-origin-resource-policy", "same-origin");
   res.end(JSON.stringify(body));
 }
 
 function safeMessage(error: unknown) {
   return String((error as any)?.message || error || "UNKNOWN_ERROR")
-    .replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "postgresql://[redacted]")
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
+    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 300);
 }
 
@@ -36,46 +38,49 @@ export default async function handler(req: any, res: ServerResponse) {
   if (req.method !== "GET") return json(res, 405, { ok: false, error: "METHOD_NOT_ALLOWED" });
 
   const deep = new URL(req.url || "/api/health", "https://eventmesh.local").searchParams.get("deep") === "1";
-  const databaseUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL;
+  const masterSecret = process.env.DEMO_MASTER_SECRET?.trim();
 
   const status: any = {
     ok: true,
     service: "eventmesh",
-    version: "0.4.0",
+    version: "0.4.1-demo-json",
     runtime: `node-${process.versions.node}`,
     timestamp: new Date().toISOString(),
-    database: { configured: !!databaseUrl, reachable: false },
+    storage: {
+      mode: DEMO_STORAGE_MODE,
+      durable: DEMO_STORAGE_DURABLE,
+      writable: false,
+      warning: process.env.VERCEL
+        ? "JSON state uses /tmp and is ephemeral per Vercel function instance."
+        : "JSON state is local demo storage and is not safe for multi-process production use."
+    },
     fiber: { configured: !!process.env.FIBER_RECEIVER_RPC_URL, reachable: false },
     ckb: {
       rpcConfigured: !!process.env.CKB_RPC_URL,
       rpcMode: process.env.CKB_RPC_URL ? "custom" : "default-testnet",
       reachable: false,
-      signerConfigured: !!process.env.CKB_PRIVATE_KEY
+      signerConfigured: !!process.env.CKB_PRIVATE_KEY,
+      broadcastEnabled: process.env.DEMO_ALLOW_CKB_BROADCAST === "true"
     },
     security: {
-      masterSecretConfigured: !!process.env.DEMO_MASTER_SECRET,
+      masterSecretConfigured: !!masterSecret && masterSecret.length >= 32,
+      masterSecretStrongEnough: !!masterSecret && masterSecret.length >= 32,
       operatorAKeyConfigured: !!process.env.OPERATOR_A_PRIVATE_KEY,
       operatorBKeyConfigured: !!process.env.OPERATOR_B_PRIVATE_KEY
     }
   };
 
   if (!deep) {
-    status.ok = status.database.configured && status.security.masterSecretConfigured;
+    status.ok = status.security.masterSecretConfigured;
     return json(res, 200, status);
   }
 
-  if (databaseUrl) {
-    try {
-      const { default: postgres } = await import("postgres");
-      const db = postgres(databaseUrl, { max: 1, connect_timeout: 8, idle_timeout: 2, prepare: false });
-      await db`SELECT 1 AS ok`;
-      await db.end({ timeout: 1 });
-      status.database.reachable = true;
-    } catch (error) {
-      status.database.error = safeMessage(error);
-    }
-  } else {
-    status.database.error = "DATABASE_URL_NOT_CONFIGURED";
+  try {
+    const storage = await ensureDemoStoreWritable();
+    status.storage.writable = true;
+    status.storage.sessionCount = storage.sessionCount;
+  } catch (error) {
+    status.storage.error = safeMessage(error);
   }
 
   try {
@@ -104,7 +109,7 @@ export default async function handler(req: any, res: ServerResponse) {
     status.fiber.error = "FIBER_RECEIVER_RPC_URL_NOT_CONFIGURED";
   }
 
-  status.coreReady = status.database.reachable && status.security.masterSecretConfigured;
+  status.coreReady = status.storage.writable && status.security.masterSecretConfigured;
   status.testnetReady = status.coreReady && status.ckb.reachable;
   status.ok = status.coreReady;
   return json(res, 200, status);

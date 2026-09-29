@@ -133,20 +133,20 @@ function App() {
   };
 
   const readiness = useMemo(() => [
-    ["Postgres durable state", !!health?.database || !!diagnostics?.database?.reachable],
+    ["JSON demo state", !!diagnostics?.storage?.writable],
     ["Receiver-side Fiber verification", !!health?.fiberReceiverVerification && !!diagnostics?.fiber?.reachable],
     ["CKB Testnet RPC", !!diagnostics?.ckb?.reachable],
-    ["CKB anchor signing", !!health?.ckbAnchoring || !!diagnostics?.ckb?.signerConfigured]
+    ["CKB anchor signing", !!health?.ckbAnchoring || (!!diagnostics?.ckb?.signerConfigured && !!diagnostics?.ckb?.broadcastEnabled)]
   ], [health, diagnostics]);
 
   return <main>
     <header className="hero">
       <div>
         <div className="eyebrow">CKB Testnet + Fiber · one-project Vercel demo</div>
-        <h1>EventMesh <span>v0.4 demo</span></h1>
-        <p>Durable bilateral reconciliation for application events when payment, retries, crashes, or network ambiguity leave operators with different local views.</p>
+        <h1>EventMesh <span>v0.4.1 JSON demo</span></h1>
+        <p>Bilateral reconciliation demo for application events when payment, retries, crashes, or network ambiguity leave operators with different local views.</p>
       </div>
-      <button className="primary" disabled={!!busy || !(health?.database || diagnostics?.database?.reachable) || !(health?.masterSecretConfigured || diagnostics?.security?.masterSecretConfigured) || !!health?.configurationErrors?.length} onClick={create}>{busy === "create" ? "Creating…" : "Start signed session"}</button>
+      <button className="primary" disabled={!!busy || !diagnostics?.storage?.writable || !(health?.masterSecretConfigured || diagnostics?.security?.masterSecretConfigured) || !!health?.configurationErrors?.length} onClick={create}>{busy === "create" ? "Creating…" : "Start signed session"}</button>
     </header>
 
     {error && <div className="banner error"><b>Action failed</b><span>{error}</span></div>}
@@ -160,15 +160,15 @@ function App() {
     <section className="card readiness">
       <div className="section-head"><div><small>DEPLOYMENT</small><h2>Runtime readiness</h2></div><button onClick={() => void reloadReadiness()} disabled={!!busy}>Run self-test</button></div>
       <div className="readiness-grid">{readiness.map(([name, ready]: any) => <div key={name}><span className={ready ? "dot on" : "dot"}/><b>{name}</b><small>{ready ? "enabled" : "optional / not configured"}</small></div>)}</div>
-      <p className="muted">PAYMENT_SETTLED is intentionally refused unless a reachable receiver Fiber RPC is configured. CKB reads default to the public Testnet RPC; broadcasting still requires your server-side Testnet private key.</p>
-      {diagnostics?.database?.error && <p className="warn"><b>Database:</b> {diagnostics.database.error}</p>}
-      {health?.databaseError && !diagnostics?.database?.reachable && <p className="warn"><b>/api/demo:</b> {health.databaseError}</p>}
+      <p className="muted">PAYMENT_SETTLED is intentionally refused unless a reachable receiver Fiber RPC is configured. CKB reads default to the public Testnet RPC; broadcasting requires both a server-side Testnet private key and DEMO_ALLOW_CKB_BROADCAST=true.</p>
+      {diagnostics?.storage?.warning && <p className="warn"><b>Storage:</b> {diagnostics.storage.warning}</p>}
+      {diagnostics?.storage?.error && <p className="warn"><b>Storage error:</b> {diagnostics.storage.error}</p>}
       {diagnostics && !diagnostics?.security?.masterSecretConfigured && <p className="warn"><b>Security:</b> set <code>DEMO_MASTER_SECRET</code> before public mutation endpoints are enabled.</p>}
       {!!health?.configurationErrors?.length && <p className="warn"><b>Configuration:</b> {health.configurationErrors.join(", ")}</p>}
-      <details><summary>Deployment diagnostics</summary><pre>{JSON.stringify({ health: diagnostics, demo: health ? { ok: health.ok, version: health.version, database: health.database, databaseConfigured: health.databaseConfigured, ckbRpcUrl: health.ckbRpcUrl } : null }, null, 2)}</pre></details>
+      <details><summary>Deployment diagnostics</summary><pre>{JSON.stringify({ health: diagnostics, demo: health ? { ok: health.ok, version: health.version, storage: health.storage, ckbRpcUrl: health.ckbRpcUrl } : null }, null, 2)}</pre></details>
     </section>
 
-    {!sessionId ? <section className="card empty"><h2>Start with one click</h2><p>The frontend and backend deploy from this single repository. Durable state is Postgres-backed and privileged operator keys remain server-side.</p></section> : <>
+    {!sessionId ? <section className="card empty"><h2>Start with one click</h2><p>The frontend and backend deploy from this single repository. Demo state is stored as JSON; on Vercel it is ephemeral /tmp state, while privileged signing keys remain server-side.</p></section> : <>
       <section className="session card"><div><small>SESSION</small><b>{sessionId}</b></div><div><small>STATE</small><b>{state?.status}</b></div><div><small>EVENTS</small><b>{events.length}</b></div></section>
 
       <section className="grid two">
