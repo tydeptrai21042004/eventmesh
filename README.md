@@ -206,11 +206,11 @@ independent application
 + documented adopter feedback
 ```
 
-## One-project Vercel demo (v0.4.1 JSON path)
+## One-project Vercel demo (v0.4.2 durable path)
 
-The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project. It requires no database: demo state is JSON-backed (`/tmp` on Vercel, `.data/` locally). Browser code never receives operator private keys or an admin token.
+The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project. On Vercel, durable state is backed by Postgres/Neon through `DATABASE_URL`; the EventMesh schema is initialized automatically. Local development can still use `.data/eventmesh-demo-state.json`. Browser code never receives operator private keys or an admin token.
 
-The v0.4.1 demo path keeps the runtime packages compiled before function packaging, reports JSON-storage readiness through `/api/demo` and `/api/health`, and handles non-JSON platform errors without crashing on `JSON.parse`. Vercel `/tmp` is explicitly treated as ephemeral demo storage, not durable persistence.
+The v0.4.2 deployment path keeps runtime packages compiled before function packaging, reports durable-storage readiness through `/api/demo` and `/api/health`, and handles non-JSON platform errors without crashing on `JSON.parse`. Vercel `/tmp` is rejected by default and is available only through the explicit `ALLOW_EPHEMERAL_VERCEL_STATE=true` throwaway-preview opt-in.
 
 ### Generate configuration and deploy
 

@@ -15,7 +15,8 @@ function json(res: ServerResponse, status: number, body: unknown) {
 function safeMessage(error: unknown) {
   return String((error as any)?.message || error || "UNKNOWN_ERROR")
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[redacted]@")
+    .replace(/([?&](?:token|key|secret|password)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 300);
 }
 
@@ -43,16 +44,18 @@ export default async function handler(req: any, res: ServerResponse) {
   const status: any = {
     ok: true,
     service: "eventmesh",
-    version: "0.4.1-demo-json",
+    version: "0.4.2",
     runtime: `node-${process.versions.node}`,
     timestamp: new Date().toISOString(),
     storage: {
       mode: DEMO_STORAGE_MODE,
       durable: DEMO_STORAGE_DURABLE,
       writable: false,
-      warning: process.env.VERCEL
-        ? "JSON state uses /tmp and is ephemeral per Vercel function instance."
-        : "JSON state is local demo storage and is not safe for multi-process production use."
+      warning: DEMO_STORAGE_DURABLE
+        ? undefined
+        : process.env.VERCEL
+          ? "Durable DATABASE_URL is required on Vercel unless ALLOW_EPHEMERAL_VERCEL_STATE=true is explicitly set."
+          : "Local JSON storage is intended for single-process development only."
     },
     fiber: { configured: !!process.env.FIBER_RECEIVER_RPC_URL, reachable: false },
     ckb: {
@@ -71,11 +74,11 @@ export default async function handler(req: any, res: ServerResponse) {
   };
 
   if (!deep) {
-    const ready = status.security.masterSecretConfigured;
+    const ready = status.security.masterSecretConfigured && (DEMO_STORAGE_DURABLE || !process.env.VERCEL || process.env.ALLOW_EPHEMERAL_VERCEL_STATE === "true");
     return json(res, 200, {
       ok: ready,
       service: "eventmesh",
-      version: "0.4.1",
+      version: "0.4.2",
       status: ready ? "ready" : "unavailable",
       network: "CKB Testnet"
     });
@@ -85,6 +88,9 @@ export default async function handler(req: any, res: ServerResponse) {
     const storage = await ensureDemoStoreWritable();
     status.storage.writable = true;
     status.storage.sessionCount = storage.sessionCount;
+    status.storage.durable = storage.durable;
+    if ("schemaVersion" in storage) status.storage.schemaVersion = storage.schemaVersion;
+    if ("revision" in storage) status.storage.revision = storage.revision;
   } catch (error) {
     status.storage.error = safeMessage(error);
   }

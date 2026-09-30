@@ -30,7 +30,8 @@ async function post(body) {
 
 const health = await get("/api/health?deep=1");
 console.log("health", JSON.stringify(health, null, 2));
-if (!health.storage?.writable) throw new Error("JSON demo storage is not writable");
+if (!health.storage?.writable) throw new Error("EventMesh storage is not writable");
+if (!health.storage?.durable) throw new Error("Vercel deployment is not using durable storage");
 if (!health.security?.masterSecretConfigured) throw new Error("DEMO_MASTER_SECRET is missing");
 
 const runtime = await get("/api/demo");

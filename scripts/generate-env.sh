@@ -23,6 +23,7 @@ ask() {
 }
 
 DEMO_MASTER_SECRET="${DEMO_MASTER_SECRET:-$(random_secret)}"
+DATABASE_URL="${DATABASE_URL:-}"
 CKB_RPC_URL="${CKB_RPC_URL:-$DEFAULT_CKB_RPC}"
 CKB_PRIVATE_KEY="${CKB_PRIVATE_KEY:-}"
 DEMO_ALLOW_CKB_BROADCAST="${DEMO_ALLOW_CKB_BROADCAST:-false}"
@@ -30,6 +31,7 @@ FIBER_RECEIVER_RPC_URL="${FIBER_RECEIVER_RPC_URL:-}"
 FIBER_RECEIVER_RPC_TOKEN="${FIBER_RECEIVER_RPC_TOKEN:-}"
 
 if [[ "$NON_INTERACTIVE" != "1" ]]; then
+  [[ -z "$DATABASE_URL" ]] && DATABASE_URL="$(ask 'Postgres/Neon DATABASE_URL (optional locally; required on Vercel unless integration injects it)')"
   [[ -z "$CKB_PRIVATE_KEY" ]] && CKB_PRIVATE_KEY="$(ask 'CKB Testnet private key (optional, 0x + 64 hex)')"
   [[ -z "$FIBER_RECEIVER_RPC_URL" ]] && FIBER_RECEIVER_RPC_URL="$(ask 'Receiver FNN RPC URL (optional)')"
   if [[ -n "$FIBER_RECEIVER_RPC_URL" && -z "$FIBER_RECEIVER_RPC_TOKEN" ]]; then
@@ -54,9 +56,11 @@ fi
 
 dotenv_quote() { local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s"' "$v"; }
 {
+  printf 'DATABASE_URL=%s\n' "$(dotenv_quote "$DATABASE_URL")"
   printf 'DEMO_MASTER_SECRET=%s\n' "$(dotenv_quote "$DEMO_MASTER_SECRET")"
   printf 'DEMO_RATE_LIMIT_PER_MINUTE=60\n'
   printf 'DEMO_STATE_MAX_BYTES=4194304\n'
+  printf 'ALLOW_EPHEMERAL_VERCEL_STATE=false\n'
   printf 'CKB_RPC_URL=%s\n' "$(dotenv_quote "$CKB_RPC_URL")"
   printf 'CKB_PRIVATE_KEY=%s\n' "$(dotenv_quote "$CKB_PRIVATE_KEY")"
   printf 'DEMO_ALLOW_CKB_BROADCAST=%s\n' "$DEMO_ALLOW_CKB_BROADCAST"
@@ -68,5 +72,9 @@ dotenv_quote() { local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s
 chmod 600 "$OUT"
 
 echo "Created $OUT (mode 600)."
-echo "No database is required. Vercel demo state uses ephemeral JSON in /tmp."
+if [[ -n "$DATABASE_URL" ]]; then
+  echo "DATABASE_URL configured; EventMesh will auto-create its durable Postgres schema."
+else
+  echo "DATABASE_URL left empty. Local JSON still works; Vercel requires a connected Postgres/Neon DATABASE_URL by default."
+fi
 echo "CKB broadcast is disabled by default even when CKB_PRIVATE_KEY is configured."

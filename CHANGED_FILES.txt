@@ -1,0 +1,26 @@
+EventMesh production-readiness patch — changed files only
+
+Apply these files over eventmesh-main(10).
+
+Main changes:
+- durable Neon/Postgres JSONB state on Vercel via DATABASE_URL
+- automatic EventMesh schema initialization
+- optimistic revision/CAS protection for concurrent serverless writes
+- Vercel fails closed when durable storage is missing (unless explicit preview opt-in)
+- durable idempotency/rate-limit state when Postgres is enabled
+- safer CKB anchor lifecycle: PREPARING -> BROADCASTING -> PENDING/COMMITTED, with tx identity persisted before submission
+- improved ambiguous-broadcast reconciliation behavior
+- storage/readiness diagnostics in /api/health and /api/demo
+- one-project Vercel deploy flow preserved
+- frontend shows durable-state status and fixes anchorOperation.txHash field
+- deployment/docs/tests updated
+
+Required production Vercel variables:
+- DATABASE_URL (Neon/Postgres; can be injected by Vercel integration)
+- DEMO_MASTER_SECRET (>=32 chars)
+
+Optional throwaway preview only:
+- ALLOW_EPHEMERAL_VERCEL_STATE=true
+
+Validation note:
+The source/tree checks and shell/JSON syntax checks were performed. Full npm validation could not complete in the sandbox because dependency installation exceeded the execution window; run `npm install && npm run check` after applying the patch.

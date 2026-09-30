@@ -25,6 +25,14 @@ describe("one-project Vercel deployment contract", () => {
     expect(config.functions["api/health.ts"]).toBeTruthy();
   });
 
+  it("includes the Neon serverless driver and durable deployment variables", () => {
+    const root = readJson("package.json");
+    expect(root.dependencies["@neondatabase/serverless"]).toBe("1.1.0");
+    const example = readFileSync(".env.example", "utf8");
+    expect(example).toMatch(/^DATABASE_URL=/m);
+    expect(example).toMatch(/^ALLOW_EPHEMERAL_VERCEL_STATE=false$/m);
+  });
+
   it("does not expose secrets through VITE_ variables", () => {
     const example = readFileSync(".env.example", "utf8");
     expect(example).not.toMatch(/^VITE_.*(?:SECRET|PRIVATE|TOKEN)/m);

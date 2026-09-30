@@ -23,7 +23,7 @@ import {
   type SignedSession
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
-import { mutateDemoStore, readDemoStore } from "./demo-store.js";
+import { DEMO_STORAGE_DURABLE, DEMO_STORAGE_MODE, mutateDemoStore, readDemoStore } from "./demo-store.js";
 
 const CKB_TESTNET_RPC_URL = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
@@ -317,51 +317,103 @@ async function anchorSession(input: any) {
   const sessionId = String(input.sessionId || "");
   if (!ckbBroadcastEnabled()) throw new Error("CKB_BROADCAST_DISABLED");
 
-  const prepared = await mutateDemoStore((store) => {
+  const reserved = await mutateDemoStore((store) => {
     const session = store.sessions[sessionId];
     if (!session) throw new Error("SESSION_NOT_FOUND");
     if (!session.signedClose) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
     if (session.anchor) return { duplicateAnchor: session.anchor };
+
     const close = session.signedClose.close;
     const dataHex = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
     const commitmentHash = sha256Hex(dataHex);
     const existing = store.anchorOps[sessionId];
-    if (existing?.txHash) return { duplicateOperation: existing };
-    if (existing && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
+
+    if (existing?.txHash && ["PENDING", "COMMITTED"].includes(existing.status)) {
+      return { duplicateOperation: existing };
+    }
+    if (existing?.txHash && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
       throw new Error("ANCHOR_BROADCAST_STATE_UNCERTAIN_RECONCILE_OR_REVIEW_BEFORE_RETRY");
     }
+    if (existing?.status === "PREPARING") {
+      const stale = Date.now() - Date.parse(existing.updatedAt || 0) > 2 * 60 * 1000;
+      if (!stale) throw new Error("ANCHOR_PREPARATION_IN_PROGRESS");
+    }
+
     store.anchorOps[sessionId] = {
-      sessionId, commitmentHash, status: "BROADCASTING", dataHex,
+      sessionId,
+      commitmentHash,
+      status: "PREPARING",
+      dataHex,
       updatedAt: new Date().toISOString()
     };
-    return { close, dataHex };
+    return { close, dataHex, commitmentHash };
   });
 
-  if ((prepared as any).duplicateAnchor) return { ok: true, anchor: (prepared as any).duplicateAnchor, duplicate: true };
-  if ((prepared as any).duplicateOperation) return { ok: true, anchorOperation: (prepared as any).duplicateOperation, duplicate: true };
+  if ((reserved as any).duplicateAnchor) return { ok: true, anchor: (reserved as any).duplicateAnchor, duplicate: true };
+  if ((reserved as any).duplicateOperation) return { ok: true, anchorOperation: (reserved as any).duplicateOperation, duplicate: true };
 
-  let broadcasted: { txHash: string; dataHex: string; status: "PENDING" } | undefined;
+  let expectedTxHash: string | undefined;
   try {
     const { CkbAnchorClient } = await import("@eventmesh/ckb");
-    const close = (prepared as any).close;
-    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY!, CKB_TESTNET_RPC_URL, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
-    broadcasted = await client.anchor({ sessionId, transcriptRoot: close.transcriptRoot, finalStateHash: close.finalStateHash, paymentEvidenceRoot: close.paymentEvidenceRoot });
+    const close = (reserved as any).close;
+    const client = new CkbAnchorClient(
+      process.env.CKB_PRIVATE_KEY!,
+      CKB_TESTNET_RPC_URL,
+      Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220)
+    );
+    const prepared = await client.prepareAnchor({
+      sessionId,
+      transcriptRoot: close.transcriptRoot,
+      finalStateHash: close.finalStateHash,
+      paymentEvidenceRoot: close.paymentEvidenceRoot
+    });
+    if (prepared.dataHex.toLowerCase() !== String((reserved as any).dataHex).toLowerCase()) {
+      throw new Error("ANCHOR_PREPARED_COMMITMENT_MISMATCH");
+    }
+    expectedTxHash = prepared.txHash;
+
+    // Persist deterministic transaction identity before the irreversible network submission.
     await mutateDemoStore((store) => {
       const op = store.anchorOps[sessionId];
-      if (!op) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
-      Object.assign(op, { status: "PENDING", txHash: broadcasted!.txHash, dataHex: broadcasted!.dataHex, updatedAt: new Date().toISOString() });
+      if (!op || op.commitmentHash !== (reserved as any).commitmentHash) throw new Error("ANCHOR_OPERATION_CONFLICT");
+      Object.assign(op, {
+        status: "BROADCASTING",
+        txHash: expectedTxHash,
+        updatedAt: new Date().toISOString()
+      });
+    });
+
+    const broadcasted = await client.broadcastPrepared(prepared);
+    await mutateDemoStore((store) => {
+      const op = store.anchorOps[sessionId];
+      if (!op || op.txHash?.toLowerCase() !== broadcasted.txHash.toLowerCase()) throw new Error("ANCHOR_OPERATION_CONFLICT");
+      Object.assign(op, {
+        status: "PENDING",
+        txHash: broadcasted.txHash,
+        dataHex: broadcasted.dataHex,
+        updatedAt: new Date().toISOString()
+      });
       store.sessions[sessionId].anchor = broadcasted;
     });
     return { ok: true, anchor: broadcasted };
   } catch (error) {
-    const txHash = broadcasted?.txHash;
-    await mutateDemoStore((store) => {
+    const persisted = await mutateDemoStore((store) => {
       const op = store.anchorOps[sessionId];
-      if (op) Object.assign(op, { status: "BROADCAST_UNKNOWN", txHash: op.txHash || txHash, error: safeErrorMessage(error), updatedAt: new Date().toISOString() });
+      if (!op) return undefined;
+      const hasTxIdentity = !!op.txHash || !!expectedTxHash;
+      Object.assign(op, {
+        status: hasTxIdentity ? "BROADCAST_UNKNOWN" : "PREPARE_FAILED",
+        txHash: op.txHash || expectedTxHash,
+        error: safeErrorMessage(error),
+        updatedAt: new Date().toISOString()
+      });
+      return { status: op.status, txHash: op.txHash };
     });
-    throw new Error(txHash
-      ? "ANCHOR_BROADCAST_UNKNOWN: tx hash was recovered; run reconcile before any retry"
-      : "ANCHOR_BROADCAST_UNKNOWN: transaction may have been submitted; automatic retry blocked");
+
+    if (persisted?.txHash) {
+      throw new Error(`ANCHOR_BROADCAST_UNKNOWN: deterministic tx hash ${persisted.txHash} was persisted; reconcile before any retry`);
+    }
+    throw error;
   }
 }
 
@@ -380,6 +432,15 @@ async function reconcileAnchor(input: any) {
     });
     return { ok: true, anchor, verification: inspected };
   }
+  if (inspected.status === "TX_NOT_FOUND" && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(op.status)) {
+    return {
+      ok: false,
+      status: op.status,
+      requiresManualReview: true,
+      reason: "PERSISTED_TX_HASH_NOT_FOUND_ON_RPC",
+      verification: inspected
+    };
+  }
   return { ok: false, status: "PENDING", verification: inspected };
 }
 
@@ -387,7 +448,8 @@ function safeErrorMessage(error: unknown) {
   const raw = String((error as any)?.message || error || "UNKNOWN_ERROR");
   return raw
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[redacted]@")
+    .replace(/([?&](?:token|key|secret|password)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 500);
 }
 
@@ -399,10 +461,11 @@ export default async function handler(req: any, res: ServerResponse) {
       if (sessionId) return json(res, 200, await loadState(sessionId));
 
       return json(res, 200, {
-        ok: !!configuredMasterSecret() && configurationErrors.length === 0,
+        ok: !!configuredMasterSecret() && configurationErrors.length === 0 && (DEMO_STORAGE_DURABLE || !process.env.VERCEL || process.env.ALLOW_EPHEMERAL_VERCEL_STATE === "true"),
         protocol: PROTOCOL,
-        version: "0.4.1",
+        version: "0.4.2",
         network: "CKB Testnet",
+        storage: { mode: DEMO_STORAGE_MODE, durable: DEMO_STORAGE_DURABLE },
         operatorA: pubA,
         operatorB: pubB,
         capabilities: {

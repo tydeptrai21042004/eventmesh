@@ -11,6 +11,7 @@ type PublicInfo = {
   network?: string;
   operatorA?: string;
   operatorB?: string;
+  storage?: { mode?: string; durable?: boolean };
   capabilities?: {
     fiberPayments?: boolean;
     ckbAnchoring?: boolean;
@@ -172,7 +173,7 @@ function App() {
         <div className="eyebrow">Bilateral event reconciliation</div>
         <h1>One shared record when systems disagree.</h1>
         <p>Coordinate service events, acknowledgements and final commitments between two independent operators with signed, verifiable evidence.</p>
-        <div className="hero-trust"><span>Signed events</span><span>Explicit acknowledgements</span><span>CKB-ready checkpoints</span></div>
+        <div className="hero-trust"><span>Signed events</span><span>Explicit acknowledgements</span><span>{info?.storage?.durable ? "Durable Postgres state" : "Local/preview state"}</span><span>CKB-ready checkpoints</span></div>
       </div>
       <div className="hero-action">
         <button className="primary large" disabled={!!busy || !info?.ok} onClick={create}>{busy === "create" ? "Starting…" : "Start signed session"}</button>
@@ -236,7 +237,7 @@ function App() {
             <div className="section-head"><div><small>Settlement evidence</small><h2>CKB checkpoint</h2></div><span className={`capability ${capabilities.ckbAnchoring ? "available" : "inactive"}`}>{capabilities.ckbAnchoring ? "Available" : "Not enabled"}</span></div>
             <p className="subtle">Optionally bind the closed session commitment to CKB Testnet for independent verification.</p>
             {capabilities.ckbAnchoring && <button disabled={!!busy || !closed || !!state?.anchor} onClick={anchor}>{state?.anchor ? "Checkpoint submitted" : "Submit checkpoint"}</button>}
-            {state?.anchorOperation?.tx_hash && <div className="checkpoint"><small>Transaction</small><code>{short(state.anchorOperation.tx_hash, 16)}</code>{capabilities.ckbReconciliation && <button className="text-button" disabled={!!busy} onClick={reconcile}>Verify on CKB</button>}</div>}
+            {state?.anchorOperation?.txHash && <div className="checkpoint"><small>Transaction</small><code>{short(state.anchorOperation.txHash, 16)}</code>{capabilities.ckbReconciliation && <button className="text-button" disabled={!!busy} onClick={reconcile}>Verify on CKB</button>}</div>}
           </article>
         </aside>
       </section>

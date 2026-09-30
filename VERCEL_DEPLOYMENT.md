@@ -1,65 +1,92 @@
-# EventMesh v0.4.1 — one-project Vercel demo without a database
+# EventMesh on Vercel — one project, durable state
 
-The reviewer demo is one Vercel project: Vite UI + same-origin serverless API + signed EventMesh state. **No Postgres, Neon, Vercel Blob, or other database is required.**
+EventMesh still deploys as one Vercel project: the Vite demo frontend and `/api/*` functions are built together. The production-oriented path now uses Postgres/Neon through `DATABASE_URL`; no separate migration command or database service process is required.
 
-For this demo build, state is JSON-backed:
-
-- local development: `.data/eventmesh-demo-state.json`;
-- Vercel Functions: `/tmp/eventmesh-demo-state.json`.
-
-`/tmp` on Vercel is **ephemeral and instance-local**. It can disappear on a cold start and two concurrent function instances can have different files. This mode is intentionally for a reviewer/demo deployment, not durable production reconciliation.
-
-## Fast path
+## 1. Required production variables
 
 ```bash
-chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
+DATABASE_URL=postgresql://...
+DEMO_MASTER_SECRET=<at least 32 characters; preferably 32 random bytes as hex>
+```
+
+The easiest Vercel setup is to connect a Neon/Postgres integration so `DATABASE_URL` is injected into the project. You can also add a connection string manually.
+
+On first access EventMesh automatically creates only its namespaced tables:
+
+- `eventmesh_schema_migrations`
+- `eventmesh_demo_state`
+
+The state table stores the compact demo ledger as JSONB with a monotonically increasing revision. Mutations use optimistic compare-and-swap updates so concurrent serverless invocations cannot silently overwrite a newer revision.
+
+To inspect initialization:
+
+```sql
+SELECT version, name, applied_at
+FROM eventmesh_schema_migrations
+ORDER BY version;
+```
+
+No manual SQL bootstrap is required.
+
+## 2. Optional Testnet/Fiber variables
+
+```bash
+CKB_RPC_URL=https://testnet.ckbapp.dev/
+CKB_PRIVATE_KEY=
+DEMO_ALLOW_CKB_BROADCAST=false
+CKB_ANCHOR_CAPACITY_CKB=220
+
+FIBER_RECEIVER_RPC_URL=
+FIBER_RECEIVER_RPC_TOKEN=
+```
+
+`PAYMENT_SETTLED` remains fail-closed unless the receiver-side Fiber RPC is configured and verifies the payment claim. CKB broadcasting remains disabled unless `DEMO_ALLOW_CKB_BROADCAST=true` and a Testnet key is present.
+
+## 3. Local setup
+
+```bash
 ./scripts/generate-env.sh
+npm install
+npm run check
+```
+
+Local development can still run without `DATABASE_URL`; it uses `.data/eventmesh-demo-state.json` in a single process. This keeps local setup simple while avoiding a false durability claim on Vercel.
+
+## 4. One-command Vercel deployment
+
+```bash
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-Only `DEMO_MASTER_SECRET` is required for mutation endpoints. The generator creates a random 32-byte secret automatically.
+The script runs the full checks, links the Vercel project, pushes any variables present in `.env.local`, deploys, then calls the live deep-health endpoint and performs a signed create → append → close smoke flow.
 
-## Minimal environment
+If a Neon integration already supplies `DATABASE_URL`, you may leave it empty in `.env.local`; the integration-provided variable remains available to the deployed project.
 
-```dotenv
-DEMO_MASTER_SECRET="<random 64 hex characters>"
-DEMO_RATE_LIMIT_PER_MINUTE=60
-DEMO_STATE_MAX_BYTES=4194304
-CKB_RPC_URL="https://testnet.ckbapp.dev/"
-DEMO_ALLOW_CKB_BROADCAST=false
+## 5. Health checks
+
+- `GET /api/health` — inexpensive readiness status.
+- `GET /api/health?deep=1` — initializes/checks Postgres, probes CKB RPC, and optionally probes Fiber.
+- `GET /api/demo` — protocol/capability metadata including storage mode and durability.
+
+For a normal production Vercel deployment, deep health should report:
+
+```json
+{
+  "storage": {
+    "mode": "postgres-jsonb",
+    "durable": true,
+    "writable": true,
+    "schemaVersion": 1
+  }
+}
 ```
 
-Optional server-side variables:
+## 6. Explicit throwaway preview mode
 
-```dotenv
-OPERATOR_A_PRIVATE_KEY="0x..."
-OPERATOR_B_PRIVATE_KEY="0x..."
-CKB_PRIVATE_KEY="0x..."
-CKB_ANCHOR_CAPACITY_CKB=220
-FIBER_RECEIVER_RPC_URL="https://your-receiver-fnn.example/rpc"
-FIBER_RECEIVER_RPC_TOKEN="..."
+Vercel `/tmp` is ephemeral and instance-local. EventMesh therefore refuses it by default. For a disposable preview only, you can explicitly set:
+
+```bash
+ALLOW_EPHEMERAL_VERCEL_STATE=true
 ```
 
-## Security defaults
-
-- Requests that mutate demo state require `application/json`.
-- Browser mutation requests are restricted to the same origin.
-- Request bodies are limited to 64 KiB.
-- JSON state writes use a temporary file + atomic rename and restrictive file permissions.
-- A per-instance minute rate limit is applied.
-- Idempotency keys are persisted in the JSON state and conflicting reuse is rejected.
-- Missing `DEMO_MASTER_SECRET` disables public mutation endpoints; secrets shorter than 32 characters are rejected.
-- Operator signing keys remain server-side. If explicit operator keys are not supplied, deterministic demo keys are derived from `DEMO_MASTER_SECRET`.
-- CKB broadcasting is **off by default**. Supplying `CKB_PRIVATE_KEY` alone is not sufficient; `DEMO_ALLOW_CKB_BROADCAST=true` must also be set explicitly.
-- `PAYMENT_SETTLED` remains fail-closed until a receiver Fiber RPC is configured and verifies the payment claim.
-
-## Diagnostics
-
-- `/api/health` — configuration-only health.
-- `/api/health?deep=1` — checks JSON storage writability, CKB Testnet RPC, and the optional Fiber receiver RPC.
-- `/api/demo` — reports runtime/storage readiness and recent demo sessions.
-- `node scripts/verify-deployment.mjs https://your-deployment.vercel.app` — creates, appends to, and closes a signed smoke-test session.
-
-## Important limitation
-
-This JSON mode deliberately trades durability for zero infrastructure. Do not describe it as durable storage on Vercel. For production, replace `api/demo-store.ts` with a durable store that provides multi-instance concurrency control while keeping the signing/protocol layer unchanged.
+Do not use that mode as evidence of durable reconciliation.

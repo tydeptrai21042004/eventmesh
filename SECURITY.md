@@ -51,3 +51,9 @@ Never commit operator private keys, `CKB_PRIVATE_KEY`, FNN tokens, `.env`, or lo
 ## Vulnerability reporting
 
 Report security issues privately to the repository maintainer rather than opening a public exploit-details issue. Replace this section with a dedicated security contact/process before any production deployment.
+
+## Vercel durable-state boundary
+
+Production Vercel deployments should configure `DATABASE_URL`. EventMesh auto-initializes namespaced Postgres tables and uses revision-based compare-and-swap updates to prevent lost updates between concurrent serverless invocations. Vercel `/tmp` is not treated as durable storage and is refused unless `ALLOW_EPHEMERAL_VERCEL_STATE=true` is explicitly enabled for a disposable preview.
+
+The public demo mutation API is intentionally unauthenticated at the end-user layer; same-origin browser checks and rate limits are abuse controls, not identity. A real operator service must put the endpoint behind application authentication and authorization.
