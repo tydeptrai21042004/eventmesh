@@ -15,10 +15,11 @@ import {
   sha256Hex,
   signAck,
   signEvent,
+  signFiberPaymentEvidence,
   signProtocolObject,
   verifyTranscript,
   type FiberPaymentClaim,
-  type FiberPaymentEvidence,
+  type SignedFiberPaymentEvidence,
   type SignedAck,
   type SignedEvent,
   type SignedSession
@@ -210,8 +211,9 @@ async function loadState(sessionId: string) {
       close: session.signedClose || null,
       anchor: session.anchor || null,
       anchorOperation: store.anchorOps[sessionId] || null,
-      paymentEvidence: evidence.map((r: any) => ({
-        ...r.evidence,
+      paymentEvidence: evidence.map((r: any) => r.evidence),
+      paymentEvidenceMeta: evidence.map((r: any) => ({
+        paymentHash: r.evidence?.evidence?.claim?.paymentHash,
         firstVerifiedAt: r.firstVerifiedAt,
         lastVerifiedAt: r.lastVerifiedAt,
         verificationCount: r.verificationCount
@@ -359,21 +361,22 @@ async function restorePortableSnapshot(snapshot: any) {
     }
 
     for (const evidence of snapshot.paymentEvidence || []) {
-      const paymentHash = String(evidence?.claim?.paymentHash || "").toLowerCase();
+      const paymentHash = String(evidence?.evidence?.claim?.paymentHash || "").toLowerCase();
       if (!paymentHash) continue;
       const event = (snapshot.events || []).find((row: any) =>
         row?.event?.type === "PAYMENT_SETTLED" && String(row?.event?.payload?.paymentHash || "").toLowerCase() === paymentHash
       );
       if (!event) continue;
-      store.paymentClaims[paymentHash] = { sessionId, eventHash: event.event.eventHash.toLowerCase(), claim: evidence.claim };
+      const verifiedAt = evidence?.evidence?.verifiedAt || new Date().toISOString();
+      store.paymentClaims[paymentHash] = { sessionId, eventHash: event.event.eventHash.toLowerCase(), claim: evidence.evidence.claim };
       store.paymentEvidence[paymentHash] = {
         sessionId,
         eventHash: event.event.eventHash.toLowerCase(),
         identityHash: stableEvidenceIdentity(evidence),
         evidence,
-        firstVerifiedAt: evidence.firstVerifiedAt || evidence.verifiedAt,
-        lastVerifiedAt: evidence.lastVerifiedAt || evidence.verifiedAt,
-        verificationCount: evidence.verificationCount || 1
+        firstVerifiedAt: verifiedAt,
+        lastVerifiedAt: verifiedAt,
+        verificationCount: 1
       };
     }
   });
@@ -395,13 +398,16 @@ function snapshotSummary(snapshot: any) {
   };
 }
 
-function stableEvidenceIdentity(evidence: FiberPaymentEvidence) {
+function stableEvidenceIdentity(evidence: SignedFiberPaymentEvidence) {
+  // Re-verifying the same paid invoice creates a fresh verifiedAt/signature.
+  // Idempotency must be based on the stable observed facts, not wall-clock time.
   return sha256Hex(canonical({
-    claim: evidence.claim,
-    verifier: evidence.verifier,
-    invoiceStatus: evidence.invoiceStatus,
-    payeePublicKey: evidence.payeePublicKey,
-    observedUdtTypeScript: evidence.observedUdtTypeScript
+    observer: evidence.observer,
+    claim: evidence.evidence.claim,
+    verifier: evidence.evidence.verifier,
+    invoiceStatus: evidence.evidence.invoiceStatus,
+    payeePublicKey: evidence.evidence.payeePublicKey,
+    observedUdtTypeScript: evidence.evidence.observedUdtTypeScript
   }));
 }
 
@@ -532,7 +538,7 @@ async function appendEvent(input: any) {
       createdAt: new Date().toISOString()
     }, senderKey);
 
-    let paymentEvidence: FiberPaymentEvidence | undefined;
+    let paymentEvidence: SignedFiberPaymentEvidence | undefined;
     if (event.type === "PAYMENT_SETTLED") {
       const claim = event.payload as FiberPaymentClaim;
       if (String(claim?.sessionId || "") !== sessionId) throw new Error("FIBER_PAYMENT_SESSION_MISMATCH");
@@ -540,20 +546,20 @@ async function appendEvent(input: any) {
       const fiber = new FiberRpcClient(process.env.FIBER_RECEIVER_RPC_URL, process.env.FIBER_RECEIVER_RPC_TOKEN || undefined);
       const verified = await fiber.verifyReceivedPaymentClaim(claim);
       if (!verified.ok) throw new Error(verified.reason);
-      paymentEvidence = verified.evidence;
-      const paymentHash = paymentEvidence.claim.paymentHash.toLowerCase();
+      paymentEvidence = signFiberPaymentEvidence(verified.evidence, receiverPub, receiverKey);
+      const paymentHash = paymentEvidence.evidence.claim.paymentHash.toLowerCase();
       const existingClaim = store.paymentClaims[paymentHash];
       if (existingClaim && (existingClaim.sessionId !== sessionId || existingClaim.eventHash !== event.eventHash.toLowerCase())) {
         throw new Error("FIBER_PAYMENT_HASH_REUSE");
       }
-      if (!existingClaim) store.paymentClaims[paymentHash] = { sessionId, eventHash: event.eventHash.toLowerCase(), claim: paymentEvidence.claim };
+      if (!existingClaim) store.paymentClaims[paymentHash] = { sessionId, eventHash: event.eventHash.toLowerCase(), claim: paymentEvidence.evidence.claim };
 
       const identityHash = stableEvidenceIdentity(paymentEvidence);
       const priorEvidence = store.paymentEvidence[paymentHash];
       if (priorEvidence && priorEvidence.identityHash !== identityHash) throw new Error("FIBER_PAYMENT_EVIDENCE_CONFLICT");
       if (priorEvidence) {
         priorEvidence.evidence = paymentEvidence;
-        priorEvidence.lastVerifiedAt = paymentEvidence.verifiedAt;
+        priorEvidence.lastVerifiedAt = paymentEvidence.evidence.verifiedAt;
         priorEvidence.verificationCount += 1;
       } else {
         store.paymentEvidence[paymentHash] = {
@@ -561,8 +567,8 @@ async function appendEvent(input: any) {
           eventHash: event.eventHash.toLowerCase(),
           identityHash,
           evidence: paymentEvidence,
-          firstVerifiedAt: paymentEvidence.verifiedAt,
-          lastVerifiedAt: paymentEvidence.verifiedAt,
+          firstVerifiedAt: paymentEvidence.evidence.verifiedAt,
+          lastVerifiedAt: paymentEvidence.evidence.verifiedAt,
           verificationCount: 1
         };
       }

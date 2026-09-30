@@ -16,6 +16,7 @@ function usage() {
 
 Options:
   --ckb-rpc <url>              Independently query CKB get_transaction
+  --ckb-confirmations <n>      Require at least n CKB confirmations (default: 0)
   --receiver-fiber-rpc <url>   Independently query receiver FNN get_invoice
   --fiber-token <token>        Optional FNN bearer token
   --adapter <name>             Validate application semantics (paid-service-reference)
@@ -50,6 +51,13 @@ for (let index = 0; index < args.length; index++) {
     process.exit(2);
   }
   flags.set(arg, value);
+}
+
+const ckbConfirmationsRaw = flags.get("--ckb-confirmations");
+const ckbConfirmations = ckbConfirmationsRaw === undefined ? 0 : Number(ckbConfirmationsRaw);
+if (!Number.isInteger(ckbConfirmations) || ckbConfirmations < 0) {
+  console.error("--ckb-confirmations must be a non-negative integer");
+  process.exit(2);
 }
 
 const transcript = JSON.parse(readFileSync(file, "utf8")) as TranscriptExport;
@@ -137,7 +145,7 @@ if (transcript.close && transcript.ckbAnchor) {
   }
 
   if (ckbRpc && typeof ckbRpc === "string") {
-    const result = await verifyAnchorRpcDetailed(ckbRpc, transcript.ckbAnchor.txHash, expected);
+    const result = await verifyAnchorRpcDetailed(ckbRpc, transcript.ckbAnchor.txHash, expected, ckbConfirmations);
     console.log(`[${result.ok ? "PASS" : "FAIL"}] CKB RPC ${result.status}`);
     if (!result.ok) failed = true;
   } else if (flags.has("--require-ckb")) {

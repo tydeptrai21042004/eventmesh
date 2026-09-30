@@ -87,6 +87,15 @@ function validatePaidServiceTranscript(transcript: TranscriptExport): AdapterVal
     return { ok: false, reason: "PAYMENT_SETTLED must bind this EventMesh sessionId" };
   }
 
+  const requestId = [...requestIds][0];
+  const resultEvent = events.find(({ event }) => event.type === "RESULT_COMMITTED")!.event;
+  if (payment.data.obligationId && payment.data.obligationId !== requestId) {
+    return { ok: false, reason: "payment obligationId must match the paid-service requestId" };
+  }
+  if (payment.data.settlesEventHash && payment.data.settlesEventHash.toLowerCase() !== resultEvent.eventHash.toLowerCase()) {
+    return { ok: false, reason: "payment settlesEventHash must bind the RESULT_COMMITTED event" };
+  }
+
   return { ok: true };
 }
 

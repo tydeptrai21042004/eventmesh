@@ -11,7 +11,9 @@ export const SIGNING_DOMAIN = {
   EVENT: "event",
   ACK: "ack",
   CLOSE: "close",
-  ANCHOR_NOTICE: "anchor-notice"
+  ANCHOR_NOTICE: "anchor-notice",
+  PAYMENT_EVIDENCE: "payment-evidence",
+  RECONCILE: "reconcile"
 } as const;
 export type SigningDomain = (typeof SIGNING_DOMAIN)[keyof typeof SIGNING_DOMAIN];
 
@@ -85,12 +87,42 @@ export type SignedAck = z.infer<typeof SignedAckSchema>;
  */
 export const FiberPaymentClaimSchema = z.object({
   paymentHash: H32,
-  sessionId: z.string().min(1),
+  sessionId: z.string().min(1).max(128),
   amount: z.string().regex(/^(?:0x[0-9a-f]+|[0-9]+)$/i),
   currency: z.enum(["Fibb", "Fibt", "Fibd"]),
-  udtTypeScript: CkbScriptSchema.optional()
+  udtTypeScript: CkbScriptSchema.optional(),
+  // Optional application-level binding. These fields make one payment identify
+  // the exact obligation/result it settles rather than only the broad session.
+  obligationId: z.string().min(1).max(128).optional(),
+  settlesEventHash: H32.optional(),
+  purposeHash: H32.optional(),
+  expectedPayeePublicKey: z.string().min(1).max(256).optional()
 }).strict();
 export type FiberPaymentClaim = z.infer<typeof FiberPaymentClaimSchema>;
+
+export function computeFiberPaymentPurposeHash(input: {
+  sessionId: string;
+  amount: string;
+  currency: "Fibb" | "Fibt" | "Fibd";
+  udtTypeScript?: CkbScript;
+  obligationId?: string;
+  settlesEventHash?: string;
+  expectedPayeePublicKey?: string;
+}) {
+  let normalizedAmount: string;
+  try { normalizedAmount = BigInt(input.amount).toString(10); }
+  catch { throw new Error("INVALID_FIBER_PAYMENT_AMOUNT"); }
+  return sha256Hex(canonical({
+    domain: "EventMesh/FiberPaymentPurpose/v1",
+    sessionId: input.sessionId,
+    amount: normalizedAmount,
+    currency: input.currency,
+    udtTypeScript: input.udtTypeScript,
+    obligationId: input.obligationId,
+    settlesEventHash: input.settlesEventHash?.toLowerCase(),
+    expectedPayeePublicKey: input.expectedPayeePublicKey?.toLowerCase()
+  }));
+}
 
 export const FiberPaymentEvidenceSchema = z.object({
   claim: FiberPaymentClaimSchema,
@@ -101,6 +133,19 @@ export const FiberPaymentEvidenceSchema = z.object({
   observedUdtTypeScript: CkbScriptSchema.optional()
 }).strict();
 export type FiberPaymentEvidence = z.infer<typeof FiberPaymentEvidenceSchema>;
+
+/**
+ * Receiver-owned observations are signed by the EventMesh operator that owns
+ * the receiving FNN. This prevents an exported transcript from containing an
+ * unauthenticated JSON object that merely claims an invoice was Paid.
+ */
+export const SignedFiberPaymentEvidenceSchema = z.object({
+  evidence: FiberPaymentEvidenceSchema,
+  observer: Pub,
+  evidenceHash: H32,
+  signature: Sig
+}).strict();
+export type SignedFiberPaymentEvidence = z.infer<typeof SignedFiberPaymentEvidenceSchema>;
 
 export const CloseBodySchema = z.object({
   sessionId: z.string().min(1),
@@ -131,11 +176,13 @@ export type TranscriptExport = {
   session: SignedSession;
   events: Array<{ event: SignedEvent; ack?: SignedAck }>;
   close?: SignedClose;
-  paymentEvidence?: FiberPaymentEvidence[];
+  // Legacy v0.2 exports may contain unsigned FiberPaymentEvidence. New
+  // operators export SignedFiberPaymentEvidence and verifiers authenticate it.
+  paymentEvidence?: Array<SignedFiberPaymentEvidence | FiberPaymentEvidence>;
   ckbAnchor?: {
     txHash: string;
     dataHex: string;
-    status?: "PENDING" | "COMMITTED";
+    status?: "PENDING" | "COMMITTED" | "CONFIRMED";
     blockHash?: string;
   };
   conflicts?: ConflictEvidence[];
@@ -207,6 +254,40 @@ export function verifyAck(ack: SignedAck) {
     && verifyProtocolObject(SIGNING_DOMAIN.ACK, body, signature, body.operator);
 }
 
+export function fiberPaymentEvidenceHash(evidence: FiberPaymentEvidence, observer: string) {
+  return sha256Hex(canonical({ evidence: FiberPaymentEvidenceSchema.parse(evidence), observer }));
+}
+
+export function signFiberPaymentEvidence(
+  evidence: FiberPaymentEvidence,
+  observer: string,
+  privateKey: string
+): SignedFiberPaymentEvidence {
+  const parsedEvidence = FiberPaymentEvidenceSchema.parse(evidence);
+  const body = { evidence: parsedEvidence, observer };
+  return SignedFiberPaymentEvidenceSchema.parse({
+    ...body,
+    evidenceHash: fiberPaymentEvidenceHash(parsedEvidence, observer),
+    signature: signProtocolObject(SIGNING_DOMAIN.PAYMENT_EVIDENCE, body, privateKey)
+  });
+}
+
+export function verifyFiberPaymentEvidence(input: SignedFiberPaymentEvidence) {
+  const parsed = SignedFiberPaymentEvidenceSchema.safeParse(input);
+  if (!parsed.success) return false;
+  const { evidence, observer, evidenceHash, signature } = parsed.data;
+  const body = { evidence, observer };
+  return evidenceHash.toLowerCase() === fiberPaymentEvidenceHash(evidence, observer).toLowerCase()
+    && verifyProtocolObject(SIGNING_DOMAIN.PAYMENT_EVIDENCE, body, signature, observer);
+}
+
+export const signedPaymentEvidenceLeaf = (input: SignedFiberPaymentEvidence) =>
+  sha256Hex(canonical(SignedFiberPaymentEvidenceSchema.parse(input)));
+export const computeSignedPaymentEvidenceRoot = (items: SignedFiberPaymentEvidence[]) =>
+  merkleRoot([...items]
+    .sort((a, b) => a.evidence.claim.paymentHash.toLowerCase().localeCompare(b.evidence.claim.paymentHash.toLowerCase()))
+    .map(signedPaymentEvidenceLeaf));
+
 export const transcriptLeaf = (event: SignedEvent, ack: SignedAck) =>
   sha256Hex(`${event.eventHash.toLowerCase()}:${ack.ackHash.toLowerCase()}`);
 export function merkleRoot(leaves: string[]) {
@@ -276,6 +357,36 @@ export function verifyTranscript(transcript: TranscriptExport) {
   const finalItems: Array<{ event: SignedEvent; ack: SignedAck }> = [];
   const paymentEvents = new Map<string, string>();
   const sortedEvents = [...transcript.events].sort((a, b) => a.event.sequence - b.event.sequence);
+  const signedEvidenceByPayment = new Map<string, SignedFiberPaymentEvidence>();
+  const legacyEvidenceByPayment = new Map<string, FiberPaymentEvidence>();
+  const hasEvidenceSection = transcript.paymentEvidence !== undefined;
+  for (const evidence of transcript.paymentEvidence ?? []) {
+    const signed = SignedFiberPaymentEvidenceSchema.safeParse(evidence);
+    if (signed.success) {
+      if (!verifyFiberPaymentEvidence(signed.data)) {
+        errors.push("Invalid signed Fiber payment evidence");
+        continue;
+      }
+      const paymentHash = signed.data.evidence.claim.paymentHash.toLowerCase();
+      const previous = signedEvidenceByPayment.get(paymentHash);
+      if (previous && canonical(previous) !== canonical(signed.data)) errors.push(`Conflicting Fiber payment evidence for ${paymentHash}`);
+      signedEvidenceByPayment.set(paymentHash, signed.data);
+      continue;
+    }
+
+    // Backward compatibility for already-exported v0.2 transcripts. Legacy
+    // observations are accepted as historical metadata only; they do not get
+    // the stronger receiver-authentication guarantee of signed observations.
+    const legacy = FiberPaymentEvidenceSchema.safeParse(evidence);
+    if (!legacy.success) {
+      errors.push("Invalid Fiber payment evidence");
+      continue;
+    }
+    const paymentHash = legacy.data.claim.paymentHash.toLowerCase();
+    const previous = legacyEvidenceByPayment.get(paymentHash);
+    if (previous && canonical(previous) !== canonical(legacy.data)) errors.push(`Conflicting legacy Fiber payment evidence for ${paymentHash}`);
+    legacyEvidenceByPayment.set(paymentHash, legacy.data);
+  }
 
   for (const [index, item] of sortedEvents.entries()) {
     const { event, ack } = item;
@@ -299,11 +410,30 @@ export function verifyTranscript(transcript: TranscriptExport) {
           errors.push(`Invalid PAYMENT_SETTLED payload at event ${event.sequence}`);
         } else {
           if (claim.data.sessionId !== session.sessionId) errors.push(`PAYMENT_SETTLED wrong session at event ${event.sequence}`);
+          if (claim.data.purposeHash) {
+            const derivedPurposeHash = computeFiberPaymentPurposeHash(claim.data);
+            if (derivedPurposeHash.toLowerCase() !== claim.data.purposeHash.toLowerCase()) {
+              errors.push(`PAYMENT_SETTLED purposeHash mismatch at event ${event.sequence}`);
+            }
+          }
           const paymentHash = claim.data.paymentHash.toLowerCase();
           if (paymentEvents.has(paymentHash) && paymentEvents.get(paymentHash) !== event.eventHash.toLowerCase()) {
             errors.push(`Fiber payment hash reused at event ${event.sequence}`);
           } else {
             paymentEvents.set(paymentHash, event.eventHash.toLowerCase());
+          }
+          const observed = signedEvidenceByPayment.get(paymentHash);
+          const legacyObserved = legacyEvidenceByPayment.get(paymentHash);
+          if (observed) {
+            const expectedObserver = ack.operator;
+            if (observed.observer !== expectedObserver) errors.push(`Fiber payment evidence signed by wrong operator at event ${event.sequence}`);
+            if (canonical(observed.evidence.claim) !== canonical(claim.data)) errors.push(`Fiber payment evidence claim mismatch at event ${event.sequence}`);
+          } else if (legacyObserved) {
+            if (canonical(legacyObserved.claim) !== canonical(claim.data)) errors.push(`Legacy Fiber payment evidence claim mismatch at event ${event.sequence}`);
+          } else if (hasEvidenceSection) {
+            // New exporters include an evidence section. If that section exists,
+            // every accepted payment must have a corresponding observation.
+            errors.push(`Missing receiver Fiber payment evidence at event ${event.sequence}`);
           }
         }
       }

@@ -47,9 +47,13 @@ const { app } = await buildOperatorApp({
   adminToken: process.env.ADMIN_TOKEN,
   corsOrigins: parseCorsOrigins(process.env.CORS_ORIGINS),
   requestTimeoutMs: Number(process.env.PEER_REQUEST_TIMEOUT_MS ?? 10_000),
+  maxBodyBytes: Number(process.env.MAX_BODY_BYTES ?? 262_144),
+  peerRateLimitMax: Number(process.env.PEER_RATE_LIMIT_MAX ?? (publicMode ? 120 : 1000)),
+  peerRateLimitWindowMs: Number(process.env.PEER_RATE_LIMIT_WINDOW_MS ?? 60_000),
   fiber,
   ckb,
   ckbRpcUrl: process.env.CKB_RPC_URL,
+  ckbMinConfirmations: Number(process.env.CKB_MIN_CONFIRMATIONS ?? (publicMode ? 2 : 0)),
   autoAnchorOnClose: process.env.CKB_AUTO_ANCHOR_ON_CLOSE === "true"
 });
 

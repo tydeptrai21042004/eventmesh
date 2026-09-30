@@ -135,6 +135,31 @@ describe("Store immutability and equivocation evidence", () => {
     store.close();
   });
 
+
+  it("persists the delivery outbox across process restarts and keeps ids idempotent", () => {
+    const dir = mkdtempSync(join(tmpdir(), "eventmesh-outbox-"));
+    dirs.push(dir);
+    const path = join(dir, "eventmesh-state.json");
+    const first = new Store(path);
+    const row = first.enqueueOutbox({
+      id: "event:0xabc", sessionId: "ses-outbox", kind: "EVENT",
+      path: "/peer/sessions/ses-outbox/events", body: { event: { eventHash: "0xabc" } }
+    });
+    expect(row.status).toBe("PENDING");
+    first.markOutboxAttempt(row.id, "simulated network loss");
+    first.close();
+
+    const second = new Store(path);
+    expect(second.listOutbox("PENDING")).toMatchObject([{ id: row.id, attempts: 1, lastError: "simulated network loss" }]);
+    expect(second.enqueueOutbox({
+      id: row.id, sessionId: "ses-outbox", kind: "EVENT",
+      path: "/peer/sessions/ses-outbox/events", body: { event: { eventHash: "0xabc" } }
+    }).id).toBe(row.id);
+    second.markOutboxDelivered(row.id);
+    expect(second.listOutbox("DELIVERED")[0]).toMatchObject({ id: row.id, status: "DELIVERED" });
+    second.close();
+  });
+
   it("makes close immutable and marks a conflicting close as disputed", () => {
     const { store, session, aPriv, bPriv } = setup();
     const c1 = signedClose(session.sessionId, aPriv, bPriv, { n: 1 });

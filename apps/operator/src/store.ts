@@ -2,9 +2,11 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { dirname, resolve } from "node:path";
 import {
   canonical,
+  sha256Hex,
+  SignedFiberPaymentEvidenceSchema,
   type ConflictEvidence,
   type FiberPaymentClaim,
-  type FiberPaymentEvidence,
+  type SignedFiberPaymentEvidence,
   type SignedAck,
   type SignedClose,
   type SignedEvent,
@@ -38,7 +40,23 @@ type PaymentClaimRow = {
 type PaymentEvidenceRow = {
   sessionId: string;
   eventHash: string;
-  evidence: FiberPaymentEvidence;
+  evidence: SignedFiberPaymentEvidence;
+};
+
+export type OutboxKind = "EVENT" | "ACK" | "ANCHOR_NOTICE";
+export type OutboxRow = {
+  id: string;
+  sessionId: string;
+  kind: OutboxKind;
+  path: string;
+  body: unknown;
+  status: "PENDING" | "DELIVERED";
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  lastAttemptAt?: string;
+  deliveredAt?: string;
+  lastError?: string;
 };
 
 type FileState = {
@@ -49,6 +67,7 @@ type FileState = {
   conflicts: Array<ConflictEvidence & { sessionId: string }>;
   paymentClaims: Record<string, PaymentClaimRow>;
   paymentEvidence: Record<string, PaymentEvidenceRow>;
+  outbox: Record<string, OutboxRow>;
 };
 
 const emptyState = (): FileState => ({
@@ -58,12 +77,30 @@ const emptyState = (): FileState => ({
   events: {},
   conflicts: [],
   paymentClaims: {},
-  paymentEvidence: {}
+  paymentEvidence: {},
+  outbox: {}
 });
 
 function parseState(raw: string): FileState {
   const value = JSON.parse(raw);
   if (!value || value.version !== 1) throw new Error("EVENTMESH_STATE_INVALID");
+
+  // v0.6 hardens receiver observations by requiring an operator signature.
+  // Older state files may contain unsigned evidence rows; do not accidentally
+  // promote those rows to trusted signed evidence. The accepted payment claim
+  // remains in paymentClaims/events and can still be exported in legacy mode.
+  const paymentEvidence: Record<string, PaymentEvidenceRow> = {};
+  for (const [paymentHash, row] of Object.entries(value.paymentEvidence || {})) {
+    const candidate = (row as any)?.evidence;
+    const parsed = SignedFiberPaymentEvidenceSchema.safeParse(candidate);
+    if (parsed.success) {
+      paymentEvidence[paymentHash] = {
+        ...(row as any),
+        evidence: parsed.data
+      };
+    }
+  }
+
   return {
     ...emptyState(),
     ...value,
@@ -71,7 +108,8 @@ function parseState(raw: string): FileState {
     events: value.events || {},
     conflicts: value.conflicts || [],
     paymentClaims: value.paymentClaims || {},
-    paymentEvidence: value.paymentEvidence || {}
+    paymentEvidence,
+    outbox: value.outbox || {}
   };
 }
 
@@ -132,6 +170,7 @@ export class Store {
       }
       if (!existing.signed.signatureB && session.signatureB) {
         existing.signed = { ...existing.signed, signatureB: session.signatureB };
+        if (existing.status === "CREATING") existing.status = "ACTIVE";
         this.persist();
       }
       return "IDEMPOTENT";
@@ -151,6 +190,16 @@ export class Store {
       close: row.close,
       anchor: row.anchor
     };
+  }
+
+  setSessionStatus(sessionId: string, status: string): WriteResult {
+    const row = this.state.sessions[sessionId];
+    if (!row) return "NOT_FOUND";
+    if (row.status === status) return "IDEMPOTENT";
+    if (row.status === "DISPUTED" && status !== "DISPUTED") return "CONFLICT";
+    row.status = status;
+    this.persist();
+    return "INSERTED";
   }
 
   listSessions() {
@@ -275,24 +324,25 @@ export class Store {
     return "CONFLICT";
   }
 
-  savePaymentEvidence(sessionId: string, eventHash: string, evidence: FiberPaymentEvidence): WriteResult {
-    const paymentHash = evidence.claim.paymentHash.toLowerCase();
+  savePaymentEvidence(sessionId: string, eventHash: string, evidence: SignedFiberPaymentEvidence): WriteResult {
+    const paymentHash = evidence.evidence.claim.paymentHash.toLowerCase();
     const row = this.state.paymentEvidence[paymentHash];
     if (!row) {
       this.state.paymentEvidence[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), evidence };
       this.persist();
       return "INSERTED";
     }
-    const stableIdentity = (item: FiberPaymentEvidence) => canonical({
-      claim: item.claim,
-      verifier: item.verifier,
-      invoiceStatus: item.invoiceStatus,
-      payeePublicKey: item.payeePublicKey,
-      observedUdtTypeScript: item.observedUdtTypeScript
+    // verifiedAt/signature may change when the same receiver re-checks an invoice
+    // after a crash. Treat the stable observed facts as the idempotency identity.
+    const stableIdentity = (item: SignedFiberPaymentEvidence) => canonical({
+      observer: item.observer,
+      claim: item.evidence.claim,
+      verifier: item.evidence.verifier,
+      invoiceStatus: item.evidence.invoiceStatus,
+      payeePublicKey: item.evidence.payeePublicKey,
+      observedUdtTypeScript: item.evidence.observedUdtTypeScript
     });
     if (row.sessionId === sessionId && row.eventHash === eventHash.toLowerCase() && stableIdentity(row.evidence) === stableIdentity(evidence)) {
-      row.evidence = evidence;
-      this.persist();
       return "IDEMPOTENT";
     }
     this.conflict(sessionId, "PAYMENT", row.evidence, evidence);
@@ -300,11 +350,79 @@ export class Store {
     return "CONFLICT";
   }
 
-  listPaymentEvidence(sessionId: string): FiberPaymentEvidence[] {
+  listPaymentEvidence(sessionId: string): SignedFiberPaymentEvidence[] {
     return Object.entries(this.state.paymentEvidence)
       .filter(([, row]) => row.sessionId === sessionId)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([, row]) => row.evidence);
+  }
+
+  enqueueOutbox(input: Omit<OutboxRow, "status" | "attempts" | "createdAt" | "updatedAt">): OutboxRow {
+    const existing = this.state.outbox[input.id];
+    if (existing) {
+      if (existing.sessionId !== input.sessionId || existing.path !== input.path || canonical(existing.body) !== canonical(input.body)) {
+        throw new Error("OUTBOX_ID_CONFLICT");
+      }
+      return existing;
+    }
+    const now = new Date().toISOString();
+    const row: OutboxRow = { ...input, status: "PENDING", attempts: 0, createdAt: now, updatedAt: now };
+    this.state.outbox[input.id] = row;
+    this.persist();
+    return row;
+  }
+
+  markOutboxAttempt(id: string, error?: string): OutboxRow | undefined {
+    const row = this.state.outbox[id];
+    if (!row) return undefined;
+    const now = new Date().toISOString();
+    row.attempts += 1;
+    row.lastAttemptAt = now;
+    row.updatedAt = now;
+    if (error) row.lastError = error;
+    else delete row.lastError;
+    this.persist();
+    return row;
+  }
+
+  markOutboxDelivered(id: string): OutboxRow | undefined {
+    const row = this.state.outbox[id];
+    if (!row) return undefined;
+    const now = new Date().toISOString();
+    row.status = "DELIVERED";
+    row.deliveredAt = now;
+    row.updatedAt = now;
+    delete row.lastError;
+    this.persist();
+    return row;
+  }
+
+  listOutbox(status?: "PENDING" | "DELIVERED", sessionId?: string): OutboxRow[] {
+    return Object.values(this.state.outbox)
+      .filter((row) => (!status || row.status === status) && (!sessionId || row.sessionId === sessionId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  sessionHead(sessionId: string) {
+    const session = this.state.sessions[sessionId];
+    if (!session) return undefined;
+    const events = this.listEvents(sessionId);
+    return {
+      sessionId,
+      status: session.status,
+      protocol: session.signed.session.protocol,
+      eventCount: events.length,
+      lastEventHash: events.at(-1)?.event.eventHash ?? null,
+      entries: events.map((row) => ({
+        sequence: row.event.sequence,
+        eventHash: row.event.eventHash,
+        ackHash: row.ack?.ackHash ?? null,
+        decision: row.ack?.decision ?? null,
+        status: row.status
+      })),
+      closeHash: session.close ? sha256Hex(canonical(session.close.close)) : null,
+      anchorTxHash: session.anchor?.txHash ?? null
+    };
   }
 
   listConflicts(sessionId: string): ConflictEvidence[] {

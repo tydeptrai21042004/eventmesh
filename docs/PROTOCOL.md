@@ -13,21 +13,22 @@ EventMesh/eventmesh-v0.2.0/session
 EventMesh/eventmesh-v0.2.0/event
 EventMesh/eventmesh-v0.2.0/ack
 EventMesh/eventmesh-v0.2.0/close
+EventMesh/eventmesh-v0.2.0/payment-evidence
 ```
 
-The stable signed objects are `SignedSession`, `SignedEvent`, `SignedAck`, and `SignedClose`.
+The stable protocol evidence includes `SignedSession`, `SignedEvent`, `SignedAck`, `SignedClose`, and receiver-signed Fiber observations. The CKB anchor domain remains `EVENTMESH_V02` for compatibility.
 
 ## 3. Session/event rules
 
 - A session has exactly two distinct secp256k1 operator public keys.
+- Operator A persists a partially signed session in `CREATING` before contacting B; retry completes the same session ID/signature instead of generating a replacement session.
 - Events are contiguous and hash-linked with `previousHash`.
-- v0.2 proof profile permits only one unresolved event at a time. This intentionally avoids pretending to implement multilateral ordering/consensus.
+- v0.2 permits only one unresolved event at a time.
 - The event sender cannot ACK its own event.
 - The counterparty signs ACCEPT or REJECT over the exact event hash.
 - First valid evidence is immutable. Conflicting session/event/ACK/close/anchor/payment material is retained and marks the session `DISPUTED`.
-- A same-sequence event from the other operator is recorded as `PROPOSAL_COLLISION`, not falsely labelled sender equivocation.
-
-A normal close is blocked when any event has a REJECT ACK.
+- A same-sequence event from the other operator is `PROPOSAL_COLLISION`, not same-sender equivocation.
+- A normal close is blocked when any event has a REJECT ACK.
 
 ## 4. Fiber payment event
 
@@ -37,13 +38,13 @@ A normal close is blocked when any event has a REJECT ACK.
 {
   paymentHash: Hex32,
   sessionId: string,
-  amount: string,              // decimal or 0x quantity
+  amount: string,
   currency: "Fibb" | "Fibt" | "Fibd",
-  udtTypeScript?: {
-    code_hash: Hex32,
-    hash_type: "data" | "type" | "data1" | "data2",
-    args: Hex
-  }
+  udtTypeScript?: CkbScript,
+  obligationId?: string,
+  settlesEventHash?: Hex32,
+  purposeHash?: Hex32,
+  expectedPayeePublicKey?: string
 }
 ```
 
@@ -52,17 +53,39 @@ The receiver MUST independently call `get_invoice(paymentHash)` on its own confi
 Required checks:
 
 1. invoice status is `Paid`;
-2. payment hash matches exactly;
-3. amount matches numerically;
-4. currency matches;
-5. invoice description includes exact `eventmesh:<sessionId>` marker;
-6. if a UDT script is claimed, the receiver must observe and exactly match the same script;
-7. if no UDT is claimed but the invoice exposes a UDT script, reject the claim;
-8. a payment hash cannot satisfy multiple EventMesh sessions/events.
+2. payment hash, numerical amount and currency match;
+3. invoice description includes exact `eventmesh:<sessionId>`;
+4. claimed obligation/result/purpose markers match when present;
+5. `purposeHash`, when present, recomputes from the canonical purpose fields;
+6. expected payee key matches the invoice observation when claimed;
+7. claimed UDT script must be observed and exactly equal; unexpected observed UDT is rejected;
+8. one payment hash cannot satisfy multiple EventMesh sessions/events.
 
-Sender-side `get_payment == Success` can be useful corroboration but MUST NOT replace receiver-owned verification.
+Sender-side `get_payment == Success` remains corroboration only.
 
-## 5. Payment evidence commitment
+## 5. Receiver-owned signed observation
+
+After receiver FNN verification, the receiving EventMesh operator signs:
+
+```ts
+{
+  evidence: {
+    claim,
+    verifier: "RECEIVER_FNN",
+    verifiedAt,
+    invoiceStatus: "Paid",
+    payeePublicKey?,
+    observedUdtTypeScript?
+  },
+  observer,
+  evidenceHash,
+  signature
+}
+```
+
+The ACCEPTing ACK operator and the observation signer must be the same session participant. New exports include this signed observation and verification rejects missing, mismatched, or tampered evidence when the evidence section is present. Historical v0.2 exports without an evidence section remain verifiable for backward compatibility, but do not receive this stronger observation-authentication guarantee.
+
+## 6. v0.2 payment claim commitment
 
 For every accepted `PAYMENT_SETTLED` claim:
 
@@ -70,33 +93,29 @@ For every accepted `PAYMENT_SETTLED` claim:
 leaf = SHA256(canonical(FiberPaymentClaim))
 ```
 
-Claims are sorted by payment hash and Merkleized into:
+Claims are sorted by payment hash and Merkleized into `paymentEvidenceRoot`. This commits amount, currency, session, UDT and any obligation/result/purpose/payee claim fields.
+
+For wire compatibility, `EVENTMESH_V02` does **not** additionally commit the receiver-observation signature. That signed observation travels in the transcript and is independently verified. A future anchor version can add a dedicated signed-observation root.
+
+## 7. Durable delivery and reconciliation
+
+Outbound immutable evidence is assigned deterministic outbox IDs:
 
 ```text
-paymentEvidenceRoot
+event:<eventHash>
+ack:<ackHash>
+anchor:<txHash>
 ```
 
-This means amount, currency, session binding and optional exact UDT type script are committed—not only the payment hash.
+Repeated delivery is idempotent. `/peer/sessions/:id/head` exposes only reconciliation identifiers (event/ACK hashes, close hash and anchor tx hash). The admin reconciliation route can safely re-deliver local signed evidence and detects forks rather than overwriting either side.
 
-## 6. Close
+## 8. Close
 
-The close commits to:
+The close commits to `sessionId`, `eventCount`, `transcriptRoot`, `finalStateHash`, `fiberPayments[]`, `paymentEvidenceRoot`, and `closedAt`. Both A and B independently recompute roots before signing the same close body.
 
-```text
-sessionId
-eventCount
-transcriptRoot
-finalStateHash
-fiberPayments[]
-paymentEvidenceRoot
-closedAt
-```
+## 9. CKB commitment and lifecycle
 
-Both A and B independently recompute the transcript and payment-evidence roots before signing the same close body.
-
-## 7. CKB commitment
-
-Canonical output data:
+Canonical output data remains:
 
 ```text
 EVENTMESH_V02
@@ -106,27 +125,15 @@ EVENTMESH_V02
 || paymentEvidenceRoot
 ```
 
-The peer/verifier never trusts supplied `dataHex` alone. It derives expected bytes locally, queries CKB `get_transaction(txHash)`, requires committed status, and requires one output-data item to exactly match the expected commitment. `EVENTMESH_V02` is 141 output-data bytes; with the standard secp lock the adapter enforces at least 202 CKB occupied capacity and uses 220 CKB by default.
-
-## 8. Anchor lifecycle
-
-Broadcast returns `PENDING`. Proof quality is achieved only after independent reconciliation returns `COMMITTED`.
-
-Operator A can call:
+Anchor lifecycle:
 
 ```text
-POST /admin/sessions/:id/anchor/reconcile
+prepare/sign -> persist deterministic txHash -> broadcast -> PENDING
+-> COMMITTED -> CONFIRMED (when configured depth is reached)
 ```
 
-The route rechecks CKB and retries notifying B when the transaction is committed.
+A timeout after broadcast is treated as ambiguous. Recovery queries the persisted tx hash; it must not blindly create a replacement transaction.
 
-## 9. Adapter boundary
+## 10. Adapter boundary
 
-Application-specific semantics live outside core in an `EventMeshAdapter`:
-
-```ts
-validateEvent(event)
-deriveFinalState(transcript)
-```
-
-The adapter cannot change the cryptographic transcript, Fiber verification rules or CKB commitment format.
+Application-specific semantics live outside core in an `EventMeshAdapter`. An adapter may validate event ordering/payloads and derive a final application state, but cannot weaken session signatures, ACK rules, Fiber receiver verification, or CKB commitment verification.

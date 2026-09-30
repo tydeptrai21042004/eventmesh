@@ -6,6 +6,7 @@ import {
   ZERO_HASH,
   acceptedFiberPaymentHashes,
   buildAnchorDataHex,
+  computeFiberPaymentPurposeHash,
   computePaymentEvidenceRoot,
   computeTranscriptRoot,
   createSessionId,
@@ -14,9 +15,11 @@ import {
   randomPrivateKeyHex,
   signAck,
   signEvent,
+  signFiberPaymentEvidence,
   signProtocolObject,
   verifyAck,
   verifyEvent,
+  verifyFiberPaymentEvidence,
   verifyProtocolObject,
   verifyTranscript,
   type FiberPaymentClaim,
@@ -111,6 +114,46 @@ describe("EventMesh v0.2 core", () => {
     const root2 = computePaymentEvidenceRoot([{ event: changed, ack: changedAck }]);
     expect(root1).not.toBe(root2);
     expect(acceptedFiberPaymentHashes([{ event, ack }])).toEqual([claim.paymentHash.toLowerCase()]);
+  });
+
+
+  it("binds a payment to an obligation/result and authenticates receiver-owned evidence", () => {
+    const f = fixture();
+    const settlesEventHash = `0x${"44".repeat(32)}`;
+    const purposeHash = computeFiberPaymentPurposeHash({
+      sessionId: f.session.sessionId,
+      amount: "100000000",
+      currency: "Fibt",
+      obligationId: "job-42",
+      settlesEventHash,
+      expectedPayeePublicKey: "02receiver"
+    });
+    const claim: FiberPaymentClaim = {
+      paymentHash: `0x${"45".repeat(32)}`,
+      sessionId: f.session.sessionId,
+      amount: "100000000",
+      currency: "Fibt",
+      obligationId: "job-42",
+      settlesEventHash,
+      purposeHash,
+      expectedPayeePublicKey: "02receiver"
+    };
+    const event = signEvent({
+      sessionId: f.session.sessionId, sequence: 1, previousHash: ZERO_HASH,
+      type: "PAYMENT_SETTLED", payload: claim, sender: f.a, createdAt: new Date().toISOString()
+    }, f.aPriv);
+    const ack = signAck({ eventHash: event.eventHash, decision: "ACCEPT", operator: f.b, createdAt: new Date().toISOString() }, f.bPriv);
+    const evidence = signFiberPaymentEvidence({
+      claim, verifier: "RECEIVER_FNN", verifiedAt: new Date().toISOString(), invoiceStatus: "Paid", payeePublicKey: "02receiver"
+    }, f.b, f.bPriv);
+    expect(verifyFiberPaymentEvidence(evidence)).toBe(true);
+
+    const transcript: TranscriptExport = { session: signedSession(f), events: [{ event, ack }], paymentEvidence: [evidence] };
+    expect(verifyTranscript(transcript)).toEqual({ ok: true, errors: [] });
+    const tampered = structuredClone(transcript);
+    const tamperedEvidence = tampered.paymentEvidence![0] as any;
+    tamperedEvidence.evidence.payeePublicKey = "02attacker";
+    expect(verifyTranscript(tampered).errors).toContain("Invalid signed Fiber payment evidence");
   });
 
   it("validates a dual-signed close and v0.2 CKB commitment", () => {

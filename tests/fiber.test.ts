@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FiberRpcClient } from "@eventmesh/fiber";
-import type { FiberPaymentClaim } from "@eventmesh/core";
+import { computeFiberPaymentPurposeHash, type FiberPaymentClaim } from "@eventmesh/core";
 
 const hash = `0x${"22".repeat(32)}`;
 const baseClaim: FiberPaymentClaim = {
@@ -44,6 +44,42 @@ describe("receiver-owned Fiber evidence", () => {
     mockRpc({ status: "Paid", invoice: { currency: "Fibt", amount: "0x5f5e100", data: { payment_hash: hash, attrs: [{ description: "eventmesh:other_session" }] } } });
     const result = await new FiberRpcClient("http://fnn.test").verifyReceivedPaymentClaim(baseClaim);
     expect(result).toMatchObject({ ok: false, reason: "FIBER_SESSION_BINDING_MISMATCH" });
+  });
+
+
+  it("verifies obligation, result, purpose, and expected-payee bindings", async () => {
+    const settlesEventHash = `0x${"77".repeat(32)}`;
+    const claimBase = {
+      ...baseClaim,
+      obligationId: "job-77",
+      settlesEventHash,
+      expectedPayeePublicKey: "02receiver"
+    };
+    const purposeHash = computeFiberPaymentPurposeHash(claimBase);
+    const claim = { ...claimBase, purposeHash };
+    mockRpc({
+      status: "Paid",
+      invoice: {
+        currency: "Fibt", amount: "0x5f5e100",
+        data: { payment_hash: hash, attrs: [
+          { description: `eventmesh:ses_test | eventmesh-obligation:job-77 | eventmesh-settles:${settlesEventHash} | eventmesh-purpose:${purposeHash}` },
+          { payee_public_key: "02receiver" }
+        ] }
+      }
+    });
+    const result = await new FiberRpcClient("http://fnn.test").verifyReceivedPaymentClaim(claim);
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a receiver identity mismatch", async () => {
+    mockRpc({
+      status: "Paid",
+      invoice: { currency: "Fibt", amount: "0x5f5e100", data: { payment_hash: hash, attrs: [
+        { description: "eventmesh:ses_test" }, { payee_public_key: "02other" }
+      ] } }
+    });
+    const result = await new FiberRpcClient("http://fnn.test").verifyReceivedPaymentClaim({ ...baseClaim, expectedPayeePublicKey: "02receiver" });
+    expect(result).toMatchObject({ ok: false, reason: "FIBER_PAYEE_MISMATCH" });
   });
 
   it("requires exact UDT script when the claim names one", async () => {

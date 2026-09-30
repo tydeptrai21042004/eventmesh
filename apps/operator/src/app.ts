@@ -9,7 +9,7 @@ import {
   CloseBodySchema,
   EventBodySchema,
   FiberPaymentClaimSchema,
-  FiberPaymentEvidenceSchema,
+  SignedFiberPaymentEvidenceSchema,
   PROTOCOL,
   SessionSchema,
   SignedAckSchema,
@@ -26,12 +26,14 @@ import {
   createSessionId,
   finalStateHashFrom,
   signAck,
+  signFiberPaymentEvidence,
   signEvent,
   signProtocolObject,
   verifyAck,
   verifyEvent,
+  verifyFiberPaymentEvidence,
   verifyProtocolObject,
-  type FiberPaymentEvidence,
+  type SignedFiberPaymentEvidence,
   type SignedSession
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
@@ -52,9 +54,13 @@ export type OperatorAppOptions = {
   adminToken?: string;
   corsOrigins?: string[];
   requestTimeoutMs?: number;
+  maxBodyBytes?: number;
+  peerRateLimitMax?: number;
+  peerRateLimitWindowMs?: number;
   fiber?: FiberRpcClient;
   ckb?: CkbAnchorClient;
   ckbRpcUrl?: string;
+  ckbMinConfirmations?: number;
   autoAnchorOnClose?: boolean;
 };
 
@@ -77,14 +83,19 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   const publicMode = options.publicMode ?? false;
   const allowPrivatePeerUrls = options.allowPrivatePeerUrls ?? !publicMode;
   const requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
+  const maxBodyBytes = options.maxBodyBytes ?? 256 * 1024;
+  const peerRateLimitMax = options.peerRateLimitMax ?? (publicMode ? 120 : 1000);
+  const peerRateLimitWindowMs = options.peerRateLimitWindowMs ?? 60_000;
+  const ckbMinConfirmations = Math.max(0, options.ckbMinConfirmations ?? (publicMode ? 2 : 0));
   if (publicMode && !options.adminToken) throw new Error("PUBLIC_MODE_REQUIRES_ADMIN_TOKEN");
   if (publicMode && !options.selfUrl.startsWith("https://")) throw new Error("PUBLIC_MODE_REQUIRES_HTTPS_SELF_URL");
 
   mkdirSync(options.dataDir, { recursive: true });
   const identity = loadIdentity(options.dataDir, options.operatorPrivateKey);
   const store = new Store(join(options.dataDir, "eventmesh-state.json"));
-  const app = Fastify({ logger: process.env.NODE_ENV !== "test" });
+  const app = Fastify({ logger: process.env.NODE_ENV !== "test", bodyLimit: maxBodyBytes });
   const corsOrigins = new Set(options.corsOrigins ?? ["http://localhost:3000"]);
+  const peerRate = new Map<string, { count: number; resetAt: number }>();
 
   await app.register(cors, {
     origin(origin, callback) {
@@ -95,6 +106,21 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   });
 
   app.addHook("onClose", async () => store.close());
+  app.addHook("onRequest", async (req, reply) => {
+    if (!req.url.startsWith("/peer/")) return;
+    const now = Date.now();
+    const key = req.ip;
+    let bucket = peerRate.get(key);
+    if (!bucket || now >= bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + peerRateLimitWindowMs };
+      peerRate.set(key, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > peerRateLimitMax) {
+      reply.header("retry-after", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+      return reply.code(429).send({ error: "PEER_RATE_LIMITED" });
+    }
+  });
 
   function requireAdmin(req: FastifyRequest, reply: FastifyReply): boolean {
     if (!options.adminToken && !publicMode) return true;
@@ -141,6 +167,51 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     return postJson<T>(`${base}${path}`, body);
   }
 
+  async function getPeer<T>(session: SignedSession, path: string): Promise<T> {
+    const base = await checkedPeerBase(peerUrlFor(session));
+    const response = await peerFetch(`${base}${path}`);
+    const text = await response.text();
+    if (!response.ok) throw new Error(`Peer ${response.status}: ${text}`);
+    return text ? JSON.parse(text) as T : ({} as T);
+  }
+
+  async function deliverOutboxRow(row: ReturnType<Store["listOutbox"]>[number]) {
+    const session = store.getSession(row.sessionId);
+    if (!session) {
+      store.markOutboxAttempt(row.id, "SESSION_NOT_FOUND");
+      return { id: row.id, delivered: false, error: "SESSION_NOT_FOUND" };
+    }
+    try {
+      await postPeer(session.signed, row.path, row.body);
+      store.markOutboxAttempt(row.id);
+      store.markOutboxDelivered(row.id);
+      return { id: row.id, delivered: true };
+    } catch (error) {
+      const detail = String(error);
+      store.markOutboxAttempt(row.id, detail);
+      return { id: row.id, delivered: false, error: detail };
+    }
+  }
+
+  async function queueAndDeliver(input: {
+    id: string;
+    sessionId: string;
+    kind: "EVENT" | "ACK" | "ANCHOR_NOTICE";
+    path: string;
+    body: unknown;
+  }) {
+    const row = store.enqueueOutbox(input);
+    if (row.status === "DELIVERED") return { id: row.id, status: "DELIVERED" as const, attempts: row.attempts };
+    const result = await deliverOutboxRow(row);
+    const current = store.listOutbox(undefined, input.sessionId).find((item) => item.id === input.id)!;
+    return {
+      id: row.id,
+      status: result.delivered ? "DELIVERED" as const : "PENDING" as const,
+      attempts: current.attempts,
+      ...(result.error ? { error: result.error } : {})
+    };
+  }
+
   function assertSessionParticipant(session: SignedSession) {
     if (identity.publicKey !== session.session.operatorA && identity.publicKey !== session.session.operatorB) {
       throw new Error("LOCAL_OPERATOR_NOT_SESSION_PARTICIPANT");
@@ -152,13 +223,13 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (Date.now() >= new Date(session.session.expiresAt).getTime()) throw new Error("SESSION_EXPIRED");
   }
 
-  function paymentEvidenceForEvent(sessionId: string, eventHash: string): FiberPaymentEvidence | undefined {
+  function paymentEvidenceForEvent(sessionId: string, eventHash: string): SignedFiberPaymentEvidence | undefined {
     const event = store.getEvent(eventHash)?.event;
     if (!event || event.type !== "PAYMENT_SETTLED") return undefined;
     const claim = FiberPaymentClaimSchema.safeParse(event.payload);
     if (!claim.success) return undefined;
     return store.listPaymentEvidence(sessionId)
-      .find((evidence) => evidence.claim.paymentHash.toLowerCase() === claim.data.paymentHash.toLowerCase());
+      .find((evidence) => evidence.evidence.claim.paymentHash.toLowerCase() === claim.data.paymentHash.toLowerCase());
   }
 
   async function createAndStoreAnchor(sessionId: string) {
@@ -167,15 +238,29 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (!record?.close) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
     if (record.anchor) return record.anchor;
     const close = record.close.close;
-    const anchor = await options.ckb.anchor({
+
+    // Prepare + sign first so the transaction identity is deterministic, persist
+    // that identity, and only then cross the irreversible broadcast boundary.
+    const prepared = await options.ckb.prepareAnchor({
       sessionId,
       transcriptRoot: close.transcriptRoot,
       finalStateHash: close.finalStateHash,
       paymentEvidenceRoot: close.paymentEvidenceRoot
     });
-    const write = store.saveAnchor(sessionId, anchor);
+    const pending = { txHash: prepared.txHash, dataHex: prepared.dataHex, status: "PENDING" as const };
+    const write = store.saveAnchor(sessionId, pending);
     if (write === "CONFLICT") throw new Error("ANCHOR_CONFLICT");
-    return anchor;
+
+    try {
+      const broadcast = await options.ckb.broadcastPrepared(prepared);
+      store.saveAnchor(sessionId, broadcast);
+      return broadcast;
+    } catch (error) {
+      // Keep the prepared tx hash. A timeout is ambiguous: the transaction may
+      // already be in the mempool, so reconciliation must query by this hash.
+      app.log.warn({ error, txHash: prepared.txHash }, "CKB broadcast result ambiguous; retained deterministic tx hash");
+      return pending;
+    }
   }
 
   async function reconcileAnchor(sessionId: string) {
@@ -190,7 +275,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       close.finalStateHash,
       close.paymentEvidenceRoot
     );
-    const verification = await inspectAnchorRpc(options.ckbRpcUrl, record.anchor.txHash, expected);
+    const verification = await inspectAnchorRpc(options.ckbRpcUrl, record.anchor.txHash, expected, ckbMinConfirmations);
     if (!verification.ok) {
       store.saveAnchor(sessionId, { ...record.anchor, dataHex: expected, status: "PENDING" });
       return { committed: false as const, verification };
@@ -198,8 +283,9 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const committed = {
       ...record.anchor,
       dataHex: expected,
-      status: "COMMITTED" as const,
-      blockHash: verification.blockHash
+      status: (verification.status === "CONFIRMED" ? "CONFIRMED" : "COMMITTED") as "CONFIRMED" | "COMMITTED",
+      blockHash: verification.blockHash,
+      confirmations: verification.confirmations
     };
     store.saveAnchor(sessionId, committed);
     return { committed: true as const, verification, anchor: committed };
@@ -214,7 +300,11 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     mode: publicMode ? "public" : "development",
     fiberEnabled: !!options.fiber,
     ckbAnchorEnabled: !!options.ckb,
-    ckbVerificationEnabled: !!options.ckbRpcUrl
+    ckbVerificationEnabled: !!options.ckbRpcUrl,
+    ckbMinConfirmations,
+    peerRateLimit: { maxRequests: peerRateLimitMax, windowMs: peerRateLimitWindowMs },
+    maxBodyBytes,
+    pendingOutbox: store.listOutbox("PENDING").length
   }));
   app.get("/identity", async () => ({
     name: options.name,
@@ -259,7 +349,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const paymentEvidence = store.listPaymentEvidence(req.params.id);
     const conflicts = store.listConflicts(req.params.id);
     const acceptedPayments = acceptedFiberPaymentHashes(events);
-    const evidencePaymentHashes = new Set(paymentEvidence.map((item) => item.claim.paymentHash.toLowerCase()));
+    const evidencePaymentHashes = new Set(paymentEvidence.map((item) => item.evidence.claim.paymentHash.toLowerCase()));
     const finalEvents = events.filter((item) => item.status === "FINAL" && !!item.ack);
     const acceptedEvents = finalEvents.filter((item) => item.ack?.decision === "ACCEPT");
     const rejectedEvents = finalEvents.filter((item) => item.ack?.decision === "REJECT");
@@ -310,11 +400,186 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
         fiberBound: acceptedPayments.length > 0 && fiberEvidenceComplete,
         noRecordedConflicts: conflicts.length === 0,
         closeDualSigned,
-        ckbCommitted: record.anchor?.status === "COMMITTED"
+        ckbCommitted: record.anchor?.status === "COMMITTED" || record.anchor?.status === "CONFIRMED",
+        ckbConfirmed: record.anchor?.status === "CONFIRMED"
       }
     };
   };
 
+
+  const listOutbox: Handler = async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const query = z.object({
+      status: z.enum(["PENDING", "DELIVERED"]).optional(),
+      sessionId: z.string().optional()
+    }).parse(req.query ?? {});
+    return store.listOutbox(query.status, query.sessionId);
+  };
+
+  const drainOutbox: Handler = async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const body = z.object({
+      sessionId: z.string().optional(),
+      limit: z.number().int().positive().max(100).default(25)
+    }).parse(req.body ?? {});
+    const pending = store.listOutbox("PENDING", body.sessionId).slice(0, body.limit);
+    const results = [];
+    for (const row of pending) results.push(await deliverOutboxRow(row));
+    return { attempted: results.length, delivered: results.filter((item) => item.delivered).length, results };
+  };
+
+  const getPeerHead: Handler = async (req, reply) => {
+    const head = store.sessionHead(req.params.id);
+    if (!head) return reply.code(404).send({ error: "SESSION_NOT_FOUND" });
+    return head;
+  };
+
+  const reconcileSession: Handler = async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const record = store.getSession(req.params.id);
+    if (!record) return reply.code(404).send({ error: "SESSION_NOT_FOUND" });
+    const body = z.object({ repair: z.boolean().default(false) }).parse(req.body ?? {});
+
+    let repairResults: Array<{ id: string; delivered: boolean; error?: string }> = [];
+    if (body.repair) {
+      for (const row of store.listOutbox("PENDING", req.params.id).slice(0, 100)) {
+        repairResults.push(await deliverOutboxRow(row));
+      }
+    }
+
+    let local = store.sessionHead(req.params.id)!;
+    let remote: any;
+    try {
+      remote = await getPeer<any>(record.signed, `/peer/sessions/${req.params.id}/head`);
+    } catch (error) {
+      return reply.code(502).send({
+        state: "PEER_UNREACHABLE",
+        local,
+        pendingOutbox: store.listOutbox("PENDING", req.params.id).length,
+        repairResults,
+        detail: String(error)
+      });
+    }
+
+    // Recover the common crash window where local evidence was persisted but
+    // the outbox entry itself was not. Rebuild delivery from immutable signed
+    // evidence; never synthesize a new event or ACK.
+    if (body.repair) {
+      const initialLocalEntries = Array.isArray(local.entries) ? local.entries : [];
+      const initialRemoteEntries = Array.isArray(remote.entries) ? remote.entries : [];
+      let canContinue = true;
+
+      for (let index = 0; index < Math.min(initialLocalEntries.length, initialRemoteEntries.length); index += 1) {
+        const left = initialLocalEntries[index];
+        const right = initialRemoteEntries[index];
+        if (left.eventHash?.toLowerCase() !== right.eventHash?.toLowerCase()) { canContinue = false; break; }
+        if (left.ackHash && !right.ackHash) {
+          const row = store.getEvent(left.eventHash);
+          if (row?.ack) {
+            const paymentEvidence = paymentEvidenceForEvent(req.params.id, row.event.eventHash);
+            const result = await queueAndDeliver({
+              id: `ack:${row.ack.ackHash.toLowerCase()}`,
+              sessionId: req.params.id,
+              kind: "ACK",
+              path: `/peer/sessions/${req.params.id}/acks`,
+              body: { ack: row.ack, paymentEvidence }
+            });
+            repairResults.push({ id: result.id, delivered: result.status === "DELIVERED", ...(result.error ? { error: result.error } : {}) });
+            if (result.status !== "DELIVERED") canContinue = false;
+          }
+        } else if (left.ackHash && right.ackHash && left.ackHash.toLowerCase() !== right.ackHash.toLowerCase()) {
+          canContinue = false;
+        }
+      }
+
+      if (canContinue && initialLocalEntries.length > initialRemoteEntries.length) {
+        for (let index = initialRemoteEntries.length; index < initialLocalEntries.length; index += 1) {
+          const entry = initialLocalEntries[index];
+          const row = store.getEvent(entry.eventHash);
+          if (!row) { canContinue = false; break; }
+          const eventDelivery = await queueAndDeliver({
+            id: `event:${row.event.eventHash.toLowerCase()}`,
+            sessionId: req.params.id,
+            kind: "EVENT",
+            path: `/peer/sessions/${req.params.id}/events`,
+            body: { event: row.event }
+          });
+          repairResults.push({ id: eventDelivery.id, delivered: eventDelivery.status === "DELIVERED", ...(eventDelivery.error ? { error: eventDelivery.error } : {}) });
+          if (eventDelivery.status !== "DELIVERED") { canContinue = false; break; }
+
+          if (row.ack) {
+            const paymentEvidence = paymentEvidenceForEvent(req.params.id, row.event.eventHash);
+            const ackDelivery = await queueAndDeliver({
+              id: `ack:${row.ack.ackHash.toLowerCase()}`,
+              sessionId: req.params.id,
+              kind: "ACK",
+              path: `/peer/sessions/${req.params.id}/acks`,
+              body: { ack: row.ack, paymentEvidence }
+            });
+            repairResults.push({ id: ackDelivery.id, delivered: ackDelivery.status === "DELIVERED", ...(ackDelivery.error ? { error: ackDelivery.error } : {}) });
+            if (ackDelivery.status !== "DELIVERED") { canContinue = false; break; }
+          }
+        }
+      }
+
+      try {
+        local = store.sessionHead(req.params.id)!;
+        remote = await getPeer<any>(record.signed, `/peer/sessions/${req.params.id}/head`);
+      } catch { /* keep last known heads; delivery results already explain failure */ }
+    }
+
+    const localEntries = Array.isArray(local.entries) ? local.entries : [];
+    const remoteEntries = Array.isArray(remote.entries) ? remote.entries : [];
+    const common = Math.min(localEntries.length, remoteEntries.length);
+    for (let index = 0; index < common; index += 1) {
+      const left = localEntries[index];
+      const right = remoteEntries[index];
+      if (left.eventHash?.toLowerCase() !== right.eventHash?.toLowerCase()) {
+        return reply.code(409).send({ state: "FORK", sequence: index + 1, local: left, remote: right, repairResults });
+      }
+      if ((left.ackHash ?? "").toLowerCase() !== (right.ackHash ?? "").toLowerCase()) {
+        return reply.code(409).send({ state: "ACK_DIVERGENCE", sequence: index + 1, local: left, remote: right, repairResults });
+      }
+    }
+
+    let state = "IN_SYNC";
+    if (localEntries.length > remoteEntries.length) state = "LOCAL_AHEAD";
+    else if (localEntries.length < remoteEntries.length) state = "REMOTE_AHEAD";
+    else if ((local.closeHash ?? null) !== (remote.closeHash ?? null)) state = "CLOSE_DIVERGENCE";
+    else if ((local.anchorTxHash ?? null) !== (remote.anchorTxHash ?? null)) state = "ANCHOR_DIVERGENCE";
+
+    return {
+      state,
+      local,
+      remote,
+      pendingOutbox: store.listOutbox("PENDING", req.params.id).length,
+      repairResults,
+      safeAction: state === "IN_SYNC" ? "NONE"
+        : state === "LOCAL_AHEAD" ? "RETRY_LOCAL_OUTBOX_OR_REDELIVER_MISSING_EVIDENCE"
+        : state === "REMOTE_AHEAD" ? "RECOVER_SIGNED_EVIDENCE_FROM_PEER_BEFORE_NEW_EVENTS"
+        : "FREEZE_SESSION_AND_COMPARE_SIGNED_EVIDENCE"
+    };
+  };
+
+  async function completeSessionJoin(sessionId: string) {
+    const draft = store.getSession(sessionId);
+    if (!draft) throw new Error("SESSION_NOT_FOUND");
+    if (draft.signed.signatureB && draft.status === "ACTIVE") return draft.signed;
+    const session = draft.signed.session;
+    if (session.operatorA !== identity.publicKey) throw new Error("ONLY_OPERATOR_A_CAN_COMPLETE_JOIN");
+    const joined = await postJson<{ signatureB: string }>(`${await checkedPeerBase(session.operatorBUrl)}/peer/sessions/${sessionId}/join`, {
+      session,
+      signatureA: draft.signed.signatureA
+    });
+    if (!verifyProtocolObject(SIGNING_DOMAIN.SESSION, session, joined.signatureB, session.operatorB)) {
+      throw new Error("INVALID_PEER_SESSION_SIGNATURE");
+    }
+    const signed = SignedSessionSchema.parse({ ...draft.signed, signatureB: joined.signatureB });
+    const write = store.saveSession(signed, "ACTIVE");
+    if (write === "CONFLICT") throw new Error("SESSION_ID_CONFLICT");
+    store.setSessionStatus(sessionId, "ACTIVE");
+    return store.getSession(sessionId)!.signed;
+  }
 
   const createSession: Handler = async (req, reply) => {
     if (!requireAdmin(req, reply)) return;
@@ -347,15 +612,36 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       expiresAt: new Date(now.getTime() + (body.expiresInSeconds ?? 1800) * 1000).toISOString(),
       maxEvents: body.maxEvents ?? 100
     });
-    const signatureA = signProtocolObject(SIGNING_DOMAIN.SESSION, session, identity.privateKey);
-    const joined = await postJson<{ signatureB: string }>(`${peerUrl}/peer/sessions/${session.sessionId}/join`, { session, signatureA });
-    if (!verifyProtocolObject(SIGNING_DOMAIN.SESSION, session, joined.signatureB, session.operatorB)) {
-      return reply.code(502).send({ error: "INVALID_PEER_SESSION_SIGNATURE" });
+    const draft = SignedSessionSchema.parse({
+      session,
+      signatureA: signProtocolObject(SIGNING_DOMAIN.SESSION, session, identity.privateKey)
+    });
+    // Persist before contacting the peer. If the response is lost, the exact
+    // session ID and signature can be retried instead of creating a new session.
+    if (store.saveSession(draft, "CREATING") === "CONFLICT") return reply.code(409).send({ error: "SESSION_ID_CONFLICT" });
+    try {
+      const signed = await completeSessionJoin(session.sessionId);
+      return reply.code(201).send(signed);
+    } catch (error) {
+      return reply.code(202).send({
+        session: draft,
+        status: "CREATING",
+        retryable: true,
+        retryPath: `/admin/sessions/${session.sessionId}/join/retry`,
+        detail: String(error)
+      });
     }
-    const signed = SignedSessionSchema.parse({ session, signatureA, signatureB: joined.signatureB });
-    const write = store.saveSession(signed);
-    if (write === "CONFLICT") return reply.code(409).send({ error: "SESSION_ID_CONFLICT" });
-    return reply.code(201).send(signed);
+  };
+
+  const retrySessionJoin: Handler = async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    try {
+      const signed = await completeSessionJoin(req.params.id);
+      return { session: signed, status: "ACTIVE" };
+    } catch (error) {
+      const message = String((error as Error).message);
+      return reply.code(message === "SESSION_NOT_FOUND" ? 404 : 502).send({ error: message, retryable: true });
+    }
   };
 
   const joinSession: Handler = async (req, reply) => {
@@ -401,12 +687,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     }), identity.privateKey);
     const write = store.saveEvent(event);
     if (write === "CONFLICT") return reply.code(409).send({ error: "EVENT_CONFLICT" });
-    try {
-      await postPeer(record.signed, `/peer/sessions/${req.params.id}/events`, { event });
-    } catch (error) {
-      return reply.code(502).send({ error: "PEER_DELIVERY_FAILED", detail: String(error), event });
-    }
-    return reply.code(201).send(event);
+    const delivery = await queueAndDeliver({
+      id: `event:${event.eventHash.toLowerCase()}`,
+      sessionId: req.params.id,
+      kind: "EVENT",
+      path: `/peer/sessions/${req.params.id}/events`,
+      body: { event }
+    });
+    return reply.code(delivery.status === "DELIVERED" ? 201 : 202).send({ ...event, delivery });
   };
 
   const retryEvent: Handler = async (req, reply) => {
@@ -417,8 +705,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (record.event.sessionId !== req.params.id) return reply.code(409).send({ error: "EVENT_SESSION_MISMATCH" });
     if (record.event.sender !== identity.publicKey) return reply.code(403).send({ error: "ONLY_SENDER_CAN_RETRY_DELIVERY" });
     if (record.status !== "PROPOSED") return { delivered: true, status: record.status };
-    await postPeer(session.signed, `/peer/sessions/${req.params.id}/events`, { event: record.event });
-    return { delivered: true, eventHash: record.event.eventHash };
+    const delivery = await queueAndDeliver({
+      id: `event:${record.event.eventHash.toLowerCase()}`,
+      sessionId: req.params.id,
+      kind: "EVENT",
+      path: `/peer/sessions/${req.params.id}/events`,
+      body: { event: record.event }
+    });
+    return { delivered: delivery.status === "DELIVERED", eventHash: record.event.eventHash, delivery };
   };
 
   const receiveEvent: Handler = async (req, reply) => {
@@ -470,14 +764,19 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (record.event.sessionId !== req.params.id) return reply.code(409).send({ error: "EVENT_SESSION_MISMATCH" });
     if (record.ack) {
       const paymentEvidence = paymentEvidenceForEvent(req.params.id, record.event.eventHash);
-      try { await postPeer(session.signed, `/peer/sessions/${req.params.id}/acks`, { ack: record.ack, paymentEvidence }); }
-      catch (error) { return reply.code(502).send({ error: "ACK_REDELIVERY_FAILED", detail: String(error), ack: record.ack }); }
-      return { ...record.ack, duplicate: true, ...(paymentEvidence ? { paymentEvidence } : {}) };
+      const delivery = await queueAndDeliver({
+        id: `ack:${record.ack.ackHash.toLowerCase()}`,
+        sessionId: req.params.id,
+        kind: "ACK",
+        path: `/peer/sessions/${req.params.id}/acks`,
+        body: { ack: record.ack, paymentEvidence }
+      });
+      return { ...record.ack, duplicate: true, delivery, ...(paymentEvidence ? { paymentEvidence } : {}) };
     }
     if (record.status !== "PROPOSED") return reply.code(409).send({ error: "EVENT_NOT_PENDING", status: record.status });
     if (record.event.sender === identity.publicKey) return reply.code(403).send({ error: "SENDER_CANNOT_ACK_OWN_EVENT" });
     const { decision } = z.object({ decision: z.enum(["ACCEPT", "REJECT"]).default("ACCEPT") }).parse(req.body ?? {});
-    let paymentEvidence: FiberPaymentEvidence | undefined;
+    let paymentEvidence: SignedFiberPaymentEvidence | undefined;
     if (decision === "ACCEPT" && record.event.type === "PAYMENT_SETTLED") {
       const claim = FiberPaymentClaimSchema.safeParse(record.event.payload);
       if (!claim.success || claim.data.sessionId !== req.params.id) return reply.code(400).send({ error: "INVALID_FIBER_PAYMENT_CLAIM" });
@@ -485,8 +784,10 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       const checked = await options.fiber.verifyReceivedPaymentClaim(claim.data);
       if (!checked.ok) return reply.code(409).send({ error: "FIBER_PAYMENT_VERIFICATION_FAILED", detail: checked.reason });
       if (store.claimPayment(req.params.id, claim.data, record.event.eventHash) === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_REUSE" });
-      if (store.savePaymentEvidence(req.params.id, record.event.eventHash, checked.evidence) === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_CONFLICT" });
-      paymentEvidence = checked.evidence;
+      paymentEvidence = signFiberPaymentEvidence(checked.evidence, identity.publicKey, identity.privateKey);
+      const evidenceWrite = store.savePaymentEvidence(req.params.id, record.event.eventHash, paymentEvidence);
+      if (evidenceWrite === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_CONFLICT" });
+      if (evidenceWrite === "IDEMPOTENT") paymentEvidence = paymentEvidenceForEvent(req.params.id, record.event.eventHash) ?? paymentEvidence;
     }
     const ack = signAck(AckBodySchema.parse({
       eventHash: record.event.eventHash,
@@ -495,12 +796,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       createdAt: new Date().toISOString()
     }), identity.privateKey);
     if (store.saveAck(ack) === "CONFLICT") return reply.code(409).send({ error: "ACK_EQUIVOCATION" });
-    try {
-      await postPeer(session.signed, `/peer/sessions/${req.params.id}/acks`, { ack, paymentEvidence });
-    } catch (error) {
-      return reply.code(502).send({ error: "ACK_DELIVERY_FAILED", detail: String(error), ack, paymentEvidence });
-    }
-    return { ...ack, ...(paymentEvidence ? { paymentEvidence } : {}) };
+    const delivery = await queueAndDeliver({
+      id: `ack:${ack.ackHash.toLowerCase()}`,
+      sessionId: req.params.id,
+      kind: "ACK",
+      path: `/peer/sessions/${req.params.id}/acks`,
+      body: { ack, paymentEvidence }
+    });
+    return reply.code(delivery.status === "DELIVERED" ? 200 : 202).send({ ...ack, delivery, ...(paymentEvidence ? { paymentEvidence } : {}) });
   };
 
   const receiveAck: Handler = async (req, reply) => {
@@ -508,7 +811,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (!session) return reply.code(404).send({ error: "SESSION_NOT_FOUND" });
     const { ack, paymentEvidence } = z.object({
       ack: SignedAckSchema,
-      paymentEvidence: FiberPaymentEvidenceSchema.optional()
+      paymentEvidence: SignedFiberPaymentEvidenceSchema.optional()
     }).parse(req.body);
     if (!verifyAck(ack)) return reply.code(400).send({ error: "INVALID_ACK" });
     const event = store.getEvent(ack.eventHash);
@@ -518,13 +821,17 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       ? session.signed.session.operatorB
       : session.signed.session.operatorA;
     if (ack.operator !== expectedAckOperator) return reply.code(403).send({ error: "WRONG_ACK_OPERATOR" });
-    if (event.ack?.ackHash === ack.ackHash) return { accepted: true, duplicate: true };
 
+    // Re-validate attached payment evidence even for a duplicate ACK. This lets
+    // a retry repair the evidence side of a partially persisted legacy state.
     if (ack.decision === "ACCEPT" && event.event.type === "PAYMENT_SETTLED") {
       const claim = FiberPaymentClaimSchema.safeParse(event.event.payload);
       if (!claim.success) return reply.code(400).send({ error: "INVALID_FIBER_PAYMENT_CLAIM" });
-      if (!paymentEvidence || canonical(paymentEvidence.claim) !== canonical(claim.data)) {
+      if (!paymentEvidence || canonical(paymentEvidence.evidence.claim) !== canonical(claim.data)) {
         return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_REQUIRED_OR_MISMATCH" });
+      }
+      if (paymentEvidence.observer !== ack.operator || !verifyFiberPaymentEvidence(paymentEvidence)) {
+        return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_SIGNATURE_INVALID" });
       }
       if (store.claimPayment(req.params.id, claim.data, event.event.eventHash) === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_REUSE" });
       if (store.savePaymentEvidence(req.params.id, event.event.eventHash, paymentEvidence) === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_CONFLICT" });
@@ -649,7 +956,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       anchor: z.object({
         txHash: z.string().regex(/^0x[0-9a-f]{64}$/i),
         dataHex: z.string().regex(/^0x[0-9a-f]+$/i),
-        status: z.enum(["PENDING", "COMMITTED"]).optional(),
+        status: z.enum(["PENDING", "COMMITTED", "CONFIRMED"]).optional(),
         blockHash: z.string().optional()
       })
     }).parse(req.body);
@@ -657,12 +964,22 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const expected = buildAnchorDataHex(req.params.id, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
     if (anchor.dataHex.toLowerCase() !== expected.toLowerCase()) return reply.code(409).send({ error: "ANCHOR_COMMITMENT_MISMATCH" });
     if (!options.ckbRpcUrl) return reply.code(503).send({ error: "CKB_RPC_REQUIRED_TO_VERIFY_ANCHOR" });
-    const verification = await inspectAnchorRpc(options.ckbRpcUrl, anchor.txHash, expected);
+    const verification = await inspectAnchorRpc(options.ckbRpcUrl, anchor.txHash, expected, ckbMinConfirmations);
     if (!verification.ok) {
       store.saveAnchor(req.params.id, { ...anchor, dataHex: expected, status: "PENDING" });
-      return reply.code(202).send({ accepted: false, pending: verification.status === "TX_NOT_COMMITTED", verification });
+      return reply.code(202).send({
+        accepted: false,
+        pending: verification.status === "TX_NOT_COMMITTED" || verification.status === "COMMITTED_UNCONFIRMED",
+        verification
+      });
     }
-    const committed = { ...anchor, dataHex: expected, status: "COMMITTED" as const, blockHash: verification.blockHash };
+    const committed = {
+      ...anchor,
+      dataHex: expected,
+      status: (verification.status === "CONFIRMED" ? "CONFIRMED" : "COMMITTED") as "CONFIRMED" | "COMMITTED",
+      blockHash: verification.blockHash,
+      confirmations: verification.confirmations
+    };
     if (store.saveAnchor(req.params.id, committed) === "CONFLICT") return reply.code(409).send({ error: "ANCHOR_CONFLICT", sessionStatus: "DISPUTED" });
     return { accepted: true, verification, anchor: committed };
   };
@@ -672,10 +989,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     try {
       const result = await reconcileAnchor(req.params.id);
       if (!result.committed) return reply.code(202).send(result);
-      const record = store.getSession(req.params.id)!;
-      try { await postPeer(record.signed, `/peer/sessions/${req.params.id}/anchor`, { anchor: result.anchor }); }
-      catch (error) { app.log.warn({ error }, "Anchor committed locally but peer notification retry failed"); }
-      return result;
+      const delivery = await queueAndDeliver({
+        id: `anchor:${result.anchor.txHash.toLowerCase()}`,
+        sessionId: req.params.id,
+        kind: "ANCHOR_NOTICE",
+        path: `/peer/sessions/${req.params.id}/anchor`,
+        body: { anchor: result.anchor }
+      });
+      return { ...result, peerDelivery: delivery };
     } catch (error) {
       const message = String((error as Error).message);
       return reply.code(message === "ANCHOR_NOT_FOUND" ? 404 : 409).send({ error: message });
@@ -686,8 +1007,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (!requireAdmin(req, reply)) return;
     const record = store.getSession(req.params.id);
     if (!record?.anchor) return reply.code(404).send({ error: "ANCHOR_NOT_FOUND" });
-    const peer = await postPeer(record.signed, `/peer/sessions/${req.params.id}/anchor`, { anchor: record.anchor });
-    return { delivered: true, peer };
+    const delivery = await queueAndDeliver({
+      id: `anchor:${String(record.anchor.txHash).toLowerCase()}`,
+      sessionId: req.params.id,
+      kind: "ANCHOR_NOTICE",
+      path: `/peer/sessions/${req.params.id}/anchor`,
+      body: { anchor: record.anchor }
+    });
+    return { delivered: delivery.status === "DELIVERED", delivery };
   };
 
   const newInvoice: Handler = async (req, reply) => {
@@ -698,6 +1025,10 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       amount: z.string(),
       currency: z.enum(["Fibb", "Fibt", "Fibd"]).optional(),
       description: z.string().optional(),
+      obligationId: z.string().min(1).max(128).optional(),
+      settlesEventHash: z.string().regex(/^0x[0-9a-f]{64}$/i).optional(),
+      purposeHash: z.string().regex(/^0x[0-9a-f]{64}$/i).optional(),
+      expectedPayeePublicKey: z.string().min(1).max(256).optional(),
       expirySeconds: z.number().int().positive().optional(),
       udtTypeScript: CkbScriptSchema.optional()
     }).parse(req.body);
@@ -729,7 +1060,11 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.get("/admin/sessions/:id", getSession);
   app.get("/admin/sessions/:id/transcript", getTranscript);
   app.get("/admin/sessions/:id/evidence-summary", getEvidenceSummary);
+  app.get("/admin/outbox", listOutbox);
+  app.post("/admin/outbox/drain", drainOutbox);
+  app.post("/admin/sessions/:id/reconcile", reconcileSession);
   app.post("/admin/sessions", createSession);
+  app.post("/admin/sessions/:id/join/retry", retrySessionJoin);
   app.post("/admin/sessions/:id/events", proposeEvent);
   app.post("/admin/sessions/:id/events/:eventHash/retry", retryEvent);
   app.post("/admin/sessions/:id/events/:eventHash/ack", ackEvent);
@@ -743,6 +1078,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.get("/admin/fiber/invoices/:hash", getInvoice);
 
   // ---------- canonical v0.2 peer API ----------
+  app.get("/peer/sessions/:id/head", getPeerHead);
   app.post("/peer/sessions/:id/join", joinSession);
   app.post("/peer/sessions/:id/events", receiveEvent);
   app.post("/peer/sessions/:id/acks", receiveAck);
@@ -754,6 +1090,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.get("/sessions/:id", getSession);
   app.get("/sessions/:id/transcript", getTranscript);
   app.post("/sessions", createSession);
+  app.post("/sessions/:id/join/retry", retrySessionJoin);
   app.post("/sessions/:id/join", joinSession);
   app.post("/sessions/:id/events", proposeEvent);
   app.post("/sessions/:id/events/receive", receiveEvent);

@@ -56,6 +56,9 @@ No shared database is the source of truth. No sender-side "payment success" asse
 ## What v0.2 already implements
 
 - distinct secp256k1 operator identities and atomic JSON-file stores;
+- crash-recoverable session creation (`CREATING` → retry same signed session → `ACTIVE`);
+- durable event/ACK/anchor outbox with idempotent redelivery;
+- peer state-head reconciliation with local-evidence repair and fork/ACK-divergence detection;
 - domain-separated session/event/ACK/close signatures;
 - signed hash-linked events and exact counterparty ACK/REJECT;
 - immutable/idempotent evidence plus durable conflict records;
@@ -63,8 +66,11 @@ No shared database is the source of truth. No sender-side "payment success" asse
 - globally blocked Fiber payment-hash reuse;
 - receiver-owned `get_invoice` verification for `PAYMENT_SETTLED`;
 - payment hash + session + amount + currency + optional UDT script binding;
+- optional obligation/result/purpose/payee binding for multi-job and milestone sessions;
+- receiver FNN observations signed by the receiving EventMesh operator;
 - deterministic `paymentEvidenceRoot` in the dual-signed close;
-- `EVENTMESH_V02` CKB commitment and PENDING → COMMITTED reconciliation;
+- `EVENTMESH_V02` CKB commitment with tx identity persisted before broadcast;
+- configurable PENDING → COMMITTED → CONFIRMED reconciliation depth;
 - independent CKB `get_transaction` verification;
 - standalone transcript/Fiber/CKB verifier;
 - machine-readable `/admin/sessions/:id/evidence-summary`;
@@ -84,6 +90,20 @@ npm run smoke
 Open `http://localhost:3000` for the guided reconciliation demo.
 
 Local smoke mode intentionally omits Fiber/CKB. It proves bilateral session/event/ACK/close behavior and idempotent ACK replay. The funded proof must use separate FNNs and CKB Testnet.
+
+### Production-oriented operator controls
+
+The standalone operator accepts the following hardening knobs in addition to the existing identity/Fiber/CKB variables:
+
+```text
+MAX_BODY_BYTES             maximum Fastify request body size (default 256 KiB)
+PEER_RATE_LIMIT_MAX        peer requests allowed per source/window
+PEER_RATE_LIMIT_WINDOW_MS  peer rate-limit window
+PEER_REQUEST_TIMEOUT_MS    outbound peer timeout
+CKB_MIN_CONFIRMATIONS      confirmations required before CONFIRMED
+```
+
+Durable peer delivery is visible through `GET /admin/outbox`, can be retried with `POST /admin/outbox/drain`, and bilateral state can be compared/repaired with `POST /admin/sessions/:id/reconcile` using `{ "repair": true }`. Session creation is persisted before contacting the peer; a lost join response can be retried with `POST /admin/sessions/:id/join/retry` without minting a new session ID.
 
 ## Guided paid-service demo
 
@@ -135,6 +155,7 @@ npm run verify -- transcript.json \
   --adapter paid-service-reference \
   --receiver-fiber-rpc http://RECEIVER_FNN:8237 \
   --ckb-rpc https://YOUR_CKB_TESTNET_RPC \
+  --ckb-confirmations 2 \
   --require-close \
   --require-fiber \
   --require-ckb
@@ -188,6 +209,20 @@ interface EventMeshAdapter<TState> {
 
 The paid-service reference adapter validates one full ordered workflow and deterministic final state. A funded external integration should use a similarly small 3–5-event adapter in a repository maintained independently from EventMesh.
 
+## Recovery / operations API
+
+The standalone operator now exposes explicit recovery surfaces instead of requiring an administrator to guess whether retry is safe:
+
+```text
+GET  /admin/outbox
+POST /admin/outbox/drain
+POST /admin/sessions/:id/reconcile        { "repair": true }
+POST /admin/sessions/:id/join/retry
+GET  /peer/sessions/:id/head
+```
+
+`reconcile` distinguishes `IN_SYNC`, `LOCAL_AHEAD`, `REMOTE_AHEAD`, `FORK`, `ACK_DIVERGENCE`, `CLOSE_DIVERGENCE`, and `ANCHOR_DIVERGENCE`. Repair mode only replays already-signed immutable evidence; it does not manufacture replacement events or ACKs.
+
 ## Security / status
 
 **Reference implementation / Testnet validation project. Not audited. Do not use production keys or mainnet funds.**
@@ -229,5 +264,5 @@ The v0.6 API also validates the service-flow state machine server-side, restrict
 
 See `VERCEL_DEPLOYMENT.md`, `SECURITY_V06.md`, and `V06_FEATURES.md` for the deployment model, security boundary, and remaining serverless limitation.
 
-**Important:** Real / Testnet mode is still a controlled Testnet surface, not a production custody architecture. For production-grade independence, run the two operators as separate services with durable operator-owned storage or another coordination layer.
+**Important:** Real / Testnet mode is still a controlled Testnet surface, not a production custody architecture: one Vercel process can hold both demo operator keys. For real users, the canonical topology is two independently deployed standalone operators, one operator key/FNN/state store per administrative domain. The Vercel workspace should remain onboarding/reviewer UX, not the production trust boundary.
 

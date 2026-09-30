@@ -23,6 +23,24 @@ describe("CKB anchor verification", () => {
     expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex)).toMatchObject({ ok: true, status: "COMMITTED", dataMatches: true });
   });
 
+
+  it("requires the configured CKB confirmation depth", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body ?? "{}"));
+      if (request.method === "get_tip_header") return response({ number: "0x65" });
+      return response({
+        tx_status: { status: "committed", block_hash: "0x01", block_number: "0x64" },
+        transaction: { outputs_data: [dataHex] }
+      });
+    }));
+    expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex, 2)).toMatchObject({
+      ok: true, status: "CONFIRMED", confirmations: 2
+    });
+    expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex, 3)).toMatchObject({
+      ok: false, status: "COMMITTED_UNCONFIRMED", confirmations: 2
+    });
+  });
+
   it("does not accept a pending transaction", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => response({ tx_status: { status: "pending" }, transaction: { outputs_data: [dataHex] } })));
     expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex)).toMatchObject({ ok: false, status: "TX_NOT_COMMITTED" });

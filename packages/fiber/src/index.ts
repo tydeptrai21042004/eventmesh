@@ -3,6 +3,7 @@ import {
   FiberPaymentClaimSchema,
   FiberPaymentEvidenceSchema,
   canonical,
+  computeFiberPaymentPurposeHash,
   type CkbScript,
   type FiberPaymentClaim,
   type FiberPaymentEvidence
@@ -84,12 +85,30 @@ export class FiberRpcClient {
     currency?: "Fibb" | "Fibt" | "Fibd";
     description?: string;
     sessionId?: string;
+    obligationId?: string;
+    settlesEventHash?: string;
+    purposeHash?: string;
+    expectedPayeePublicKey?: string;
     expirySeconds?: number;
     udtTypeScript?: CkbScript;
   }) {
+    const effectivePurposeHash = input.purposeHash ?? (input.sessionId && (input.obligationId || input.settlesEventHash)
+      ? computeFiberPaymentPurposeHash({
+          sessionId: input.sessionId,
+          amount: input.amount,
+          currency: input.currency ?? "Fibt",
+          udtTypeScript: input.udtTypeScript,
+          obligationId: input.obligationId,
+          settlesEventHash: input.settlesEventHash,
+          expectedPayeePublicKey: input.expectedPayeePublicKey
+        })
+      : undefined);
     const description = [
       input.description ?? "EventMesh payment",
-      input.sessionId ? `eventmesh:${input.sessionId}` : undefined
+      input.sessionId ? `eventmesh:${input.sessionId}` : undefined,
+      input.obligationId ? `eventmesh-obligation:${input.obligationId}` : undefined,
+      input.settlesEventHash ? `eventmesh-settles:${input.settlesEventHash.toLowerCase()}` : undefined,
+      effectivePurposeHash ? `eventmesh-purpose:${effectivePurposeHash.toLowerCase()}` : undefined
     ].filter(Boolean).join(" | ");
     const result = await this.call<any>("new_invoice", [{
       amount: quantity(input.amount),
@@ -105,7 +124,11 @@ export class FiberRpcClient {
         sessionId: input.sessionId,
         amount: result.invoice.amount,
         currency: result.invoice.currency,
-        ...(input.udtTypeScript ? { udtTypeScript: input.udtTypeScript } : {})
+        ...(input.udtTypeScript ? { udtTypeScript: input.udtTypeScript } : {}),
+        ...(input.obligationId ? { obligationId: input.obligationId } : {}),
+        ...(input.settlesEventHash ? { settlesEventHash: input.settlesEventHash } : {}),
+        ...(effectivePurposeHash ? { purposeHash: effectivePurposeHash } : {}),
+        ...(input.expectedPayeePublicKey ? { expectedPayeePublicKey: input.expectedPayeePublicKey } : {})
       });
     }
     return result;
@@ -156,9 +179,31 @@ export class FiberRpcClient {
       return { ok: false, reason: "FIBER_AMOUNT_OR_CURRENCY_MISMATCH", invoice: result };
     }
 
+    if (parsedClaim.purposeHash) {
+      const derivedPurposeHash = computeFiberPaymentPurposeHash(parsedClaim);
+      if (derivedPurposeHash.toLowerCase() !== parsedClaim.purposeHash.toLowerCase()) {
+        return { ok: false, reason: "FIBER_PURPOSE_HASH_INVALID", invoice: result };
+      }
+    }
+
+    const descriptions = invoiceDescriptions(invoice).flatMap((description) => description.split(/\s*\|\s*/));
     const marker = `eventmesh:${parsedClaim.sessionId}`;
-    if (!invoiceDescriptions(invoice).some((description) => description.split(/\s*\|\s*/).includes(marker))) {
+    if (!descriptions.includes(marker)) {
       return { ok: false, reason: "FIBER_SESSION_BINDING_MISMATCH", invoice: result };
+    }
+    if (parsedClaim.obligationId && !descriptions.includes(`eventmesh-obligation:${parsedClaim.obligationId}`)) {
+      return { ok: false, reason: "FIBER_OBLIGATION_BINDING_MISMATCH", invoice: result };
+    }
+    if (parsedClaim.settlesEventHash && !descriptions.some((value) => value.toLowerCase() === `eventmesh-settles:${parsedClaim.settlesEventHash.toLowerCase()}`)) {
+      return { ok: false, reason: "FIBER_SETTLED_EVENT_BINDING_MISMATCH", invoice: result };
+    }
+    if (parsedClaim.purposeHash && !descriptions.some((value) => value.toLowerCase() === `eventmesh-purpose:${parsedClaim.purposeHash.toLowerCase()}`)) {
+      return { ok: false, reason: "FIBER_PURPOSE_BINDING_MISMATCH", invoice: result };
+    }
+
+    const observedPayee = payeePublicKey(invoice);
+    if (parsedClaim.expectedPayeePublicKey && (!observedPayee || observedPayee.toLowerCase() !== parsedClaim.expectedPayeePublicKey.toLowerCase())) {
+      return { ok: false, reason: "FIBER_PAYEE_MISMATCH", invoice: result };
     }
 
     const observedUdtTypeScript = invoiceUdtScript(invoice);
@@ -176,7 +221,7 @@ export class FiberRpcClient {
       verifier: "RECEIVER_FNN",
       verifiedAt: new Date().toISOString(),
       invoiceStatus: "Paid",
-      ...(payeePublicKey(invoice) ? { payeePublicKey: payeePublicKey(invoice) } : {}),
+      ...(observedPayee ? { payeePublicKey: observedPayee } : {}),
       ...(observedUdtTypeScript ? { observedUdtTypeScript } : {})
     });
     return { ok: true, invoice: result, evidence };

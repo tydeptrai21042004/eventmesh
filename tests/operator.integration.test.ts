@@ -94,6 +94,29 @@ describe("two-operator HTTP + separate JSON-file stores", () => {
     expect(b.store.getSession(id)?.status).toBe("CLOSED");
   });
 
+
+  it("reports IN_SYNC after durable event/ACK delivery and exposes no pending outbox", async () => {
+    const { a, b } = await pair();
+    const signed = await createSession(a);
+    const id = signed.session.sessionId;
+    const eventResponse = await a.app.inject({
+      method: "POST", url: `/admin/sessions/${id}/events`, payload: { type: "SYNC_TEST", payload: { n: 1 } }
+    });
+    expect(eventResponse.statusCode).toBe(201);
+    const event = eventResponse.json();
+    expect((await b.app.inject({
+      method: "POST", url: `/admin/sessions/${id}/events/${event.eventHash}/ack`, payload: { decision: "ACCEPT" }
+    })).statusCode).toBe(200);
+
+    const reconcile = await a.app.inject({
+      method: "POST", url: `/admin/sessions/${id}/reconcile`, payload: { repair: true }
+    });
+    expect(reconcile.statusCode).toBe(200);
+    expect(reconcile.json()).toMatchObject({ state: "IN_SYNC", pendingOutbox: 0, safeAction: "NONE" });
+    expect(a.store.listOutbox("PENDING", id)).toHaveLength(0);
+    expect(b.store.listOutbox("PENDING", id)).toHaveLength(0);
+  });
+
   it("rejects cross-session eventHash use in an ACK route", async () => {
     const { a, b } = await pair();
     const s1 = await createSession(a);
