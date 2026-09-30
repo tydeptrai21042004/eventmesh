@@ -1,92 +1,93 @@
-# EventMesh on Vercel — one project, durable state
+# EventMesh v0.4.2 — zero-database Vercel preview
 
-EventMesh still deploys as one Vercel project: the Vite demo frontend and `/api/*` functions are built together. The production-oriented path now uses Postgres/Neon through `DATABASE_URL`; no separate migration command or database service process is required.
+The reviewer demo remains a **single Vercel project**: Vite UI + same-origin serverless API + signed EventMesh evidence. No Postgres, Neon, Vercel Blob, Redis, or other external state service is required.
 
-## 1. Required production variables
+## Storage model
 
-```bash
-DATABASE_URL=postgresql://...
-DEMO_MASTER_SECRET=<at least 32 characters; preferably 32 random bytes as hex>
-```
+The preview keeps the existing JSON-file model:
 
-The easiest Vercel setup is to connect a Neon/Postgres integration so `DATABASE_URL` is injected into the project. You can also add a connection string manually.
+- local development: `.data/eventmesh-demo-state.json`;
+- Vercel Functions: `/tmp/eventmesh-demo-state.json`.
 
-On first access EventMesh automatically creates only its namespaced tables:
+Vercel `/tmp` is **ephemeral and instance-local**. A cold start can reset the file, and two function instances can observe different files. The UI and exported evidence now state this directly. This deployment mode is intended for a reviewer/demo experience, not production durability.
 
-- `eventmesh_schema_migrations`
-- `eventmesh_demo_state`
+## Fastest deployment
 
-The state table stores the compact demo ledger as JSONB with a monotonically increasing revision. Mutations use optimistic compare-and-swap updates so concurrent serverless invocations cannot silently overwrite a newer revision.
+Import the repository into Vercel and deploy it. **No environment variable is required for the core signed reference flow.**
 
-To inspect initialization:
+The zero-config preview uses deterministic, public **demo-only** signing identities. They are intentionally not secret and must never control funds or production authority.
 
-```sql
-SELECT version, name, applied_at
-FROM eventmesh_schema_migrations
-ORDER BY version;
-```
-
-No manual SQL bootstrap is required.
-
-## 2. Optional Testnet/Fiber variables
+You can also deploy from the repository:
 
 ```bash
-CKB_RPC_URL=https://testnet.ckbapp.dev/
-CKB_PRIVATE_KEY=
-DEMO_ALLOW_CKB_BROADCAST=false
-CKB_ANCHOR_CAPACITY_CKB=220
-
-FIBER_RECEIVER_RPC_URL=
-FIBER_RECEIVER_RPC_TOKEN=
-```
-
-`PAYMENT_SETTLED` remains fail-closed unless the receiver-side Fiber RPC is configured and verifies the payment claim. CKB broadcasting remains disabled unless `DEMO_ALLOW_CKB_BROADCAST=true` and a Testnet key is present.
-
-## 3. Local setup
-
-```bash
-./scripts/generate-env.sh
-npm install
-npm run check
-```
-
-Local development can still run without `DATABASE_URL`; it uses `.data/eventmesh-demo-state.json` in a single process. This keeps local setup simple while avoiding a false durability claim on Vercel.
-
-## 4. One-command Vercel deployment
-
-```bash
+chmod +x scripts/deploy-vercel-testnet.sh
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-The script runs the full checks, links the Vercel project, pushes any variables present in `.env.local`, deploys, then calls the live deep-health endpoint and performs a signed create → append → close smoke flow.
+The script can run without `.env.local`. If you want deployment-specific signer identities or optional integrations, run:
 
-If a Neon integration already supplies `DATABASE_URL`, you may leave it empty in `.env.local`; the integration-provided variable remains available to the deployed project.
+```bash
+./scripts/generate-env.sh
+./scripts/deploy-vercel-testnet.sh
+```
 
-## 5. Health checks
+## Optional environment
 
-- `GET /api/health` — inexpensive readiness status.
-- `GET /api/health?deep=1` — initializes/checks Postgres, probes CKB RPC, and optionally probes Fiber.
-- `GET /api/demo` — protocol/capability metadata including storage mode and durability.
+```dotenv
+# Optional but recommended for a public reviewer deployment.
+DEMO_MASTER_SECRET="<random 64 hex characters>"
 
-For a normal production Vercel deployment, deep health should report:
+DEMO_RATE_LIMIT_PER_MINUTE=60
+DEMO_STATE_MAX_BYTES=4194304
+CKB_RPC_URL="https://testnet.ckbapp.dev/"
+DEMO_ALLOW_CKB_BROADCAST=false
+```
+
+Optional real integration variables:
+
+```dotenv
+OPERATOR_A_PRIVATE_KEY="0x..."
+OPERATOR_B_PRIVATE_KEY="0x..."
+CKB_PRIVATE_KEY="0x..."
+CKB_ANCHOR_CAPACITY_CKB=220
+FIBER_RECEIVER_RPC_URL="https://your-receiver-fnn.example/rpc"
+FIBER_RECEIVER_RPC_TOKEN="..."
+```
+
+## What works with zero configuration
+
+- create a dual-signed session;
+- append hash-linked bilateral events;
+- generate explicit signed acknowledgements;
+- run the complete reference service flow in one click;
+- dual-sign the final state;
+- verify the session/event/ACK/close signatures and transcript roots;
+- export the complete evidence JSON;
+- resume the last session from the same browser while the Vercel instance still has it.
+
+Fiber payment verification remains fail-closed until a receiver Fiber RPC is configured. CKB broadcasting remains off unless both `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true` are explicitly configured.
+
+## Diagnostics
+
+- `/api/health` — lightweight preview readiness;
+- `/api/health?deep=1` — JSON-file writability, CKB RPC reachability and optional Fiber RPC check;
+- `/api/demo` — signer mode, storage mode, capabilities and operator identities;
+- `node scripts/verify-deployment.mjs https://your-deployment.vercel.app` — runs the full reference flow and verifies its signed evidence.
+
+Expected storage status on Vercel:
 
 ```json
 {
-  "storage": {
-    "mode": "postgres-jsonb",
-    "durable": true,
-    "writable": true,
-    "schemaVersion": 1
-  }
+  "mode": "ephemeral-json",
+  "durable": false,
+  "writable": true
 }
 ```
 
-## 6. Explicit throwaway preview mode
+That is intentional for this preview build.
 
-Vercel `/tmp` is ephemeral and instance-local. EventMesh therefore refuses it by default. For a disposable preview only, you can explicitly set:
+## Security boundary
 
-```bash
-ALLOW_EPHEMERAL_VERCEL_STATE=true
-```
+The built-in zero-config identities are public demo identities. Supplying `DEMO_MASTER_SECRET` derives deployment-specific demo identities instead. Explicit operator private keys remain server-side when supplied.
 
-Do not use that mode as evidence of durable reconciliation.
+CKB funds are a separate boundary: the preview does not derive or expose `CKB_PRIVATE_KEY`, and broadcasting is disabled by default. Do not fund the public demo identities and do not describe `/tmp` state as durable storage.

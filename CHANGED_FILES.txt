@@ -1,26 +1,30 @@
-EventMesh production-readiness patch — changed files only
+EventMesh v0.4.2 — file-backed preview patch
 
-Apply these files over eventmesh-main(10).
+Overlay these files at the repository root.
 
-Main changes:
-- durable Neon/Postgres JSONB state on Vercel via DATABASE_URL
-- automatic EventMesh schema initialization
-- optimistic revision/CAS protection for concurrent serverless writes
-- Vercel fails closed when durable storage is missing (unless explicit preview opt-in)
-- durable idempotency/rate-limit state when Postgres is enabled
-- safer CKB anchor lifecycle: PREPARING -> BROADCASTING -> PENDING/COMMITTED, with tx identity persisted before submission
-- improved ambiguous-broadcast reconciliation behavior
-- storage/readiness diagnostics in /api/health and /api/demo
-- one-project Vercel deploy flow preserved
-- frontend shows durable-state status and fixes anchorOperation.txHash field
-- deployment/docs/tests updated
+Changed / added:
+.env.example
+PREVIEW_V0.4.2_CHANGES.md
+README.md
+VERCEL_DEPLOYMENT.md
+api/demo.ts
+api/health.ts
+apps/demo/package.json
+apps/demo/src/main.tsx
+apps/demo/src/style.css
+package.json
+scripts/deploy-vercel-testnet.sh
+scripts/verify-deployment.mjs
 
-Required production Vercel variables:
-- DATABASE_URL (Neon/Postgres; can be injected by Vercel integration)
-- DEMO_MASTER_SECRET (>=32 chars)
+Key behavior:
+- no Neon/Postgres/database dependency;
+- Vercel keeps /tmp/eventmesh-demo-state.json;
+- zero-config preview no longer shows Service unavailable just because DEMO_MASTER_SECRET is absent;
+- public demo-only deterministic signing identities when no secret is configured;
+- one-click reference flow;
+- server-side evidence verification;
+- browser session resume while /tmp state still exists;
+- richer evidence UI/export;
+- CKB/Fiber remain optional and fail closed when their real integration is unavailable.
 
-Optional throwaway preview only:
-- ALLOW_EPHEMERAL_VERCEL_STATE=true
-
-Validation note:
-The source/tree checks and shell/JSON syntax checks were performed. Full npm validation could not complete in the sandbox because dependency installation exceeded the execution window; run `npm install && npm run check` after applying the patch.
+Important: Vercel /tmp remains ephemeral and instance-local. This patch deliberately does not claim durable production persistence.

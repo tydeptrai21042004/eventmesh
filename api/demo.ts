@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac } from "node:crypto";
 import {
   PROTOCOL,
   SIGNING_DOMAIN,
@@ -16,27 +16,46 @@ import {
   signAck,
   signEvent,
   signProtocolObject,
+  verifyTranscript,
   type FiberPaymentClaim,
   type FiberPaymentEvidence,
   type SignedAck,
   type SignedEvent,
-  type SignedSession
+  type SignedSession,
+  type TranscriptExport
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
-import { DEMO_STORAGE_DURABLE, DEMO_STORAGE_MODE, mutateDemoStore, readDemoStore } from "./demo-store.js";
+import {
+  DEMO_STORAGE_DURABLE,
+  DEMO_STORAGE_MODE,
+  DEMO_STATE_PATH,
+  mutateDemoStore,
+  readDemoStore
+} from "./demo-store.js";
 
 const CKB_TESTNET_RPC_URL = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
-const processFallbackSecret = randomBytes(32).toString("hex");
+
+// This value is intentionally public. It exists only so the zero-config preview
+// has stable demo identities across serverless instances. Never fund or reuse
+// these identities. Supplying DEMO_MASTER_SECRET replaces this preview secret.
+const PUBLIC_PREVIEW_SIGNING_SECRET = "eventmesh-public-preview-signing-secret-v1-never-use-for-funds";
 
 function configuredMasterSecret() {
   const value = process.env.DEMO_MASTER_SECRET?.trim();
   return value && value.length >= 32 ? value : undefined;
 }
 
+function signingSecret() {
+  return configuredMasterSecret() || PUBLIC_PREVIEW_SIGNING_SECRET;
+}
+
+function signerMode() {
+  return configuredMasterSecret() ? "configured-secret" : "public-preview";
+}
+
 function derivedKey(label: string) {
-  const secret = configuredMasterSecret() || processFallbackSecret;
-  const raw = createHmac("sha256", secret).update(label).digest("hex");
+  const raw = createHmac("sha256", signingSecret()).update(label).digest("hex");
   const scalar = (BigInt(`0x${raw}`) % (SECP256K1_N - 1n)) + 1n;
   return `0x${scalar.toString(16).padStart(64, "0")}`;
 }
@@ -109,7 +128,7 @@ function enforceSameOrigin(req: any) {
 
 function actorHash(req: any) {
   const ip = String(req.headers?.["x-forwarded-for"] || req.socket?.remoteAddress || "unknown").split(",")[0].trim();
-  return sha256Hex(`${configuredMasterSecret() || processFallbackSecret}:${ip}`);
+  return sha256Hex(`${signingSecret()}:${ip}`);
 }
 
 async function rateLimit(req: any, limit = Number(process.env.DEMO_RATE_LIMIT_PER_MINUTE || 60)) {
@@ -309,6 +328,71 @@ async function closeSession(input: any) {
   });
 }
 
+async function runReferenceFlow(req: any, input: any) {
+  const flowKey = String(input.idempotencyKey || "");
+  if (!flowKey) throw new Error("IDEMPOTENCY_KEY_REQUIRED");
+  const created = await createSession(req, {
+    idempotencyKey: `${flowKey}:session`,
+    ttlSeconds: input.ttlSeconds ?? 3600,
+    maxEvents: 20
+  });
+  const sessionId = created.sessionId;
+  const requestId = String(input.requestId || `req-${sessionId.slice(-8)}`).slice(0, 120);
+  const service = String(input.service || "dataset-transform").slice(0, 120);
+  const resultHash = /^0x[0-9a-fA-F]{64}$/.test(String(input.resultHash || ""))
+    ? String(input.resultHash)
+    : sha256Hex(canonical({ sessionId, requestId, service, preview: true }));
+
+  await appendEvent({
+    sessionId, sender: "A", type: "SERVICE_REQUESTED",
+    payload: { requestId, service }, idempotencyKey: `${flowKey}:request`
+  });
+  await appendEvent({
+    sessionId, sender: "B", type: "SERVICE_ACCEPTED",
+    payload: { requestId }, idempotencyKey: `${flowKey}:accept`
+  });
+  await appendEvent({
+    sessionId, sender: "B", type: "RESULT_COMMITTED",
+    payload: { requestId, resultHash }, idempotencyKey: `${flowKey}:result`
+  });
+  await appendEvent({
+    sessionId, sender: "B", type: "SESSION_COMPLETED",
+    payload: { requestId }, idempotencyKey: `${flowKey}:complete`
+  });
+  await closeSession({
+    sessionId,
+    idempotencyKey: `${flowKey}:close`,
+    finalState: { kind: "paid-service-preview", requestId, service, resultHash, completed: true }
+  });
+
+  return { ok: true, sessionId, referenceFlow: true };
+}
+
+async function verifySessionEvidence(sessionId: string) {
+  const state = await loadState(sessionId);
+  const transcript: TranscriptExport = {
+    session: state.signedSession,
+    events: state.events.map((row: any) => ({ event: row.event, ack: row.ack })),
+    close: state.close || undefined,
+    paymentEvidence: state.paymentEvidence || undefined,
+    ckbAnchor: state.anchor || undefined
+  };
+  const verification = verifyTranscript(transcript);
+  return {
+    ok: verification.ok,
+    verification,
+    summary: {
+      sessionId,
+      eventCount: transcript.events.length,
+      closed: !!transcript.close,
+      anchored: !!transcript.ckbAnchor,
+      transcriptRoot: transcript.close?.close.transcriptRoot || null,
+      finalStateHash: transcript.close?.close.finalStateHash || null,
+      paymentEvidenceRoot: transcript.close?.close.paymentEvidenceRoot || null
+    }
+  };
+}
+
 function ckbBroadcastEnabled() {
   return process.env.DEMO_ALLOW_CKB_BROADCAST === "true" && !!process.env.CKB_PRIVATE_KEY;
 }
@@ -317,103 +401,51 @@ async function anchorSession(input: any) {
   const sessionId = String(input.sessionId || "");
   if (!ckbBroadcastEnabled()) throw new Error("CKB_BROADCAST_DISABLED");
 
-  const reserved = await mutateDemoStore((store) => {
+  const prepared = await mutateDemoStore((store) => {
     const session = store.sessions[sessionId];
     if (!session) throw new Error("SESSION_NOT_FOUND");
     if (!session.signedClose) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
     if (session.anchor) return { duplicateAnchor: session.anchor };
-
     const close = session.signedClose.close;
     const dataHex = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
     const commitmentHash = sha256Hex(dataHex);
     const existing = store.anchorOps[sessionId];
-
-    if (existing?.txHash && ["PENDING", "COMMITTED"].includes(existing.status)) {
-      return { duplicateOperation: existing };
-    }
-    if (existing?.txHash && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
+    if (existing?.txHash) return { duplicateOperation: existing };
+    if (existing && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
       throw new Error("ANCHOR_BROADCAST_STATE_UNCERTAIN_RECONCILE_OR_REVIEW_BEFORE_RETRY");
     }
-    if (existing?.status === "PREPARING") {
-      const stale = Date.now() - Date.parse(existing.updatedAt || 0) > 2 * 60 * 1000;
-      if (!stale) throw new Error("ANCHOR_PREPARATION_IN_PROGRESS");
-    }
-
     store.anchorOps[sessionId] = {
-      sessionId,
-      commitmentHash,
-      status: "PREPARING",
-      dataHex,
+      sessionId, commitmentHash, status: "BROADCASTING", dataHex,
       updatedAt: new Date().toISOString()
     };
-    return { close, dataHex, commitmentHash };
+    return { close, dataHex };
   });
 
-  if ((reserved as any).duplicateAnchor) return { ok: true, anchor: (reserved as any).duplicateAnchor, duplicate: true };
-  if ((reserved as any).duplicateOperation) return { ok: true, anchorOperation: (reserved as any).duplicateOperation, duplicate: true };
+  if ((prepared as any).duplicateAnchor) return { ok: true, anchor: (prepared as any).duplicateAnchor, duplicate: true };
+  if ((prepared as any).duplicateOperation) return { ok: true, anchorOperation: (prepared as any).duplicateOperation, duplicate: true };
 
-  let expectedTxHash: string | undefined;
+  let broadcasted: { txHash: string; dataHex: string; status: "PENDING" } | undefined;
   try {
     const { CkbAnchorClient } = await import("@eventmesh/ckb");
-    const close = (reserved as any).close;
-    const client = new CkbAnchorClient(
-      process.env.CKB_PRIVATE_KEY!,
-      CKB_TESTNET_RPC_URL,
-      Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220)
-    );
-    const prepared = await client.prepareAnchor({
-      sessionId,
-      transcriptRoot: close.transcriptRoot,
-      finalStateHash: close.finalStateHash,
-      paymentEvidenceRoot: close.paymentEvidenceRoot
-    });
-    if (prepared.dataHex.toLowerCase() !== String((reserved as any).dataHex).toLowerCase()) {
-      throw new Error("ANCHOR_PREPARED_COMMITMENT_MISMATCH");
-    }
-    expectedTxHash = prepared.txHash;
-
-    // Persist deterministic transaction identity before the irreversible network submission.
+    const close = (prepared as any).close;
+    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY!, CKB_TESTNET_RPC_URL, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
+    broadcasted = await client.anchor({ sessionId, transcriptRoot: close.transcriptRoot, finalStateHash: close.finalStateHash, paymentEvidenceRoot: close.paymentEvidenceRoot });
     await mutateDemoStore((store) => {
       const op = store.anchorOps[sessionId];
-      if (!op || op.commitmentHash !== (reserved as any).commitmentHash) throw new Error("ANCHOR_OPERATION_CONFLICT");
-      Object.assign(op, {
-        status: "BROADCASTING",
-        txHash: expectedTxHash,
-        updatedAt: new Date().toISOString()
-      });
-    });
-
-    const broadcasted = await client.broadcastPrepared(prepared);
-    await mutateDemoStore((store) => {
-      const op = store.anchorOps[sessionId];
-      if (!op || op.txHash?.toLowerCase() !== broadcasted.txHash.toLowerCase()) throw new Error("ANCHOR_OPERATION_CONFLICT");
-      Object.assign(op, {
-        status: "PENDING",
-        txHash: broadcasted.txHash,
-        dataHex: broadcasted.dataHex,
-        updatedAt: new Date().toISOString()
-      });
+      if (!op) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
+      Object.assign(op, { status: "PENDING", txHash: broadcasted!.txHash, dataHex: broadcasted!.dataHex, updatedAt: new Date().toISOString() });
       store.sessions[sessionId].anchor = broadcasted;
     });
     return { ok: true, anchor: broadcasted };
   } catch (error) {
-    const persisted = await mutateDemoStore((store) => {
+    const txHash = broadcasted?.txHash;
+    await mutateDemoStore((store) => {
       const op = store.anchorOps[sessionId];
-      if (!op) return undefined;
-      const hasTxIdentity = !!op.txHash || !!expectedTxHash;
-      Object.assign(op, {
-        status: hasTxIdentity ? "BROADCAST_UNKNOWN" : "PREPARE_FAILED",
-        txHash: op.txHash || expectedTxHash,
-        error: safeErrorMessage(error),
-        updatedAt: new Date().toISOString()
-      });
-      return { status: op.status, txHash: op.txHash };
+      if (op) Object.assign(op, { status: "BROADCAST_UNKNOWN", txHash: op.txHash || txHash, error: safeErrorMessage(error), updatedAt: new Date().toISOString() });
     });
-
-    if (persisted?.txHash) {
-      throw new Error(`ANCHOR_BROADCAST_UNKNOWN: deterministic tx hash ${persisted.txHash} was persisted; reconcile before any retry`);
-    }
-    throw error;
+    throw new Error(txHash
+      ? "ANCHOR_BROADCAST_UNKNOWN: tx hash was recovered; run reconcile before any retry"
+      : "ANCHOR_BROADCAST_UNKNOWN: transaction may have been submitted; automatic retry blocked");
   }
 }
 
@@ -432,15 +464,6 @@ async function reconcileAnchor(input: any) {
     });
     return { ok: true, anchor, verification: inspected };
   }
-  if (inspected.status === "TX_NOT_FOUND" && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(op.status)) {
-    return {
-      ok: false,
-      status: op.status,
-      requiresManualReview: true,
-      reason: "PERSISTED_TX_HASH_NOT_FOUND_ON_RPC",
-      verification: inspected
-    };
-  }
   return { ok: false, status: "PENDING", verification: inspected };
 }
 
@@ -448,8 +471,7 @@ function safeErrorMessage(error: unknown) {
   const raw = String((error as any)?.message || error || "UNKNOWN_ERROR");
   return raw
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[redacted]@")
-    .replace(/([?&](?:token|key|secret|password)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 500);
 }
 
@@ -461,14 +483,24 @@ export default async function handler(req: any, res: ServerResponse) {
       if (sessionId) return json(res, 200, await loadState(sessionId));
 
       return json(res, 200, {
-        ok: !!configuredMasterSecret() && configurationErrors.length === 0 && (DEMO_STORAGE_DURABLE || !process.env.VERCEL || process.env.ALLOW_EPHEMERAL_VERCEL_STATE === "true"),
+        ok: configurationErrors.length === 0,
         protocol: PROTOCOL,
         version: "0.4.2",
         network: "CKB Testnet",
-        storage: { mode: DEMO_STORAGE_MODE, durable: DEMO_STORAGE_DURABLE },
         operatorA: pubA,
         operatorB: pubB,
+        signerMode: signerMode(),
+        storage: {
+          mode: DEMO_STORAGE_MODE,
+          durable: DEMO_STORAGE_DURABLE,
+          path: process.env.VERCEL ? "/tmp/eventmesh-demo-state.json" : DEMO_STATE_PATH,
+          warning: process.env.VERCEL
+            ? "Preview state is stored in Vercel /tmp and may reset on a cold start or another function instance."
+            : "Preview state is stored in a local JSON file and is not multi-process durable."
+        },
         capabilities: {
+          referenceFlow: true,
+          evidenceVerification: true,
           fiberPayments: !!process.env.FIBER_RECEIVER_RPC_URL,
           ckbAnchoring: ckbBroadcastEnabled(),
           ckbReconciliation: true
@@ -477,7 +509,6 @@ export default async function handler(req: any, res: ServerResponse) {
     }
 
     if (req.method !== "POST") return json(res, 405, { error: "METHOD_NOT_ALLOWED" });
-    if (!configuredMasterSecret()) throw new Error(process.env.DEMO_MASTER_SECRET ? "DEMO_MASTER_SECRET_TOO_SHORT" : "DEMO_MASTER_SECRET_REQUIRED");
     if (configurationErrors.length) throw new Error(configurationErrors.join(","));
     enforceSameOrigin(req);
     await rateLimit(req);
@@ -485,8 +516,10 @@ export default async function handler(req: any, res: ServerResponse) {
     let result: any;
     switch (String(input.action || "")) {
       case "create_session": result = await createSession(req, input); break;
+      case "run_reference_flow": result = await runReferenceFlow(req, input); break;
       case "append_event": result = await appendEvent(input); break;
       case "close_session": result = await closeSession(input); break;
+      case "verify_evidence": result = await verifySessionEvidence(String(input.sessionId || "")); break;
       case "anchor": result = await anchorSession(input); break;
       case "reconcile_anchor": result = await reconcileAnchor(input); break;
       default: throw new Error("UNKNOWN_ACTION");
@@ -497,7 +530,7 @@ export default async function handler(req: any, res: ServerResponse) {
     const message = safeErrorMessage(error);
     const status = message === "RATE_LIMITED" ? 429
       : message.includes("NOT_FOUND") ? 404
-      : message.includes("REQUIRED") || message.includes("DISABLED") ? 503
+      : message.includes("DISABLED") ? 503
       : message.includes("TOO_LARGE") ? 413
       : 400;
     return json(res, status, { error: message });

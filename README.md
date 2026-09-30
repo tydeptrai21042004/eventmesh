@@ -206,11 +206,11 @@ independent application
 + documented adopter feedback
 ```
 
-## One-project Vercel demo (v0.4.2 durable path)
+## One-project Vercel demo (v0.4.2 JSON preview)
 
-The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project. On Vercel, durable state is backed by Postgres/Neon through `DATABASE_URL`; the EventMesh schema is initialized automatically. Local development can still use `.data/eventmesh-demo-state.json`. Browser code never receives operator private keys or an admin token.
+The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project. It requires no database: demo state is JSON-backed (`/tmp` on Vercel, `.data/` locally). Browser code never receives operator private keys or an admin token.
 
-The v0.4.2 deployment path keeps runtime packages compiled before function packaging, reports durable-storage readiness through `/api/demo` and `/api/health`, and handles non-JSON platform errors without crashing on `JSON.parse`. Vercel `/tmp` is rejected by default and is available only through the explicit `ALLOW_EPHEMERAL_VERCEL_STATE=true` throwaway-preview opt-in.
+The v0.4.2 preview keeps the runtime packages compiled before function packaging, reports JSON-storage readiness through `/api/demo` and `/api/health`, and handles non-JSON platform errors without crashing on `JSON.parse`. Vercel `/tmp` is explicitly treated as ephemeral demo storage, not durable persistence. The core reference flow now works with zero environment variables using public demo-only signing identities, and the UI can run, verify, resume, inspect, and export a complete signed reference transcript.
 
 ### Generate configuration and deploy
 
@@ -220,7 +220,7 @@ chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-The script pushes the runtime variables to Vercel, deploys, probes `/api/health?deep=1`, and performs a signed create → event → close smoke test against the deployed URL. CKB uses Testnet by default for RPC reads; broadcasting requires both a funded Testnet-only `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true`.
+The deploy script can run without `.env.local`; optional variables are pushed only when present. It deploys, probes `/api/health?deep=1`, runs the complete reference flow, and verifies the resulting signed evidence against the deployed API. CKB uses Testnet by default for RPC reads; broadcasting requires both a funded Testnet-only `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true`.
 
 A native Fiber FNN should remain on a persistent host; set `FIBER_RECEIVER_RPC_URL` to that receiver-owned node. EventMesh intentionally refuses `PAYMENT_SETTLED` when the receiver RPC cannot prove the matching paid invoice.
 
