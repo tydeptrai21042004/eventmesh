@@ -1,24 +1,28 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-describe("Vercel durable demo-store contract", () => {
-  const source = readFileSync("api/demo-store.ts", "utf8");
+describe("database-free Vercel preview store contract", () => {
+  const storeSource = readFileSync("api/demo-store.ts", "utf8");
+  const apiSource = readFileSync("api/demo.ts", "utf8");
 
-  it("uses DATABASE_URL and namespaced automatic migrations", () => {
-    expect(source).toContain("process.env.DATABASE_URL");
-    expect(source).toContain("eventmesh_schema_migrations");
-    expect(source).toContain("eventmesh_demo_state");
-    expect(source).toContain("ON CONFLICT (version) DO NOTHING");
+  it("does not depend on DATABASE_URL, Neon, or Postgres", () => {
+    expect(storeSource).not.toContain("DATABASE_URL");
+    expect(storeSource).not.toContain("@neondatabase/serverless");
+    expect(storeSource).not.toContain("CREATE TABLE");
+    expect(storeSource).toContain('"ephemeral-preview"');
   });
 
-  it("uses optimistic revision checks for concurrent serverless mutations", () => {
-    expect(source).toContain("revision = revision + 1");
-    expect(source).toContain("WHERE id = 'main' AND revision = ${revision}");
-    expect(source).toContain("DEMO_STATE_CONCURRENT_UPDATE_RETRY_EXHAUSTED");
+  it("uses only a bounded disposable cache on Vercel", () => {
+    expect(storeSource).toContain('"/tmp/eventmesh-preview-state.json"');
+    expect(storeSource).toContain("DEMO_STATE_MAX_BYTES");
+    expect(storeSource).toContain("slice(100)");
+    expect(storeSource).toContain("DEMO_STORAGE_DURABLE = false");
   });
 
-  it("fails closed on Vercel unless ephemeral state is explicitly opted in", () => {
-    expect(source).toContain("ALLOW_EPHEMERAL_VERCEL_STATE");
-    expect(source).toContain("DATABASE_URL_REQUIRED_ON_VERCEL");
+  it("recovers from signed portable snapshots and rejects rollback conflicts", () => {
+    expect(apiSource).toContain("verifyTranscript");
+    expect(apiSource).toContain("restorePortableSnapshot");
+    expect(apiSource).toContain("SNAPSHOT_EVENT_HISTORY_CONFLICT");
+    expect(apiSource).toContain("portableRecovery: true");
   });
 });

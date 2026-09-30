@@ -1,93 +1,91 @@
-# EventMesh v0.4.2 — zero-database Vercel preview
+# EventMesh on Vercel — one project, no database
 
-The reviewer demo remains a **single Vercel project**: Vite UI + same-origin serverless API + signed EventMesh evidence. No Postgres, Neon, Vercel Blob, Redis, or other external state service is required.
+EventMesh v0.5 deploys the Vite frontend and `/api/*` functions as one Vercel project **without Postgres, Neon, Blob, SQLite, or another database service**.
 
-## Storage model
+The preview uses two layers of state:
 
-The preview keeps the existing JSON-file model:
+1. a bounded `/tmp/eventmesh-preview-state.json` cache inside the current serverless instance; and
+2. a portable signed snapshot stored in the browser and attached to later mutations.
 
-- local development: `.data/eventmesh-demo-state.json`;
-- Vercel Functions: `/tmp/eventmesh-demo-state.json`.
+If Vercel starts a fresh instance, the API verifies the session signatures, event/ACK signatures, hash chain, close commitment, and participant identities before reconstructing the disposable cache. The server therefore does not treat client JSON as trusted state.
 
-Vercel `/tmp` is **ephemeral and instance-local**. A cold start can reset the file, and two function instances can observe different files. The UI and exported evidence now state this directly. This deployment mode is intended for a reviewer/demo experience, not production durability.
+> This is a preview/reviewer deployment model. It is not a substitute for durable multi-party production storage. The standalone operator service uses an atomic JSON file on its persistent host.
 
-## Fastest deployment
-
-Import the repository into Vercel and deploy it. **No environment variable is required for the core signed reference flow.**
-
-The zero-config preview uses deterministic, public **demo-only** signing identities. They are intentionally not secret and must never control funds or production authority.
-
-You can also deploy from the repository:
+## 1. Required variable
 
 ```bash
-chmod +x scripts/deploy-vercel-testnet.sh
-./scripts/deploy-vercel-testnet.sh
+DEMO_MASTER_SECRET=<at least 32 characters; preferably 32 random bytes as hex>
 ```
 
-The script can run without `.env.local`. If you want deployment-specific signer identities or optional integrations, run:
+The secret keeps the two demo signing identities stable across Vercel instances. Operator private keys are derived server-side when explicit operator keys are not supplied; they are never sent to the browser.
+
+## 2. Optional CKB Testnet / Fiber variables
 
 ```bash
-./scripts/generate-env.sh
-./scripts/deploy-vercel-testnet.sh
-```
-
-## Optional environment
-
-```dotenv
-# Optional but recommended for a public reviewer deployment.
-DEMO_MASTER_SECRET="<random 64 hex characters>"
-
-DEMO_RATE_LIMIT_PER_MINUTE=60
-DEMO_STATE_MAX_BYTES=4194304
-CKB_RPC_URL="https://testnet.ckbapp.dev/"
+CKB_RPC_URL=https://testnet.ckbapp.dev/
+CKB_PRIVATE_KEY=
 DEMO_ALLOW_CKB_BROADCAST=false
-```
-
-Optional real integration variables:
-
-```dotenv
-OPERATOR_A_PRIVATE_KEY="0x..."
-OPERATOR_B_PRIVATE_KEY="0x..."
-CKB_PRIVATE_KEY="0x..."
 CKB_ANCHOR_CAPACITY_CKB=220
-FIBER_RECEIVER_RPC_URL="https://your-receiver-fnn.example/rpc"
-FIBER_RECEIVER_RPC_TOKEN="..."
+
+FIBER_RECEIVER_RPC_URL=
+FIBER_RECEIVER_RPC_TOKEN=
 ```
 
-## What works with zero configuration
+`PAYMENT_SETTLED` remains fail-closed unless the receiver-side Fiber RPC independently verifies the claim. CKB broadcast remains disabled unless `DEMO_ALLOW_CKB_BROADCAST=true` and a Testnet-only key is configured.
 
-- create a dual-signed session;
-- append hash-linked bilateral events;
-- generate explicit signed acknowledgements;
-- run the complete reference service flow in one click;
-- dual-sign the final state;
-- verify the session/event/ACK/close signatures and transcript roots;
-- export the complete evidence JSON;
-- resume the last session from the same browser while the Vercel instance still has it.
+## 3. Local setup
 
-Fiber payment verification remains fail-closed until a receiver Fiber RPC is configured. CKB broadcasting remains off unless both `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true` are explicitly configured.
+```bash
+chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
+./scripts/generate-env.sh
+npm install
+npm run check
+```
 
-## Diagnostics
+Local development writes `.data/eventmesh-demo-state.json`. The standalone operator writes `eventmesh-state.json` inside its configured data directory.
 
-- `/api/health` — lightweight preview readiness;
-- `/api/health?deep=1` — JSON-file writability, CKB RPC reachability and optional Fiber RPC check;
-- `/api/demo` — signer mode, storage mode, capabilities and operator identities;
-- `node scripts/verify-deployment.mjs https://your-deployment.vercel.app` — runs the full reference flow and verifies its signed evidence.
+## 4. Deploy
 
-Expected storage status on Vercel:
+```bash
+./scripts/deploy-vercel-testnet.sh
+```
+
+The script runs checks, pushes the non-database environment variables, deploys, probes deep health, then performs a signed create → event → portable verification → close → final verification flow.
+
+## 5. Health checks
+
+- `GET /api/health` — lightweight signing-service readiness.
+- `GET /api/health?deep=1` — preview-cache write check plus CKB/Fiber connectivity diagnostics.
+- `GET /api/demo` — protocol, identities, capabilities, and storage mode.
+
+Expected preview storage metadata:
 
 ```json
 {
-  "mode": "ephemeral-json",
-  "durable": false,
-  "writable": true
+  "storage": {
+    "mode": "ephemeral-preview",
+    "durable": false,
+    "portableRecovery": true
+  }
 }
 ```
 
-That is intentional for this preview build.
+A `durable: false` value is intentional. The UI says "Database-free preview" rather than claiming server-side durability.
 
-## Security boundary
+## 6. New preview features
 
-The built-in zero-config identities are public demo identities. Supplying `DEMO_MASTER_SECRET` derives deployment-specific demo identities instead. Explicit operator private keys remain server-side when supplied.
+- automatic browser resume after refresh;
+- signed snapshot reconstruction after Vercel cold starts;
+- one-click full reference flow;
+- server-side evidence verification;
+- JSON import/export;
+- reconciliation notes;
+- transcript-root and chain-tip display;
+- optional Fiber verification;
+- optional CKB Testnet checkpointing/reconciliation.
 
-CKB funds are a separate boundary: the preview does not derive or expose `CKB_PRIVATE_KEY`, and broadcasting is disabled by default. Do not fund the public demo identities and do not describe `/tmp` state as durable storage.
+## 7. Security boundary
+
+The portable snapshot is **not trusted merely because it came from localStorage or an imported JSON file**. Before restoration the API verifies the bilateral signed session and full event chain with `verifyTranscript`, checks that both participant public keys are the configured preview identities, rejects conflicting history, and prevents a warm cache from being rolled back to a shorter chain.
+
+The public preview is still intentionally unauthenticated at the end-user layer. Same-origin checks and rate limits are abuse controls, not application identity. Do not use production funds or production signing keys.

@@ -15,7 +15,8 @@ function json(res: ServerResponse, status: number, body: unknown) {
 function safeMessage(error: unknown) {
   return String((error as any)?.message || error || "UNKNOWN_ERROR")
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[redacted]@")
+    .replace(/([?&](?:token|key|secret|password)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 300);
 }
 
@@ -39,12 +40,11 @@ export default async function handler(req: any, res: ServerResponse) {
 
   const deep = new URL(req.url || "/api/health", "https://eventmesh.local").searchParams.get("deep") === "1";
   const masterSecret = process.env.DEMO_MASTER_SECRET?.trim();
-  const masterSecretInvalid = !!masterSecret && masterSecret.length < 32;
 
   const status: any = {
-    ok: !masterSecretInvalid,
+    ok: true,
     service: "eventmesh",
-    version: "0.4.2-preview-json",
+    version: "0.5.0",
     runtime: `node-${process.versions.node}`,
     timestamp: new Date().toISOString(),
     storage: {
@@ -52,8 +52,8 @@ export default async function handler(req: any, res: ServerResponse) {
       durable: DEMO_STORAGE_DURABLE,
       writable: false,
       warning: process.env.VERCEL
-        ? "JSON preview state uses /tmp and can reset across cold starts or function instances."
-        : "JSON preview state is local and is not safe for multi-process production use."
+        ? "Preview state is ephemeral on Vercel; signed browser snapshots provide cold-start recovery."
+        : "Local JSON storage is intended for single-process development only."
     },
     fiber: { configured: !!process.env.FIBER_RECEIVER_RPC_URL, reachable: false },
     ckb: {
@@ -64,25 +64,20 @@ export default async function handler(req: any, res: ServerResponse) {
       broadcastEnabled: process.env.DEMO_ALLOW_CKB_BROADCAST === "true"
     },
     security: {
-      signerMode: masterSecret ? "configured-secret" : "public-preview",
       masterSecretConfigured: !!masterSecret && masterSecret.length >= 32,
-      masterSecretStrongEnough: !masterSecretInvalid,
-      publicPreviewIdentity: !masterSecret,
+      masterSecretStrongEnough: !!masterSecret && masterSecret.length >= 32,
       operatorAKeyConfigured: !!process.env.OPERATOR_A_PRIVATE_KEY,
-      operatorBKeyConfigured: !!process.env.OPERATOR_B_PRIVATE_KEY,
-      warning: !masterSecret
-        ? "Zero-config preview uses public demo-only signing identities. Do not attach funds or production authority to them."
-        : undefined
+      operatorBKeyConfigured: !!process.env.OPERATOR_B_PRIVATE_KEY
     }
   };
 
   if (!deep) {
+    const ready = status.security.masterSecretConfigured;
     return json(res, 200, {
-      ok: !masterSecretInvalid,
+      ok: ready,
       service: "eventmesh",
-      version: "0.4.2",
-      status: !masterSecretInvalid ? "ready" : "unavailable",
-      mode: masterSecret ? "configured-preview" : "zero-config-preview",
+      version: "0.5.0",
+      status: ready ? "ready" : "unavailable",
       network: "CKB Testnet"
     });
   }
@@ -91,6 +86,9 @@ export default async function handler(req: any, res: ServerResponse) {
     const storage = await ensureDemoStoreWritable();
     status.storage.writable = true;
     status.storage.sessionCount = storage.sessionCount;
+    status.storage.durable = storage.durable;
+    if ("schemaVersion" in storage) status.storage.schemaVersion = storage.schemaVersion;
+    if ("revision" in storage) status.storage.revision = storage.revision;
   } catch (error) {
     status.storage.error = safeMessage(error);
   }
@@ -121,7 +119,7 @@ export default async function handler(req: any, res: ServerResponse) {
     status.fiber.error = "FIBER_RECEIVER_RPC_URL_NOT_CONFIGURED";
   }
 
-  status.coreReady = status.storage.writable && !masterSecretInvalid;
+  status.coreReady = status.storage.writable && status.security.masterSecretConfigured;
   status.testnetReady = status.coreReady && status.ckb.reachable;
   status.ok = status.coreReady;
   return json(res, 200, status);

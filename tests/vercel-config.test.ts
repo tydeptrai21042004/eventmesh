@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 
 const readJson = (path: string) => JSON.parse(readFileSync(path, "utf8"));
 
-describe("one-project Vercel deployment contract", () => {
+describe("one-project database-free Vercel deployment contract", () => {
   it("builds runtime workspace packages before the demo", () => {
     const root = readJson("package.json");
     expect(root.scripts["vercel-build"]).toContain("build:runtime");
@@ -25,12 +25,15 @@ describe("one-project Vercel deployment contract", () => {
     expect(config.functions["api/health.ts"]).toBeTruthy();
   });
 
-  it("includes the Neon serverless driver and durable deployment variables", () => {
+  it("has no database dependency or database environment requirement", () => {
     const root = readJson("package.json");
-    expect(root.dependencies["@neondatabase/serverless"]).toBe("1.1.0");
+    const operator = readJson("apps/operator/package.json");
+    expect(root.dependencies?.["@neondatabase/serverless"]).toBeUndefined();
+    expect(operator.dependencies?.["better-sqlite3"]).toBeUndefined();
     const example = readFileSync(".env.example", "utf8");
-    expect(example).toMatch(/^DATABASE_URL=/m);
-    expect(example).toMatch(/^ALLOW_EPHEMERAL_VERCEL_STATE=false$/m);
+    expect(example).not.toMatch(/^DATABASE_URL=/m);
+    expect(example).not.toMatch(/^ALLOW_EPHEMERAL_VERCEL_STATE=/m);
+    expect(example).toMatch(/^DEMO_MASTER_SECRET=/m);
   });
 
   it("does not expose secrets through VITE_ variables", () => {

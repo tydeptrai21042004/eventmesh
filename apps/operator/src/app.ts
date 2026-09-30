@@ -82,7 +82,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
 
   mkdirSync(options.dataDir, { recursive: true });
   const identity = loadIdentity(options.dataDir, options.operatorPrivateKey);
-  const store = new Store(join(options.dataDir, "eventmesh.db"));
+  const store = new Store(join(options.dataDir, "eventmesh-state.json"));
   const app = Fastify({ logger: process.env.NODE_ENV !== "test" });
   const corsOrigins = new Set(options.corsOrigins ?? ["http://localhost:3000"]);
 

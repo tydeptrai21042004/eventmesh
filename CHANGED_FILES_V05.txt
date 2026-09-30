@@ -1,0 +1,42 @@
+EventMesh v0.5 database-free patch
+
+Runtime/API
+- api/demo-store.ts
+- api/demo.ts
+- api/health.ts
+
+Demo UI
+- apps/demo/src/main.tsx
+- apps/demo/src/style.css
+- apps/demo/package.json
+
+Standalone operator
+- apps/operator/src/store.ts
+- apps/operator/src/app.ts
+- apps/operator/package.json
+
+Root/config
+- package.json
+- .env.example
+
+Deployment
+- scripts/generate-env.sh
+- scripts/deploy-vercel-testnet.sh
+- scripts/bootstrap-vercel.sh
+- scripts/verify-deployment.mjs
+
+Tests
+- tests/demo-store-config.test.ts
+- tests/vercel-config.test.ts
+- tests/store.test.ts
+- tests/operator.integration.test.ts
+
+Docs
+- README.md
+- SECURITY.md
+- VERCEL_DEPLOYMENT.md
+- docs/PRODUCTION_READINESS.md
+- docs/HOW_TO_VERIFY.md
+- docs/FUNDING_READINESS_CHECKLIST.md
+- docs/FUNDING_PROPOSAL_DRAFT.md
+- DATABASE_FREE_V05.md

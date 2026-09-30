@@ -30,25 +30,48 @@ async function post(body) {
 
 const health = await get("/api/health?deep=1");
 console.log("health", JSON.stringify(health, null, 2));
-if (!health.storage?.writable) throw new Error("JSON preview storage is not writable");
-if (!health.security?.masterSecretStrongEnough) throw new Error("Configured DEMO_MASTER_SECRET is invalid");
+if (!health.storage?.writable) throw new Error("EventMesh preview cache is not writable");
+if (!health.security?.masterSecretConfigured) throw new Error("DEMO_MASTER_SECRET is missing");
 
 const runtime = await get("/api/demo");
-if (!runtime.ok) throw new Error("Preview API reports unavailable");
-console.log("demo", JSON.stringify({ ok: runtime.ok, version: runtime.version, signerMode: runtime.signerMode, storage: runtime.storage }, null, 2));
+console.log("demo", JSON.stringify({ ok: runtime.ok, version: runtime.version, storage: runtime.storage }, null, 2));
+if (!runtime.ok) throw new Error("EventMesh signing service is not ready");
+if (runtime.storage?.durable) throw new Error("Database-free preview unexpectedly reports durable storage");
+if (!runtime.storage?.portableRecovery) throw new Error("Portable snapshot recovery is not enabled");
 
 const suffix = crypto.randomUUID();
-const completed = await post({
-  action: "run_reference_flow",
-  idempotencyKey: `deploy-reference-${suffix}`,
-  requestId: `smoke-${suffix.slice(0, 8)}`,
-  service: "deployment-smoke"
+const created = await post({ action: "create_session", idempotencyKey: `deploy-smoke-${suffix}` });
+const sessionId = created.sessionId;
+let snapshot = created.state;
+
+const appended = await post({
+  action: "append_event",
+  sessionId,
+  sender: "A",
+  type: "DEPLOYMENT_SMOKE",
+  payload: { source: "verify-deployment" },
+  idempotencyKey: `${sessionId}:smoke`,
+  snapshot
 });
-if (completed.state?.status !== "CLOSED") throw new Error("Reference flow did not close");
-const sessionId = completed.sessionId;
-const verified = await post({ action: "verify_evidence", sessionId });
-if (!verified.ok) throw new Error(`Evidence verification failed: ${(verified.verification?.errors || []).join(", ")}`);
-console.log(`PASS EventMesh reference flow + evidence verification: ${sessionId}`);
-console.log(`Signer mode: ${runtime.signerMode}; storage: ${runtime.storage?.mode} (durable=${runtime.storage?.durable})`);
+snapshot = appended.state;
+
+const verifiedActive = await post({ action: "verify_snapshot", snapshot });
+if (!verifiedActive.ok || verifiedActive.eventCount !== 1) throw new Error("Active portable snapshot verification failed");
+
+const closed = await post({
+  action: "close_session",
+  sessionId,
+  finalState: { smoke: true },
+  idempotencyKey: `${sessionId}:close`,
+  snapshot
+});
+snapshot = closed.state;
+if (snapshot?.status !== "CLOSED") throw new Error("Smoke session did not close");
+
+const verifiedClosed = await post({ action: "verify_snapshot", snapshot });
+if (!verifiedClosed.ok || verifiedClosed.status !== "CLOSED") throw new Error("Closed portable snapshot verification failed");
+
+console.log(`PASS EventMesh database-free signed-session smoke test: ${sessionId}`);
+console.log(`Storage: ${health.storage?.mode}; portable recovery: enabled`);
 console.log(`CKB RPC: ${health.ckb?.reachable ? "reachable" : "not reachable"}; signer: ${health.ckb?.signerConfigured ? "configured" : "not configured"}`);
 console.log(`Fiber receiver: ${health.fiber?.reachable ? "reachable" : health.fiber?.configured ? "configured but unreachable" : "not configured"}`);

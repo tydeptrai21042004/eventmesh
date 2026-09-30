@@ -52,7 +52,7 @@ async function createSession(a: Awaited<ReturnType<typeof buildOperatorApp>>): P
   return response.json() as SignedSession;
 }
 
-describe("two-operator HTTP + separate SQLite protocol", () => {
+describe("two-operator HTTP + separate JSON-file stores", () => {
   it("completes a bilateral transcript and never reopens CLOSED on join replay", async () => {
     const { a, b } = await pair();
     const signed = await createSession(a);

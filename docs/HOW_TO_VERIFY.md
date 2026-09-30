@@ -107,7 +107,7 @@ This is the market-pain proof, not an optional stress test.
 3. A pays it;
 4. confirm B's FNN can report `Paid`;
 5. stop B **before** the application settlement ACK is completed/delivered;
-6. restart B against the same durable SQLite volume;
+6. restart B against the same persistent JSON state file;
 7. retry the settlement path;
 8. B re-queries its own FNN;
 9. verify only one payment-linked EventMesh event becomes canonical;
@@ -175,7 +175,7 @@ Do not call the project independently proven until public evidence shows:
 - an external application/repository not owned by EventMesh;
 - operator A and B on separate hosts/administrative environments;
 - different private keys;
-- different SQLite stores;
+- different JSON state files;
 - different FNN nodes/credentials;
 - a real Fiber Testnet payment;
 - receiver-owned `Paid` verification;

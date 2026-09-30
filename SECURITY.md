@@ -46,14 +46,16 @@ The protocol serializes each bilateral session to one unresolved event at a time
 
 ## Secret handling
 
-Never commit operator private keys, `CKB_PRIVATE_KEY`, FNN tokens, `.env`, or local SQLite databases. The supplied `.gitignore` excludes the expected local secret/state paths.
+Never commit operator private keys, `CKB_PRIVATE_KEY`, FNN tokens, `.env`, or local JSON state files. The supplied `.gitignore` excludes the expected local secret/state paths.
 
 ## Vulnerability reporting
 
 Report security issues privately to the repository maintainer rather than opening a public exploit-details issue. Replace this section with a dedicated security contact/process before any production deployment.
 
-## Vercel durable-state boundary
+## Database-free preview boundary
 
-Production Vercel deployments should configure `DATABASE_URL`. EventMesh auto-initializes namespaced Postgres tables and uses revision-based compare-and-swap updates to prevent lost updates between concurrent serverless invocations. Vercel `/tmp` is not treated as durable storage and is refused unless `ALLOW_EPHEMERAL_VERCEL_STATE=true` is explicitly enabled for a disposable preview.
+The Vercel surface intentionally does not claim durable server-side state. `/tmp` is a bounded disposable cache, while the browser carries a signed snapshot that is cryptographically re-verified before a cold serverless instance can reconstruct the session. Conflicting history and shorter-chain rollback are rejected.
+
+The standalone operator runtime uses an atomic JSON state file on persistent storage rather than a database engine. This is suitable for the single-process reference operator model, but multi-writer production deployments need an explicit concurrency/durability design rather than sharing one JSON file between processes.
 
 The public demo mutation API is intentionally unauthenticated at the end-user layer; same-origin browser checks and rate limits are abuse controls, not identity. A real operator service must put the endpoint behind application authentication and authorization.

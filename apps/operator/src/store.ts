@@ -1,4 +1,5 @@
-import Database from "better-sqlite3";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import {
   canonical,
   type ConflictEvidence,
@@ -13,244 +14,275 @@ import {
 
 export type WriteResult = "INSERTED" | "IDEMPOTENT" | "CONFLICT" | "NOT_FOUND";
 
+type SessionRow = {
+  signed: SignedSession;
+  status: string;
+  closeProposal?: SignedClose;
+  close?: SignedClose;
+  anchor?: any;
+  order: number;
+};
+
+type EventRow = {
+  event: SignedEvent;
+  ack?: SignedAck;
+  status: string;
+};
+
+type PaymentClaimRow = {
+  sessionId: string;
+  eventHash: string;
+  claim: FiberPaymentClaim;
+};
+
+type PaymentEvidenceRow = {
+  sessionId: string;
+  eventHash: string;
+  evidence: FiberPaymentEvidence;
+};
+
+type FileState = {
+  version: 1;
+  nextOrder: number;
+  sessions: Record<string, SessionRow>;
+  events: Record<string, EventRow>;
+  conflicts: Array<ConflictEvidence & { sessionId: string }>;
+  paymentClaims: Record<string, PaymentClaimRow>;
+  paymentEvidence: Record<string, PaymentEvidenceRow>;
+};
+
+const emptyState = (): FileState => ({
+  version: 1,
+  nextOrder: 1,
+  sessions: {},
+  events: {},
+  conflicts: [],
+  paymentClaims: {},
+  paymentEvidence: {}
+});
+
+function parseState(raw: string): FileState {
+  const value = JSON.parse(raw);
+  if (!value || value.version !== 1) throw new Error("EVENTMESH_STATE_INVALID");
+  return {
+    ...emptyState(),
+    ...value,
+    sessions: value.sessions || {},
+    events: value.events || {},
+    conflicts: value.conflicts || [],
+    paymentClaims: value.paymentClaims || {},
+    paymentEvidence: value.paymentEvidence || {}
+  };
+}
+
+/**
+ * Durable operator state without a database engine. Each mutation rewrites one
+ * compact JSON document through temp-file + rename, which is sufficient for the
+ * single-process reference operator deployment model.
+ */
 export class Store {
-  private db: Database.Database;
+  private readonly path: string;
+  private state: FileState;
 
   constructor(path: string) {
-    this.db = new Database(path);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions(
-        session_id TEXT PRIMARY KEY,
-        signed_session_json TEXT NOT NULL,
-        status TEXT NOT NULL,
-        close_proposal_json TEXT,
-        signed_close_json TEXT,
-        ckb_anchor_json TEXT
-      );
-      CREATE TABLE IF NOT EXISTS events(
-        event_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        event_json TEXT NOT NULL,
-        ack_json TEXT,
-        status TEXT NOT NULL,
-        UNIQUE(session_id, sequence)
-      );
-      CREATE TABLE IF NOT EXISTS conflicts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        existing_json TEXT NOT NULL,
-        incoming_json TEXT NOT NULL,
-        observed_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS payment_claims(
-        payment_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        event_hash TEXT NOT NULL,
-        claim_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS payment_evidence(
-        payment_hash TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        event_hash TEXT NOT NULL,
-        evidence_json TEXT NOT NULL,
-        verified_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_events_session_sequence ON events(session_id, sequence);
-      CREATE INDEX IF NOT EXISTS idx_conflicts_session ON conflicts(session_id);
-      CREATE INDEX IF NOT EXISTS idx_payment_evidence_session ON payment_evidence(session_id);
-    `);
+    this.path = resolve(path);
+    mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+    try {
+      this.state = parseState(readFileSync(this.path, "utf8"));
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      this.state = emptyState();
+      this.persist();
+    }
+  }
+
+  private persist() {
+    const tmp = `${this.path}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(this.state)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, this.path);
+    try { chmodSync(this.path, 0o600); } catch { /* best effort on non-POSIX filesystems */ }
   }
 
   close() {
-    this.db.close();
+    this.persist();
   }
 
   getEventBySequence(sessionId: string, sequence: number) {
-    const row = this.db.prepare("SELECT * FROM events WHERE session_id=? AND sequence=?").get(sessionId, sequence) as any;
-    if (!row) return undefined;
-    return {
-      event: JSON.parse(row.event_json) as SignedEvent,
-      ack: row.ack_json ? JSON.parse(row.ack_json) as SignedAck : undefined,
-      status: row.status as string
-    };
+    return Object.values(this.state.events).find((row) => row.event.sessionId === sessionId && row.event.sequence === sequence);
   }
 
   private conflict(sessionId: string, kind: ConflictEvidence["kind"], existing: unknown, incoming: unknown) {
-    this.db.prepare(
-      "INSERT INTO conflicts(session_id,kind,existing_json,incoming_json,observed_at) VALUES(?,?,?,?,?)"
-    ).run(sessionId, kind, JSON.stringify(existing), JSON.stringify(incoming), new Date().toISOString());
-    this.db.prepare("UPDATE sessions SET status='DISPUTED' WHERE session_id=?").run(sessionId);
+    this.state.conflicts.push({ kind, existing, incoming, observedAt: new Date().toISOString(), sessionId });
+    if (this.state.sessions[sessionId]) this.state.sessions[sessionId].status = "DISPUTED";
   }
 
   saveSession(session: SignedSession, status = "ACTIVE"): WriteResult {
-    const existing = this.getSession(session.session.sessionId);
+    const sessionId = session.session.sessionId;
+    const existing = this.state.sessions[sessionId];
     if (!existing) {
-      this.db.prepare("INSERT INTO sessions(session_id,signed_session_json,status) VALUES(?,?,?)")
-        .run(session.session.sessionId, JSON.stringify(session), status);
+      this.state.sessions[sessionId] = { signed: session, status, order: this.state.nextOrder++ };
+      this.persist();
       return "INSERTED";
     }
     if (canonical(existing.signed.session) === canonical(session.session) && existing.signed.signatureA === session.signatureA) {
+      if (existing.signed.signatureB && session.signatureB && existing.signed.signatureB !== session.signatureB) {
+        this.conflict(sessionId, "SESSION", existing.signed, session);
+        this.persist();
+        return "CONFLICT";
+      }
       if (!existing.signed.signatureB && session.signatureB) {
-        this.db.prepare("UPDATE sessions SET signed_session_json=? WHERE session_id=?")
-          .run(JSON.stringify({ ...existing.signed, signatureB: session.signatureB }), session.session.sessionId);
+        existing.signed = { ...existing.signed, signatureB: session.signatureB };
+        this.persist();
       }
       return "IDEMPOTENT";
     }
-    this.conflict(session.session.sessionId, "SESSION", existing.signed, session);
+    this.conflict(sessionId, "SESSION", existing.signed, session);
+    this.persist();
     return "CONFLICT";
   }
 
   getSession(sessionId: string) {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE session_id=?").get(sessionId) as any;
+    const row = this.state.sessions[sessionId];
     if (!row) return undefined;
     return {
-      signed: JSON.parse(row.signed_session_json) as SignedSession,
-      status: row.status as string,
-      closeProposal: row.close_proposal_json ? JSON.parse(row.close_proposal_json) : undefined,
-      close: row.signed_close_json ? JSON.parse(row.signed_close_json) : undefined,
-      anchor: row.ckb_anchor_json ? JSON.parse(row.ckb_anchor_json) : undefined
+      signed: row.signed,
+      status: row.status,
+      closeProposal: row.closeProposal,
+      close: row.close,
+      anchor: row.anchor
     };
   }
 
   listSessions() {
-    return (this.db.prepare("SELECT * FROM sessions ORDER BY rowid DESC").all() as any[]).map((row) => ({
-      sessionId: row.session_id,
-      status: row.status,
-      session: JSON.parse(row.signed_session_json).session,
-      close: row.signed_close_json ? JSON.parse(row.signed_close_json) : undefined,
-      anchor: row.ckb_anchor_json ? JSON.parse(row.ckb_anchor_json) : undefined
-    }));
+    return Object.entries(this.state.sessions)
+      .sort(([, a], [, b]) => b.order - a.order)
+      .map(([sessionId, row]) => ({
+        sessionId,
+        status: row.status,
+        session: row.signed.session,
+        close: row.close,
+        anchor: row.anchor
+      }));
   }
 
   saveEvent(event: SignedEvent, status = "PROPOSED"): WriteResult {
-    const byHash = this.getEvent(event.eventHash);
+    const key = event.eventHash.toLowerCase();
+    const byHash = this.state.events[key];
     if (byHash) return canonical(byHash.event) === canonical(event) ? "IDEMPOTENT" : "CONFLICT";
 
-    const sameSequence = this.db.prepare(
-      "SELECT event_json FROM events WHERE session_id=? AND sequence=?"
-    ).get(event.sessionId, event.sequence) as any;
+    const sameSequence = this.getEventBySequence(event.sessionId, event.sequence);
     if (sameSequence) {
-      const existing = JSON.parse(sameSequence.event_json) as SignedEvent;
-      const kind: ConflictEvidence["kind"] = existing.sender === event.sender ? "EVENT" : "PROPOSAL_COLLISION";
-      this.conflict(event.sessionId, kind, existing, event);
+      const kind: ConflictEvidence["kind"] = sameSequence.event.sender === event.sender ? "EVENT" : "PROPOSAL_COLLISION";
+      this.conflict(event.sessionId, kind, sameSequence.event, event);
+      this.persist();
       return "CONFLICT";
     }
 
-    this.db.prepare("INSERT INTO events VALUES(?,?,?,?,?,?)")
-      .run(event.eventHash, event.sessionId, event.sequence, JSON.stringify(event), null, status);
+    this.state.events[key] = { event, status };
+    this.persist();
     return "INSERTED";
   }
 
   getEvent(eventHash: string) {
-    const row = this.db.prepare("SELECT * FROM events WHERE event_hash=?").get(eventHash) as any;
-    if (!row) return undefined;
-    return {
-      event: JSON.parse(row.event_json) as SignedEvent,
-      ack: row.ack_json ? JSON.parse(row.ack_json) as SignedAck : undefined,
-      status: row.status as string
-    };
+    return this.state.events[eventHash.toLowerCase()];
   }
 
   listEvents(sessionId: string) {
-    return (this.db.prepare("SELECT * FROM events WHERE session_id=? ORDER BY sequence").all(sessionId) as any[]).map((row) => ({
-      event: JSON.parse(row.event_json) as SignedEvent,
-      ack: row.ack_json ? JSON.parse(row.ack_json) as SignedAck : undefined,
-      status: row.status as string
-    }));
+    return Object.values(this.state.events)
+      .filter((row) => row.event.sessionId === sessionId)
+      .sort((a, b) => a.event.sequence - b.event.sequence);
   }
 
   saveAck(ack: SignedAck): WriteResult {
-    const row = this.db.prepare("SELECT session_id,ack_json FROM events WHERE event_hash=?").get(ack.eventHash) as any;
+    const row = this.state.events[ack.eventHash.toLowerCase()];
     if (!row) return "NOT_FOUND";
-    if (!row.ack_json) {
-      this.db.prepare("UPDATE events SET ack_json=?,status='FINAL' WHERE event_hash=?")
-        .run(JSON.stringify(ack), ack.eventHash);
+    if (!row.ack) {
+      row.ack = ack;
+      row.status = "FINAL";
+      this.persist();
       return "INSERTED";
     }
-    const existing = JSON.parse(row.ack_json) as SignedAck;
-    if (canonical(existing) === canonical(ack)) return "IDEMPOTENT";
-    this.conflict(row.session_id, "ACK", existing, ack);
+    if (canonical(row.ack) === canonical(ack)) return "IDEMPOTENT";
+    this.conflict(row.event.sessionId, "ACK", row.ack, ack);
+    this.persist();
     return "CONFLICT";
   }
 
   saveCloseProposal(sessionId: string, close: SignedClose): WriteResult {
-    const existing = this.getSession(sessionId);
+    const existing = this.state.sessions[sessionId];
     if (!existing) return "NOT_FOUND";
     if (existing.closeProposal) {
       if (canonical(existing.closeProposal) === canonical(close)) return "IDEMPOTENT";
       this.conflict(sessionId, "CLOSE", existing.closeProposal, close);
+      this.persist();
       return "CONFLICT";
     }
-    this.db.prepare("UPDATE sessions SET close_proposal_json=?,status='CLOSING' WHERE session_id=?")
-      .run(JSON.stringify(close), sessionId);
+    existing.closeProposal = close;
+    existing.status = "CLOSING";
+    this.persist();
     return "INSERTED";
   }
 
   saveClose(sessionId: string, close: SignedClose): WriteResult {
-    const existing = this.getSession(sessionId);
+    const existing = this.state.sessions[sessionId];
     if (!existing) return "NOT_FOUND";
     if (existing.close) {
       if (canonical(existing.close) === canonical(close)) return "IDEMPOTENT";
       this.conflict(sessionId, "CLOSE", existing.close, close);
+      this.persist();
       return "CONFLICT";
     }
-    this.db.prepare(
-      "UPDATE sessions SET signed_close_json=?,close_proposal_json=COALESCE(close_proposal_json,?),status='CLOSED' WHERE session_id=?"
-    ).run(JSON.stringify(close), JSON.stringify(close), sessionId);
+    existing.close = close;
+    existing.closeProposal ||= close;
+    existing.status = "CLOSED";
+    this.persist();
     return "INSERTED";
   }
 
   saveAnchor(sessionId: string, anchor: any): WriteResult {
-    const existing = this.getSession(sessionId);
+    const existing = this.state.sessions[sessionId];
     if (!existing) return "NOT_FOUND";
     if (existing.anchor) {
       if (existing.anchor.txHash === anchor.txHash && existing.anchor.dataHex === anchor.dataHex) {
-        this.db.prepare("UPDATE sessions SET ckb_anchor_json=? WHERE session_id=?")
-          .run(JSON.stringify(anchor), sessionId);
+        existing.anchor = anchor;
+        this.persist();
         return "IDEMPOTENT";
       }
       this.conflict(sessionId, "ANCHOR", existing.anchor, anchor);
+      this.persist();
       return "CONFLICT";
     }
-    this.db.prepare("UPDATE sessions SET ckb_anchor_json=? WHERE session_id=?")
-      .run(JSON.stringify(anchor), sessionId);
+    existing.anchor = anchor;
+    this.persist();
     return "INSERTED";
   }
 
   claimPayment(sessionId: string, claim: FiberPaymentClaim, eventHash: string): WriteResult {
     const paymentHash = claim.paymentHash.toLowerCase();
-    const row = this.db.prepare("SELECT * FROM payment_claims WHERE payment_hash=?").get(paymentHash) as any;
+    const row = this.state.paymentClaims[paymentHash];
     if (!row) {
-      this.db.prepare("INSERT INTO payment_claims VALUES(?,?,?,?)")
-        .run(paymentHash, sessionId, eventHash.toLowerCase(), JSON.stringify(claim));
+      this.state.paymentClaims[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), claim };
+      this.persist();
       return "INSERTED";
     }
-    if (
-      row.session_id === sessionId
-      && row.event_hash === eventHash.toLowerCase()
-      && canonical(JSON.parse(row.claim_json)) === canonical(claim)
-    ) return "IDEMPOTENT";
+    if (row.sessionId === sessionId && row.eventHash === eventHash.toLowerCase() && canonical(row.claim) === canonical(claim)) {
+      return "IDEMPOTENT";
+    }
 
     this.conflict(sessionId, "PAYMENT", row, { sessionId, eventHash, claim });
-    if (row.session_id && row.session_id !== sessionId) {
-      this.db.prepare("UPDATE sessions SET status='DISPUTED' WHERE session_id=?").run(row.session_id);
-    }
+    if (row.sessionId !== sessionId && this.state.sessions[row.sessionId]) this.state.sessions[row.sessionId].status = "DISPUTED";
+    this.persist();
     return "CONFLICT";
   }
 
   savePaymentEvidence(sessionId: string, eventHash: string, evidence: FiberPaymentEvidence): WriteResult {
     const paymentHash = evidence.claim.paymentHash.toLowerCase();
-    const row = this.db.prepare("SELECT * FROM payment_evidence WHERE payment_hash=?").get(paymentHash) as any;
+    const row = this.state.paymentEvidence[paymentHash];
     if (!row) {
-      this.db.prepare("INSERT INTO payment_evidence VALUES(?,?,?,?,?)")
-        .run(paymentHash, sessionId, eventHash.toLowerCase(), JSON.stringify(evidence), evidence.verifiedAt);
+      this.state.paymentEvidence[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), evidence };
+      this.persist();
       return "INSERTED";
     }
-    const previous = JSON.parse(row.evidence_json) as FiberPaymentEvidence;
     const stableIdentity = (item: FiberPaymentEvidence) => canonical({
       claim: item.claim,
       verifier: item.verifier,
@@ -258,35 +290,27 @@ export class Store {
       payeePublicKey: item.payeePublicKey,
       observedUdtTypeScript: item.observedUdtTypeScript
     });
-    if (
-      row.session_id === sessionId
-      && row.event_hash === eventHash.toLowerCase()
-      && stableIdentity(previous) === stableIdentity(evidence)
-    ) {
-      // Re-verification after a crash/retry is idempotent even though verifiedAt changes.
-      this.db.prepare("UPDATE payment_evidence SET evidence_json=?,verified_at=? WHERE payment_hash=?")
-        .run(JSON.stringify(evidence), evidence.verifiedAt, paymentHash);
+    if (row.sessionId === sessionId && row.eventHash === eventHash.toLowerCase() && stableIdentity(row.evidence) === stableIdentity(evidence)) {
+      row.evidence = evidence;
+      this.persist();
       return "IDEMPOTENT";
     }
-    this.conflict(sessionId, "PAYMENT", previous, evidence);
+    this.conflict(sessionId, "PAYMENT", row.evidence, evidence);
+    this.persist();
     return "CONFLICT";
   }
 
   listPaymentEvidence(sessionId: string): FiberPaymentEvidence[] {
-    return (this.db.prepare(
-      "SELECT evidence_json FROM payment_evidence WHERE session_id=? ORDER BY payment_hash"
-    ).all(sessionId) as any[]).map((row) => JSON.parse(row.evidence_json) as FiberPaymentEvidence);
+    return Object.entries(this.state.paymentEvidence)
+      .filter(([, row]) => row.sessionId === sessionId)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, row]) => row.evidence);
   }
 
   listConflicts(sessionId: string): ConflictEvidence[] {
-    return (this.db.prepare(
-      "SELECT kind,existing_json,incoming_json,observed_at FROM conflicts WHERE session_id=? ORDER BY id"
-    ).all(sessionId) as any[]).map((row) => ({
-      kind: row.kind,
-      existing: JSON.parse(row.existing_json),
-      incoming: JSON.parse(row.incoming_json),
-      observedAt: row.observed_at
-    }));
+    return this.state.conflicts
+      .filter((row) => row.sessionId === sessionId)
+      .map(({ sessionId: _sessionId, ...conflict }) => conflict);
   }
 
   exportTranscript(sessionId: string): TranscriptExport | undefined {

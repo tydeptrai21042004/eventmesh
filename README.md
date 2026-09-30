@@ -4,7 +4,7 @@
 
 **Problem:** a Fiber payment can succeed while two independently operated applications still disagree about what business event that payment settled after a timeout, retry, crash, or lost response.
 
-**EventMesh** is a bilateral reconciliation layer for that boundary. Two operators keep separate keys and databases, exchange signed application events, explicitly ACCEPT/REJECT exact event hashes, can bind receiver-verified Fiber payments to those events, dual-sign the final state, and optionally checkpoint one compact proof to CKB.
+**EventMesh** is a bilateral reconciliation layer for that boundary. Two operators keep separate keys and independent state files, exchange signed application events, explicitly ACCEPT/REJECT exact event hashes, can bind receiver-verified Fiber payments to those events, dual-sign the final state, and optionally checkpoint one compact proof to CKB.
 
 ```text
 Fiber answers:      did value move?
@@ -41,7 +41,7 @@ Operator A                         Operator B
     |                                  |  receiver FNN = Paid
     |                                  X  process crashes
     |                                  |
-    |                             restart from SQLite
+    |                             restart from JSON state
     |------ PAYMENT_SETTLED ---------->|
     |<-- receiver re-verifies + ACCEPT |
     |                                  |
@@ -55,7 +55,7 @@ No shared database is the source of truth. No sender-side "payment success" asse
 
 ## What v0.2 already implements
 
-- distinct secp256k1 operator identities and SQLite/WAL stores;
+- distinct secp256k1 operator identities and atomic JSON-file stores;
 - domain-separated session/event/ACK/close signatures;
 - signed hash-linked events and exact counterparty ACK/REJECT;
 - immutable/idempotent evidence plus durable conflict records;
@@ -206,11 +206,11 @@ independent application
 + documented adopter feedback
 ```
 
-## One-project Vercel demo (v0.4.2 JSON preview)
+## One-project Vercel demo (v0.5 database-free preview)
 
-The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project. It requires no database: demo state is JSON-backed (`/tmp` on Vercel, `.data/` locally). Browser code never receives operator private keys or an admin token.
+The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project **without a database service**. Vercel `/tmp` is used only as a bounded disposable cache. The browser keeps a portable signed snapshot and sends it with later mutations; a fresh serverless instance verifies the signatures and hash chain before rebuilding its cache.
 
-The v0.4.2 preview keeps the runtime packages compiled before function packaging, reports JSON-storage readiness through `/api/demo` and `/api/health`, and handles non-JSON platform errors without crashing on `JSON.parse`. Vercel `/tmp` is explicitly treated as ephemeral demo storage, not durable persistence. The core reference flow now works with zero environment variables using public demo-only signing identities, and the UI can run, verify, resume, inspect, and export a complete signed reference transcript.
+The standalone operator runtime is database-free as well: it stores state in an atomic JSON file (`eventmesh-state.json`) on its persistent host. Browser code never receives operator private keys or an admin token.
 
 ### Generate configuration and deploy
 
@@ -220,10 +220,10 @@ chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-The deploy script can run without `.env.local`; optional variables are pushed only when present. It deploys, probes `/api/health?deep=1`, runs the complete reference flow, and verifies the resulting signed evidence against the deployed API. CKB uses Testnet by default for RPC reads; broadcasting requires both a funded Testnet-only `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true`.
+Only `DEMO_MASTER_SECRET` is required for the Vercel signing preview. CKB uses Testnet by default for RPC reads; broadcasting requires both a funded Testnet-only `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true`. A native Fiber FNN should remain on a persistent host; set `FIBER_RECEIVER_RPC_URL` to that receiver-owned node. EventMesh refuses `PAYMENT_SETTLED` when the receiver RPC cannot prove the matching paid invoice.
 
-A native Fiber FNN should remain on a persistent host; set `FIBER_RECEIVER_RPC_URL` to that receiver-owned node. EventMesh intentionally refuses `PAYMENT_SETTLED` when the receiver RPC cannot prove the matching paid invoice.
+The v0.5 UI adds one-click reference execution, browser resume, cold-start reconstruction, evidence import/export, evidence verification, reconciliation notes, and transcript/chain integrity summaries.
 
-See `VERCEL_DEPLOYMENT.md` for the zero-database JSON demo, CKB Testnet, Fiber, diagnostics, and security details.
+See `VERCEL_DEPLOYMENT.md` for deployment, diagnostics, recovery behavior, and security boundaries.
 
-This Vercel surface is intentionally a reviewer/demo surface. The original `apps/operator` two-process implementation remains available for independent-host protocol testing.
+This Vercel surface is intentionally a reviewer/demo surface. Use the independent operator processes when validating multi-host behavior, and verify proof artifacts with the standalone verifier rather than screenshots.

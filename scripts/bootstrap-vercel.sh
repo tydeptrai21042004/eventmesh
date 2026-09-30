@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cat <<'MSG'
-EventMesh one-project Vercel deployment
+EventMesh one-project Vercel deployment — database-free preview
 
 1. Push this repository to GitHub.
 2. Import the repository as ONE Vercel Project (root directory = repository root).
-3. Attach a Postgres database from Vercel Marketplace.
-4. Add DEMO_MASTER_SECRET (generate: openssl rand -hex 32).
-5. Optional real integrations:
+3. Add DEMO_MASTER_SECRET (generate: openssl rand -hex 32).
+4. Optional real Testnet integrations:
    FIBER_RECEIVER_RPC_URL / FIBER_RECEIVER_RPC_TOKEN
    CKB_PRIVATE_KEY / CKB_RPC_URL
-6. Deploy. Vercel uses vercel.json automatically.
+5. Deploy. Vercel uses vercel.json automatically.
 
+No Postgres/Neon/Blob database is required. Preview state is carried as a
+signed browser snapshot and reconstructed after serverless cold starts.
 No VITE_ADMIN_TOKEN, VITE_OPERATOR_A_URL, or VITE_OPERATOR_B_URL is needed.
 MSG

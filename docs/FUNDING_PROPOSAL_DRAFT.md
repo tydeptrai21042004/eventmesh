@@ -96,7 +96,7 @@ References:
 
 Already implemented in the repository:
 
-- two separate secp256k1 operator identities and SQLite/WAL stores;
+- two separate secp256k1 operator identities and atomic JSON-file stores;
 - domain-separated session/event/ACK/close signatures;
 - hash-linked signed application events;
 - exact counterparty ACCEPT/REJECT acknowledgements;
@@ -151,7 +151,7 @@ Deploy:
 ```text
 Host A                    Host B
 Operator A                Operator B
-SQLite A                  SQLite B
+JSON state A              JSON state B
 EventMesh key A           EventMesh key B
 FNN A                     FNN B
 ```

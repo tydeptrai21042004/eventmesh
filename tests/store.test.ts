@@ -52,7 +52,7 @@ function signedSession(aPriv: string, bPriv: string, overrides: Partial<Session>
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), "eventmesh-store-"));
   dirs.push(dir);
-  const store = new Store(join(dir, "eventmesh.db"));
+  const store = new Store(join(dir, "eventmesh-state.json"));
   const aPriv = randomPrivateKeyHex();
   const bPriv = randomPrivateKeyHex();
   const a = publicKeyFromPrivate(aPriv);
@@ -122,7 +122,7 @@ describe("Store immutability and equivocation evidence", () => {
 
     const dir2 = mkdtempSync(join(tmpdir(), "eventmesh-collision-"));
     dirs.push(dir2);
-    const collisionStore = new Store(join(dir2, "eventmesh.db"));
+    const collisionStore = new Store(join(dir2, "eventmesh-state.json"));
     expect(collisionStore.saveSession(signedSession(aPriv, bPriv, { sessionId: session.sessionId }))).toBe("INSERTED");
     expect(collisionStore.saveEvent(first)).toBe("INSERTED");
     const collision = signEvent({

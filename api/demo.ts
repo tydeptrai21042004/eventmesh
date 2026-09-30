@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import {
   PROTOCOL,
   SIGNING_DOMAIN,
@@ -21,41 +21,23 @@ import {
   type FiberPaymentEvidence,
   type SignedAck,
   type SignedEvent,
-  type SignedSession,
-  type TranscriptExport
+  type SignedSession
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
-import {
-  DEMO_STORAGE_DURABLE,
-  DEMO_STORAGE_MODE,
-  DEMO_STATE_PATH,
-  mutateDemoStore,
-  readDemoStore
-} from "./demo-store.js";
+import { DEMO_STORAGE_DURABLE, DEMO_STORAGE_MODE, clearDemoSession, mutateDemoStore, readDemoStore } from "./demo-store.js";
 
 const CKB_TESTNET_RPC_URL = process.env.CKB_RPC_URL || "https://testnet.ckbapp.dev/";
 const SECP256K1_N = BigInt("0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
-
-// This value is intentionally public. It exists only so the zero-config preview
-// has stable demo identities across serverless instances. Never fund or reuse
-// these identities. Supplying DEMO_MASTER_SECRET replaces this preview secret.
-const PUBLIC_PREVIEW_SIGNING_SECRET = "eventmesh-public-preview-signing-secret-v1-never-use-for-funds";
+const processFallbackSecret = randomBytes(32).toString("hex");
 
 function configuredMasterSecret() {
   const value = process.env.DEMO_MASTER_SECRET?.trim();
   return value && value.length >= 32 ? value : undefined;
 }
 
-function signingSecret() {
-  return configuredMasterSecret() || PUBLIC_PREVIEW_SIGNING_SECRET;
-}
-
-function signerMode() {
-  return configuredMasterSecret() ? "configured-secret" : "public-preview";
-}
-
 function derivedKey(label: string) {
-  const raw = createHmac("sha256", signingSecret()).update(label).digest("hex");
+  const secret = configuredMasterSecret() || processFallbackSecret;
+  const raw = createHmac("sha256", secret).update(label).digest("hex");
   const scalar = (BigInt(`0x${raw}`) % (SECP256K1_N - 1n)) + 1n;
   return `0x${scalar.toString(16).padStart(64, "0")}`;
 }
@@ -93,7 +75,7 @@ function json(res: ServerResponse, status: number, body: unknown) {
 }
 
 async function bodyOf(req: any) {
-  const maxBytes = 64 * 1024;
+  const maxBytes = 2 * 1024 * 1024;
   const contentType = String(req.headers?.["content-type"] || "").toLowerCase();
   if (!contentType.startsWith("application/json")) throw new Error("CONTENT_TYPE_APPLICATION_JSON_REQUIRED");
   const contentLength = Number(req.headers?.["content-length"] || 0);
@@ -128,7 +110,7 @@ function enforceSameOrigin(req: any) {
 
 function actorHash(req: any) {
   const ip = String(req.headers?.["x-forwarded-for"] || req.socket?.remoteAddress || "unknown").split(",")[0].trim();
-  return sha256Hex(`${signingSecret()}:${ip}`);
+  return sha256Hex(`${configuredMasterSecret() || processFallbackSecret}:${ip}`);
 }
 
 async function rateLimit(req: any, limit = Number(process.env.DEMO_RATE_LIMIT_PER_MINUTE || 60)) {
@@ -213,6 +195,127 @@ async function createSession(req: any, input: any) {
     store.events[session.sessionId] = [];
     return { ok: true, sessionId: session.sessionId, signedSession: signed };
   });
+}
+
+
+function transcriptFromSnapshot(snapshot: any) {
+  if (!snapshot || typeof snapshot !== "object") throw new Error("SNAPSHOT_REQUIRED");
+  if (!snapshot.signedSession) throw new Error("SNAPSHOT_SIGNED_SESSION_REQUIRED");
+  return {
+    session: snapshot.signedSession,
+    events: Array.isArray(snapshot.events)
+      ? snapshot.events.map((row: any) => ({ event: row.event, ack: row.ack }))
+      : [],
+    close: snapshot.close || undefined,
+    paymentEvidence: Array.isArray(snapshot.paymentEvidence) ? snapshot.paymentEvidence : undefined,
+    ckbAnchor: snapshot.anchor || undefined
+  };
+}
+
+function validatePortableSnapshot(snapshot: any) {
+  const transcript = transcriptFromSnapshot(snapshot);
+  const verification = verifyTranscript(transcript as any);
+  if (!verification.ok) throw new Error(`SNAPSHOT_VERIFICATION_FAILED:${verification.errors.join("|")}`);
+  const signedSession = snapshot.signedSession as SignedSession;
+  if (signedSession.session.operatorA.toLowerCase() !== pubA.toLowerCase()) throw new Error("SNAPSHOT_OPERATOR_A_MISMATCH");
+  if (signedSession.session.operatorB.toLowerCase() !== pubB.toLowerCase()) throw new Error("SNAPSHOT_OPERATOR_B_MISMATCH");
+  if (snapshot.sessionId && snapshot.sessionId !== signedSession.session.sessionId) throw new Error("SNAPSHOT_SESSION_ID_MISMATCH");
+  return { transcript, signedSession, verification };
+}
+
+async function restorePortableSnapshot(snapshot: any) {
+  const { signedSession } = validatePortableSnapshot(snapshot);
+  const sessionId = signedSession.session.sessionId;
+  await mutateDemoStore((store) => {
+    const existing = store.sessions[sessionId];
+    if (existing?.signedSession) {
+      const current = canonical(existing.signedSession);
+      const incoming = canonical(signedSession);
+      if (current !== incoming) throw new Error("SNAPSHOT_SESSION_CONFLICT");
+    }
+
+    const incomingEvents = (snapshot.events || []).map((row: any) => ({
+      eventHash: row.event.eventHash.toLowerCase(),
+      sequence: row.event.sequence,
+      signedEvent: row.event,
+      ack: row.ack,
+      status: row.status || "FINAL"
+    }));
+    const existingEvents = store.events[sessionId] || [];
+    const commonLength = Math.min(existingEvents.length, incomingEvents.length);
+    for (let index = 0; index < commonLength; index += 1) {
+      if (String(existingEvents[index]?.eventHash || "").toLowerCase() !== String(incomingEvents[index]?.eventHash || "").toLowerCase()) {
+        throw new Error("SNAPSHOT_EVENT_HISTORY_CONFLICT");
+      }
+    }
+
+    // Never roll a warm server cache backwards when a browser submits an older
+    // but otherwise valid snapshot. The longer verified chain wins.
+    const useIncoming = incomingEvents.length >= existingEvents.length;
+    if (useIncoming) {
+      store.sessions[sessionId] = {
+        signedSession,
+        status: snapshot.status === "CLOSED" || snapshot.close ? "CLOSED" : "ACTIVE",
+        createdAt: signedSession.session.createdAt,
+        signedClose: snapshot.close || undefined,
+        anchor: snapshot.anchor || undefined
+      };
+      store.events[sessionId] = incomingEvents;
+    }
+
+    if (snapshot.anchorOperation && (useIncoming || !store.anchorOps[sessionId])) {
+      if (!snapshot.close?.close) throw new Error("SNAPSHOT_ANCHOR_OPERATION_REQUIRES_CLOSE");
+      const expectedDataHex = buildAnchorDataHex(
+        sessionId,
+        snapshot.close.close.transcriptRoot,
+        snapshot.close.close.finalStateHash,
+        snapshot.close.close.paymentEvidenceRoot
+      );
+      if (String(snapshot.anchorOperation.dataHex || "").toLowerCase() !== expectedDataHex.toLowerCase()) {
+        throw new Error("SNAPSHOT_ANCHOR_OPERATION_COMMITMENT_MISMATCH");
+      }
+      const txHash = snapshot.anchorOperation.txHash;
+      if (txHash && !/^0x[0-9a-f]{64}$/i.test(String(txHash))) throw new Error("SNAPSHOT_ANCHOR_TX_HASH_INVALID");
+      if (snapshot.anchorOperation.commitmentHash && String(snapshot.anchorOperation.commitmentHash).toLowerCase() !== sha256Hex(expectedDataHex).toLowerCase()) {
+        throw new Error("SNAPSHOT_ANCHOR_COMMITMENT_HASH_MISMATCH");
+      }
+      store.anchorOps[sessionId] = snapshot.anchorOperation;
+    }
+
+    for (const evidence of snapshot.paymentEvidence || []) {
+      const paymentHash = String(evidence?.claim?.paymentHash || "").toLowerCase();
+      if (!paymentHash) continue;
+      const event = (snapshot.events || []).find((row: any) =>
+        row?.event?.type === "PAYMENT_SETTLED" && String(row?.event?.payload?.paymentHash || "").toLowerCase() === paymentHash
+      );
+      if (!event) continue;
+      store.paymentClaims[paymentHash] = { sessionId, eventHash: event.event.eventHash.toLowerCase(), claim: evidence.claim };
+      store.paymentEvidence[paymentHash] = {
+        sessionId,
+        eventHash: event.event.eventHash.toLowerCase(),
+        identityHash: stableEvidenceIdentity(evidence),
+        evidence,
+        firstVerifiedAt: evidence.firstVerifiedAt || evidence.verifiedAt,
+        lastVerifiedAt: evidence.lastVerifiedAt || evidence.verifiedAt,
+        verificationCount: evidence.verificationCount || 1
+      };
+    }
+  });
+  return sessionId;
+}
+
+function snapshotSummary(snapshot: any) {
+  const { signedSession, verification } = validatePortableSnapshot(snapshot);
+  const events = Array.isArray(snapshot.events) ? snapshot.events : [];
+  return {
+    ok: verification.ok,
+    sessionId: signedSession.session.sessionId,
+    status: snapshot.close ? "CLOSED" : "ACTIVE",
+    eventCount: events.length,
+    expiresAt: signedSession.session.expiresAt,
+    transcriptRoot: snapshot.close?.close?.transcriptRoot || computeTranscriptRoot(events.map((row: any) => ({ event: row.event, ack: row.ack }))),
+    errors: verification.errors
+  };
 }
 
 function stableEvidenceIdentity(evidence: FiberPaymentEvidence) {
@@ -328,71 +431,6 @@ async function closeSession(input: any) {
   });
 }
 
-async function runReferenceFlow(req: any, input: any) {
-  const flowKey = String(input.idempotencyKey || "");
-  if (!flowKey) throw new Error("IDEMPOTENCY_KEY_REQUIRED");
-  const created = await createSession(req, {
-    idempotencyKey: `${flowKey}:session`,
-    ttlSeconds: input.ttlSeconds ?? 3600,
-    maxEvents: 20
-  });
-  const sessionId = created.sessionId;
-  const requestId = String(input.requestId || `req-${sessionId.slice(-8)}`).slice(0, 120);
-  const service = String(input.service || "dataset-transform").slice(0, 120);
-  const resultHash = /^0x[0-9a-fA-F]{64}$/.test(String(input.resultHash || ""))
-    ? String(input.resultHash)
-    : sha256Hex(canonical({ sessionId, requestId, service, preview: true }));
-
-  await appendEvent({
-    sessionId, sender: "A", type: "SERVICE_REQUESTED",
-    payload: { requestId, service }, idempotencyKey: `${flowKey}:request`
-  });
-  await appendEvent({
-    sessionId, sender: "B", type: "SERVICE_ACCEPTED",
-    payload: { requestId }, idempotencyKey: `${flowKey}:accept`
-  });
-  await appendEvent({
-    sessionId, sender: "B", type: "RESULT_COMMITTED",
-    payload: { requestId, resultHash }, idempotencyKey: `${flowKey}:result`
-  });
-  await appendEvent({
-    sessionId, sender: "B", type: "SESSION_COMPLETED",
-    payload: { requestId }, idempotencyKey: `${flowKey}:complete`
-  });
-  await closeSession({
-    sessionId,
-    idempotencyKey: `${flowKey}:close`,
-    finalState: { kind: "paid-service-preview", requestId, service, resultHash, completed: true }
-  });
-
-  return { ok: true, sessionId, referenceFlow: true };
-}
-
-async function verifySessionEvidence(sessionId: string) {
-  const state = await loadState(sessionId);
-  const transcript: TranscriptExport = {
-    session: state.signedSession,
-    events: state.events.map((row: any) => ({ event: row.event, ack: row.ack })),
-    close: state.close || undefined,
-    paymentEvidence: state.paymentEvidence || undefined,
-    ckbAnchor: state.anchor || undefined
-  };
-  const verification = verifyTranscript(transcript);
-  return {
-    ok: verification.ok,
-    verification,
-    summary: {
-      sessionId,
-      eventCount: transcript.events.length,
-      closed: !!transcript.close,
-      anchored: !!transcript.ckbAnchor,
-      transcriptRoot: transcript.close?.close.transcriptRoot || null,
-      finalStateHash: transcript.close?.close.finalStateHash || null,
-      paymentEvidenceRoot: transcript.close?.close.paymentEvidenceRoot || null
-    }
-  };
-}
-
 function ckbBroadcastEnabled() {
   return process.env.DEMO_ALLOW_CKB_BROADCAST === "true" && !!process.env.CKB_PRIVATE_KEY;
 }
@@ -401,51 +439,103 @@ async function anchorSession(input: any) {
   const sessionId = String(input.sessionId || "");
   if (!ckbBroadcastEnabled()) throw new Error("CKB_BROADCAST_DISABLED");
 
-  const prepared = await mutateDemoStore((store) => {
+  const reserved = await mutateDemoStore((store) => {
     const session = store.sessions[sessionId];
     if (!session) throw new Error("SESSION_NOT_FOUND");
     if (!session.signedClose) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
     if (session.anchor) return { duplicateAnchor: session.anchor };
+
     const close = session.signedClose.close;
     const dataHex = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
     const commitmentHash = sha256Hex(dataHex);
     const existing = store.anchorOps[sessionId];
-    if (existing?.txHash) return { duplicateOperation: existing };
-    if (existing && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
+
+    if (existing?.txHash && ["PENDING", "COMMITTED"].includes(existing.status)) {
+      return { duplicateOperation: existing };
+    }
+    if (existing?.txHash && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(existing.status)) {
       throw new Error("ANCHOR_BROADCAST_STATE_UNCERTAIN_RECONCILE_OR_REVIEW_BEFORE_RETRY");
     }
+    if (existing?.status === "PREPARING") {
+      const stale = Date.now() - Date.parse(existing.updatedAt || 0) > 2 * 60 * 1000;
+      if (!stale) throw new Error("ANCHOR_PREPARATION_IN_PROGRESS");
+    }
+
     store.anchorOps[sessionId] = {
-      sessionId, commitmentHash, status: "BROADCASTING", dataHex,
+      sessionId,
+      commitmentHash,
+      status: "PREPARING",
+      dataHex,
       updatedAt: new Date().toISOString()
     };
-    return { close, dataHex };
+    return { close, dataHex, commitmentHash };
   });
 
-  if ((prepared as any).duplicateAnchor) return { ok: true, anchor: (prepared as any).duplicateAnchor, duplicate: true };
-  if ((prepared as any).duplicateOperation) return { ok: true, anchorOperation: (prepared as any).duplicateOperation, duplicate: true };
+  if ((reserved as any).duplicateAnchor) return { ok: true, anchor: (reserved as any).duplicateAnchor, duplicate: true };
+  if ((reserved as any).duplicateOperation) return { ok: true, anchorOperation: (reserved as any).duplicateOperation, duplicate: true };
 
-  let broadcasted: { txHash: string; dataHex: string; status: "PENDING" } | undefined;
+  let expectedTxHash: string | undefined;
   try {
     const { CkbAnchorClient } = await import("@eventmesh/ckb");
-    const close = (prepared as any).close;
-    const client = new CkbAnchorClient(process.env.CKB_PRIVATE_KEY!, CKB_TESTNET_RPC_URL, Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220));
-    broadcasted = await client.anchor({ sessionId, transcriptRoot: close.transcriptRoot, finalStateHash: close.finalStateHash, paymentEvidenceRoot: close.paymentEvidenceRoot });
+    const close = (reserved as any).close;
+    const client = new CkbAnchorClient(
+      process.env.CKB_PRIVATE_KEY!,
+      CKB_TESTNET_RPC_URL,
+      Number(process.env.CKB_ANCHOR_CAPACITY_CKB || 220)
+    );
+    const prepared = await client.prepareAnchor({
+      sessionId,
+      transcriptRoot: close.transcriptRoot,
+      finalStateHash: close.finalStateHash,
+      paymentEvidenceRoot: close.paymentEvidenceRoot
+    });
+    if (prepared.dataHex.toLowerCase() !== String((reserved as any).dataHex).toLowerCase()) {
+      throw new Error("ANCHOR_PREPARED_COMMITMENT_MISMATCH");
+    }
+    expectedTxHash = prepared.txHash;
+
+    // Persist deterministic transaction identity before the irreversible network submission.
     await mutateDemoStore((store) => {
       const op = store.anchorOps[sessionId];
-      if (!op) throw new Error("ANCHOR_OPERATION_NOT_FOUND");
-      Object.assign(op, { status: "PENDING", txHash: broadcasted!.txHash, dataHex: broadcasted!.dataHex, updatedAt: new Date().toISOString() });
+      if (!op || op.commitmentHash !== (reserved as any).commitmentHash) throw new Error("ANCHOR_OPERATION_CONFLICT");
+      Object.assign(op, {
+        status: "BROADCASTING",
+        txHash: expectedTxHash,
+        updatedAt: new Date().toISOString()
+      });
+    });
+
+    const broadcasted = await client.broadcastPrepared(prepared);
+    await mutateDemoStore((store) => {
+      const op = store.anchorOps[sessionId];
+      if (!op || op.txHash?.toLowerCase() !== broadcasted.txHash.toLowerCase()) throw new Error("ANCHOR_OPERATION_CONFLICT");
+      Object.assign(op, {
+        status: "PENDING",
+        txHash: broadcasted.txHash,
+        dataHex: broadcasted.dataHex,
+        updatedAt: new Date().toISOString()
+      });
       store.sessions[sessionId].anchor = broadcasted;
     });
     return { ok: true, anchor: broadcasted };
   } catch (error) {
-    const txHash = broadcasted?.txHash;
-    await mutateDemoStore((store) => {
+    const persisted = await mutateDemoStore((store) => {
       const op = store.anchorOps[sessionId];
-      if (op) Object.assign(op, { status: "BROADCAST_UNKNOWN", txHash: op.txHash || txHash, error: safeErrorMessage(error), updatedAt: new Date().toISOString() });
+      if (!op) return undefined;
+      const hasTxIdentity = !!op.txHash || !!expectedTxHash;
+      Object.assign(op, {
+        status: hasTxIdentity ? "BROADCAST_UNKNOWN" : "PREPARE_FAILED",
+        txHash: op.txHash || expectedTxHash,
+        error: safeErrorMessage(error),
+        updatedAt: new Date().toISOString()
+      });
+      return { status: op.status, txHash: op.txHash };
     });
-    throw new Error(txHash
-      ? "ANCHOR_BROADCAST_UNKNOWN: tx hash was recovered; run reconcile before any retry"
-      : "ANCHOR_BROADCAST_UNKNOWN: transaction may have been submitted; automatic retry blocked");
+
+    if (persisted?.txHash) {
+      throw new Error(`ANCHOR_BROADCAST_UNKNOWN: deterministic tx hash ${persisted.txHash} was persisted; reconcile before any retry`);
+    }
+    throw error;
   }
 }
 
@@ -464,6 +554,15 @@ async function reconcileAnchor(input: any) {
     });
     return { ok: true, anchor, verification: inspected };
   }
+  if (inspected.status === "TX_NOT_FOUND" && ["BROADCASTING", "BROADCAST_UNKNOWN"].includes(op.status)) {
+    return {
+      ok: false,
+      status: op.status,
+      requiresManualReview: true,
+      reason: "PERSISTED_TX_HASH_NOT_FOUND_ON_RPC",
+      verification: inspected
+    };
+  }
   return { ok: false, status: "PENDING", verification: inspected };
 }
 
@@ -471,7 +570,8 @@ function safeErrorMessage(error: unknown) {
   const raw = String((error as any)?.message || error || "UNKNOWN_ERROR");
   return raw
     .replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
-    .replace(/([?&](?:token|key|secret)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/postgres(?:ql)?:\/\/[^@\s]+@/gi, "postgresql://[redacted]@")
+    .replace(/([?&](?:token|key|secret|password)=)[^&\s]+/gi, "$1[redacted]")
     .slice(0, 500);
 }
 
@@ -483,24 +583,14 @@ export default async function handler(req: any, res: ServerResponse) {
       if (sessionId) return json(res, 200, await loadState(sessionId));
 
       return json(res, 200, {
-        ok: configurationErrors.length === 0,
+        ok: !!configuredMasterSecret() && configurationErrors.length === 0,
         protocol: PROTOCOL,
-        version: "0.4.2",
+        version: "0.5.0",
         network: "CKB Testnet",
+        storage: { mode: DEMO_STORAGE_MODE, durable: DEMO_STORAGE_DURABLE, portableRecovery: true },
         operatorA: pubA,
         operatorB: pubB,
-        signerMode: signerMode(),
-        storage: {
-          mode: DEMO_STORAGE_MODE,
-          durable: DEMO_STORAGE_DURABLE,
-          path: process.env.VERCEL ? "/tmp/eventmesh-demo-state.json" : DEMO_STATE_PATH,
-          warning: process.env.VERCEL
-            ? "Preview state is stored in Vercel /tmp and may reset on a cold start or another function instance."
-            : "Preview state is stored in a local JSON file and is not multi-process durable."
-        },
         capabilities: {
-          referenceFlow: true,
-          evidenceVerification: true,
           fiberPayments: !!process.env.FIBER_RECEIVER_RPC_URL,
           ckbAnchoring: ckbBroadcastEnabled(),
           ckbReconciliation: true
@@ -509,28 +599,41 @@ export default async function handler(req: any, res: ServerResponse) {
     }
 
     if (req.method !== "POST") return json(res, 405, { error: "METHOD_NOT_ALLOWED" });
+    if (!configuredMasterSecret()) throw new Error(process.env.DEMO_MASTER_SECRET ? "DEMO_MASTER_SECRET_TOO_SHORT" : "DEMO_MASTER_SECRET_REQUIRED");
     if (configurationErrors.length) throw new Error(configurationErrors.join(","));
     enforceSameOrigin(req);
     await rateLimit(req);
     const input = await bodyOf(req);
+    if (input.snapshot && String(input.action || "") !== "verify_snapshot") {
+      await restorePortableSnapshot(input.snapshot);
+    }
     let result: any;
     switch (String(input.action || "")) {
       case "create_session": result = await createSession(req, input); break;
-      case "run_reference_flow": result = await runReferenceFlow(req, input); break;
       case "append_event": result = await appendEvent(input); break;
       case "close_session": result = await closeSession(input); break;
-      case "verify_evidence": result = await verifySessionEvidence(String(input.sessionId || "")); break;
       case "anchor": result = await anchorSession(input); break;
       case "reconcile_anchor": result = await reconcileAnchor(input); break;
+      case "verify_snapshot": result = snapshotSummary(input.snapshot); break;
+      case "reset_session": {
+        const sessionId = String(input.sessionId || input.snapshot?.sessionId || "");
+        if (!sessionId) throw new Error("SESSION_ID_REQUIRED");
+        await clearDemoSession(sessionId);
+        result = { ok: true, sessionId, reset: true };
+        break;
+      }
       default: throw new Error("UNKNOWN_ACTION");
     }
-    const state = result?.sessionId ? await loadState(result.sessionId) : input.sessionId ? await loadState(String(input.sessionId)) : undefined;
+    const shouldLoadState = !["verify_snapshot", "reset_session"].includes(String(input.action || ""));
+    const state = shouldLoadState
+      ? result?.sessionId ? await loadState(result.sessionId) : input.sessionId ? await loadState(String(input.sessionId)) : undefined
+      : undefined;
     return json(res, 200, { ...result, state });
   } catch (error: any) {
     const message = safeErrorMessage(error);
     const status = message === "RATE_LIMITED" ? 429
       : message.includes("NOT_FOUND") ? 404
-      : message.includes("DISABLED") ? 503
+      : message.includes("REQUIRED") || message.includes("DISABLED") ? 503
       : message.includes("TOO_LARGE") ? 413
       : 400;
     return json(res, status, { error: message });

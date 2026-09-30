@@ -53,7 +53,7 @@ Acceptance rule: an EventMesh-owned example does **not** satisfy this section.
 
 - [ ] Operator A and B run on separate hosts or independently administered environments.
 - [ ] Different EventMesh private keys.
-- [ ] Different SQLite databases/volumes.
+- [ ] Different persistent JSON state files/volumes.
 - [ ] Different FNN nodes/credentials.
 - [ ] Real Fiber Testnet invoice created by receiver B.
 - [ ] Real payment sent by A.
