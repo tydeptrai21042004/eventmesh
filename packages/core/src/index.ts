@@ -30,6 +30,7 @@ export type CkbScript = z.infer<typeof CkbScriptSchema>;
 export const SessionSchema = z.object({
   sessionId: z.string().min(1).max(128),
   protocol: z.literal(PROTOCOL),
+  environment: z.enum(["DEMO", "TESTNET"]).optional(),
   operatorA: Pub,
   operatorB: Pub,
   operatorAUrl: z.string().url(),

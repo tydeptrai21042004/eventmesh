@@ -9,6 +9,10 @@ function json(res: ServerResponse, status: number, body: unknown) {
   res.setHeader("cache-control", "no-store");
   res.setHeader("x-content-type-options", "nosniff");
   res.setHeader("cross-origin-resource-policy", "same-origin");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("permissions-policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("content-security-policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'");
+  res.setHeader("x-eventmesh-version", "0.6.0");
   res.end(JSON.stringify(body));
 }
 
@@ -44,7 +48,7 @@ export default async function handler(req: any, res: ServerResponse) {
   const status: any = {
     ok: true,
     service: "eventmesh",
-    version: "0.5.0",
+    version: "0.6.0",
     runtime: `node-${process.versions.node}`,
     timestamp: new Date().toISOString(),
     storage: {
@@ -61,24 +65,44 @@ export default async function handler(req: any, res: ServerResponse) {
       rpcMode: process.env.CKB_RPC_URL ? "custom" : "default-testnet",
       reachable: false,
       signerConfigured: !!process.env.CKB_PRIVATE_KEY,
-      broadcastEnabled: process.env.DEMO_ALLOW_CKB_BROADCAST === "true"
+      broadcastEnabled: (process.env.TESTNET_ALLOW_CKB_BROADCAST === "true" || process.env.DEMO_ALLOW_CKB_BROADCAST === "true") && process.env.EVENTMESH_TESTNET_MODE === "true"
     },
     security: {
       masterSecretConfigured: !!masterSecret && masterSecret.length >= 32,
       masterSecretStrongEnough: !!masterSecret && masterSecret.length >= 32,
-      operatorAKeyConfigured: !!process.env.OPERATOR_A_PRIVATE_KEY,
-      operatorBKeyConfigured: !!process.env.OPERATOR_B_PRIVATE_KEY
+      sameOriginMutations: true,
+      optimisticChainPreconditions: true,
+      eventSchemaValidation: true
+    },
+    workspaces: {
+      demo: {
+        enabled: true,
+        ready: !!masterSecret && masterSecret.length >= 32,
+        persistence: "portable-browser-snapshot"
+      },
+      testnet: {
+        enabled: process.env.EVENTMESH_TESTNET_MODE === "true",
+        operatorAKeyConfigured: !!process.env.OPERATOR_A_PRIVATE_KEY,
+        operatorBKeyConfigured: !!process.env.OPERATOR_B_PRIVATE_KEY,
+        accessKeyConfigured: (process.env.EVENTMESH_TESTNET_ACCESS_KEY?.trim().length || 0) >= 32,
+        publicOriginPinned: !!process.env.EVENTMESH_PUBLIC_ORIGIN
+      }
     }
   };
 
   if (!deep) {
     const ready = status.security.masterSecretConfigured;
+    const testnetReady = status.workspaces.testnet.enabled
+      && status.workspaces.testnet.operatorAKeyConfigured
+      && status.workspaces.testnet.operatorBKeyConfigured
+      && status.workspaces.testnet.accessKeyConfigured;
     return json(res, 200, {
       ok: ready,
       service: "eventmesh",
-      version: "0.5.0",
+      version: "0.6.0",
       status: ready ? "ready" : "unavailable",
-      network: "CKB Testnet"
+      network: "CKB Testnet",
+      workspaces: { demoReady: ready, testnetReady }
     });
   }
 
@@ -120,7 +144,12 @@ export default async function handler(req: any, res: ServerResponse) {
   }
 
   status.coreReady = status.storage.writable && status.security.masterSecretConfigured;
-  status.testnetReady = status.coreReady && status.ckb.reachable;
+  status.workspaces.testnet.ready = status.workspaces.testnet.enabled
+    && status.workspaces.testnet.operatorAKeyConfigured
+    && status.workspaces.testnet.operatorBKeyConfigured
+    && status.workspaces.testnet.accessKeyConfigured
+    && status.ckb.reachable;
+  status.testnetReady = status.workspaces.testnet.ready;
   status.ok = status.coreReady;
   return json(res, 200, status);
 }

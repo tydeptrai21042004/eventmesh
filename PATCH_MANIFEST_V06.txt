@@ -1,0 +1,48 @@
+EventMesh v0.6 — changed/new files only
+Baseline: EventMesh v0.5 database-free project
+
+Purpose
+- Separate Demo and Real / Testnet workspaces in both UX and backend policy.
+- Keep Demo database-free and easy to run.
+- Make Real / Testnet fail closed unless explicitly enabled and authenticated.
+- Add optimistic state preconditions, browser edit lease/fork warning, sync recovery,
+  stricter event validation and payload limits.
+- Improve readiness diagnostics, evidence inspection/export, timeline search, UI hierarchy,
+  security headers and Testnet deployment configuration.
+
+Apply
+1. Extract this archive into the root of the v0.5 EventMesh repository.
+2. Review .env.example and configure only the workspace you need.
+3. Run: npm install
+4. Run: npm run check
+5. Deploy to Vercel after local checks pass.
+
+Important Real / Testnet controls
+- EVENTMESH_TESTNET_MODE=true
+- EVENTMESH_TESTNET_ACCESS_KEY=<32+ chars>
+- OPERATOR_A_PRIVATE_KEY=<explicit testnet key>
+- OPERATOR_B_PRIVATE_KEY=<explicit testnet key>
+- TESTNET_ALLOW_CKB_BROADCAST=true only when you intentionally want Testnet broadcasts
+- CKB_PRIVATE_KEY=<server-side testnet key> only when broadcasting is enabled
+
+Changed/new files
+- .env.example
+- README.md
+- SECURITY_V06.md
+- V06_FEATURES.md
+- VERCEL_DEPLOYMENT.md
+- api/demo.ts
+- api/health.ts
+- apps/demo/index.html
+- apps/demo/package.json
+- apps/demo/src/main.tsx
+- apps/demo/src/style.css
+- apps/operator/package.json
+- package.json
+- packages/core/src/index.ts
+- scripts/bootstrap-vercel.sh
+- scripts/deploy-vercel-testnet.sh
+- scripts/generate-env.sh
+- scripts/verify-deployment.mjs
+- tests/workspace-security.test.ts
+- vercel.json

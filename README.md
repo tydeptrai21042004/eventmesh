@@ -206,11 +206,14 @@ independent application
 + documented adopter feedback
 ```
 
-## One-project Vercel demo (v0.5 database-free preview)
+## One-project Vercel app (v0.6: Demo + Real / Testnet)
 
-The public demo deploys the Vite UI, `/api/demo`, and `/api/health` from one Vercel project **without a database service**. Vercel `/tmp` is used only as a bounded disposable cache. The browser keeps a portable signed snapshot and sends it with later mutations; a fresh serverless instance verifies the signatures and hash chain before rebuilding its cache.
+The Vercel app now exposes two intentionally different workspaces while remaining **database-free**.
 
-The standalone operator runtime is database-free as well: it stores state in an atomic JSON file (`eventmesh-state.json`) on its persistent host. Browser code never receives operator private keys or an admin token.
+- **Demo** uses deterministic preview identities derived from `DEMO_MASTER_SECRET`, supports the one-click reference flow, stores its portable signed snapshot in Local Storage, and never broadcasts a CKB transaction.
+- **Real / Testnet** is disabled by default. It requires explicit Operator A/B private keys plus a separate server-side access key. Its access credential is never persisted by the browser; its signed snapshot uses Session Storage. Automatic reference execution is disabled so each Testnet state transition is explicit.
+
+Vercel `/tmp` remains only a bounded disposable cache. The browser carries the cryptographically verified snapshot needed for cold-start recovery. The standalone operator runtime is also database-free and persists an atomic JSON state file on a persistent host.
 
 ### Generate configuration and deploy
 
@@ -220,10 +223,11 @@ chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-Only `DEMO_MASTER_SECRET` is required for the Vercel signing preview. CKB uses Testnet by default for RPC reads; broadcasting requires both a funded Testnet-only `CKB_PRIVATE_KEY` and `DEMO_ALLOW_CKB_BROADCAST=true`. A native Fiber FNN should remain on a persistent host; set `FIBER_RECEIVER_RPC_URL` to that receiver-owned node. EventMesh refuses `PAYMENT_SETTLED` when the receiver RPC cannot prove the matching paid invoice.
+For Demo, only `DEMO_MASTER_SECRET` is required. To enable the connected Testnet workspace, configure `EVENTMESH_TESTNET_MODE=true`, a 32+ character `EVENTMESH_TESTNET_ACCESS_KEY`, and dedicated `OPERATOR_A_PRIVATE_KEY` / `OPERATOR_B_PRIVATE_KEY`. CKB broadcasting additionally requires `CKB_PRIVATE_KEY` and the explicit `TESTNET_ALLOW_CKB_BROADCAST=true` opt-in.
 
-The v0.5 UI adds one-click reference execution, browser resume, cold-start reconstruction, evidence import/export, evidence verification, reconciliation notes, and transcript/chain integrity summaries.
+The v0.6 API also validates the service-flow state machine server-side, restricts event types and payload sizes, requires optimistic `eventCount + chainTip` preconditions for mutations, and rejects CKB anchoring from Demo. The UI adds deployment readiness, browser-tab fork protection, stale-state sync recovery, searchable evidence, richer exports, session expiry visibility, and clearer Demo/Testnet boundaries.
 
-See `VERCEL_DEPLOYMENT.md` for deployment, diagnostics, recovery behavior, and security boundaries.
+See `VERCEL_DEPLOYMENT.md`, `SECURITY_V06.md`, and `V06_FEATURES.md` for the deployment model, security boundary, and remaining serverless limitation.
 
-This Vercel surface is intentionally a reviewer/demo surface. Use the independent operator processes when validating multi-host behavior, and verify proof artifacts with the standalone verifier rather than screenshots.
+**Important:** Real / Testnet mode is still a controlled Testnet surface, not a production custody architecture. For production-grade independence, run the two operators as separate services with durable operator-owned storage or another coordination layer.
+

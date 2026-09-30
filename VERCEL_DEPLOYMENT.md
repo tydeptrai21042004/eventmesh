@@ -1,91 +1,92 @@
-# EventMesh on Vercel — one project, no database
+# EventMesh v0.6 — one-project Vercel deployment
 
-EventMesh v0.5 deploys the Vite frontend and `/api/*` functions as one Vercel project **without Postgres, Neon, Blob, SQLite, or another database service**.
+EventMesh deploys the Vite frontend plus `/api/demo` and `/api/health` as one Vercel project **without Postgres, Neon, Blob, SQLite, or another database service**.
 
-The preview uses two layers of state:
+## Workspace 1 — Demo
 
-1. a bounded `/tmp/eventmesh-preview-state.json` cache inside the current serverless instance; and
-2. a portable signed snapshot stored in the browser and attached to later mutations.
+Required environment variable:
 
-If Vercel starts a fresh instance, the API verifies the session signatures, event/ACK signatures, hash chain, close commitment, and participant identities before reconstructing the disposable cache. The server therefore does not treat client JSON as trusted state.
-
-> This is a preview/reviewer deployment model. It is not a substitute for durable multi-party production storage. The standalone operator service uses an atomic JSON file on its persistent host.
-
-## 1. Required variable
-
-```bash
-DEMO_MASTER_SECRET=<at least 32 characters; preferably 32 random bytes as hex>
+```env
+DEMO_MASTER_SECRET=<32+ random characters>
 ```
 
-The secret keeps the two demo signing identities stable across Vercel instances. Operator private keys are derived server-side when explicit operator keys are not supplied; they are never sent to the browser.
+Recommended:
 
-## 2. Optional CKB Testnet / Fiber variables
+```env
+DEMO_RATE_LIMIT_PER_MINUTE=60
+DEMO_STATE_MAX_BYTES=4194304
+EVENTMESH_PUBLIC_ORIGIN=https://your-app.vercel.app
+```
 
-```bash
+Demo uses deterministic server-side preview identities. The browser stores the signed portable snapshot in Local Storage so a refresh can resume the walkthrough. The one-click reference flow is available only here. CKB broadcasting is rejected from Demo.
+
+## Workspace 2 — Real / Testnet
+
+The connected workspace is **off by default**. Enable it only with dedicated Testnet credentials:
+
+```env
+EVENTMESH_TESTNET_MODE=true
+EVENTMESH_TESTNET_ACCESS_KEY=<separate 32+ random characters>
+TESTNET_RATE_LIMIT_PER_MINUTE=30
+OPERATOR_A_PRIVATE_KEY=0x...
+OPERATOR_B_PRIVATE_KEY=0x...
+```
+
+The browser asks for the access key and keeps it in React memory only. It is sent in the `x-eventmesh-access-key` request header and is not written to Local Storage or Session Storage. The Testnet signed snapshot itself uses Session Storage.
+
+### CKB Testnet
+
+Read-only RPC access uses the public Testnet endpoint by default:
+
+```env
 CKB_RPC_URL=https://testnet.ckbapp.dev/
-CKB_PRIVATE_KEY=
-DEMO_ALLOW_CKB_BROADCAST=false
-CKB_ANCHOR_CAPACITY_CKB=220
-
-FIBER_RECEIVER_RPC_URL=
-FIBER_RECEIVER_RPC_TOKEN=
 ```
 
-`PAYMENT_SETTLED` remains fail-closed unless the receiver-side Fiber RPC independently verifies the claim. CKB broadcast remains disabled unless `DEMO_ALLOW_CKB_BROADCAST=true` and a Testnet-only key is configured.
+Broadcasting stays off unless both are set:
 
-## 3. Local setup
+```env
+CKB_PRIVATE_KEY=0x...
+TESTNET_ALLOW_CKB_BROADCAST=true
+```
+
+Before broadcasting, EventMesh persists the deterministic transaction hash/commitment identity in its cache. Ambiguous submission states must be reconciled by transaction hash rather than blindly retried.
+
+### Fiber
+
+Optional receiver-side verification:
+
+```env
+FIBER_RECEIVER_RPC_URL=https://receiver-fnn.example
+FIBER_RECEIVER_RPC_TOKEN=<optional bearer token>
+```
+
+`PAYMENT_SETTLED` remains fail-closed unless the receiver-side Fiber RPC independently proves the matching paid invoice.
+
+## Deploy
 
 ```bash
-chmod +x scripts/generate-env.sh scripts/deploy-vercel-testnet.sh
 ./scripts/generate-env.sh
-npm install
-npm run check
-```
-
-Local development writes `.data/eventmesh-demo-state.json`. The standalone operator writes `eventmesh-state.json` inside its configured data directory.
-
-## 4. Deploy
-
-```bash
 ./scripts/deploy-vercel-testnet.sh
 ```
 
-The script runs checks, pushes the non-database environment variables, deploys, probes deep health, then performs a signed create → event → portable verification → close → final verification flow.
+or import the repository into Vercel and set the same variables manually. `vercel.json` already points at the one-project Vite build and the two API functions.
 
-## 5. Health checks
+## Database-free recovery model
 
-- `GET /api/health` — lightweight signing-service readiness.
-- `GET /api/health?deep=1` — preview-cache write check plus CKB/Fiber connectivity diagnostics.
-- `GET /api/demo` — protocol, identities, capabilities, and storage mode.
+`/tmp/eventmesh-preview-state.json` is only a bounded disposable cache. On a cold start, later requests carry the browser's signed snapshot. The API verifies the session signatures, event hashes, previous-hash links, ACKs, final commitment, and configured operator identities before reconstructing cache state.
 
-Expected preview storage metadata:
+Mutations also carry an expected event count and expected chain tip. A stale browser state receives HTTP `409` / `STATE_PRECONDITION_FAILED` rather than silently extending a different chain. The UI offers **Sync now** and a same-browser edit lease to reduce accidental forks.
 
-```json
-{
-  "storage": {
-    "mode": "ephemeral-preview",
-    "durable": false,
-    "portableRecovery": true
-  }
-}
-```
+## Important serverless limitation
 
-A `durable: false` value is intentional. The UI says "Database-free preview" rather than claiming server-side durability.
+Without a shared durable coordination service, two different clients can still submit competing next events from the exact same valid snapshot to different cold Vercel instances. Both descendants can be cryptographically valid. This is detectable as a fork, but cannot be globally serialized without shared coordination.
 
-## 6. New preview features
+Therefore **Real / Testnet is a controlled Testnet surface, not production custody infrastructure**. For production-grade bilateral independence, run separate operator services and durable operator-owned storage or another consensus/coordination layer.
 
-- automatic browser resume after refresh;
-- signed snapshot reconstruction after Vercel cold starts;
-- one-click full reference flow;
-- server-side evidence verification;
-- JSON import/export;
-- reconciliation notes;
-- transcript-root and chain-tip display;
-- optional Fiber verification;
-- optional CKB Testnet checkpointing/reconciliation.
+## Diagnostics
 
-## 7. Security boundary
-
-The portable snapshot is **not trusted merely because it came from localStorage or an imported JSON file**. Before restoration the API verifies the bilateral signed session and full event chain with `verifyTranscript`, checks that both participant public keys are the configured preview identities, rejects conflicting history, and prevents a warm cache from being rolled back to a shorter chain.
-
-The public preview is still intentionally unauthenticated at the end-user layer. Same-origin checks and rate limits are abuse controls, not application identity. Do not use production funds or production signing keys.
+- `GET /api/health` — fast app readiness.
+- `GET /api/health?deep=1` — writable cache, CKB RPC, Fiber RPC, Testnet workspace and broadcaster readiness.
+- UI → **Real / Testnet** → **Deployment readiness** — operator-facing summary.
+- UI → **Verify current evidence** — re-runs transcript verification.
+- UI → **Export JSON** — portable verification artifact with a v2 export manifest.
