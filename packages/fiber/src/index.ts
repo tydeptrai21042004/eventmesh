@@ -194,10 +194,12 @@ export class FiberRpcClient {
     if (parsedClaim.obligationId && !descriptions.includes(`eventmesh-obligation:${parsedClaim.obligationId}`)) {
       return { ok: false, reason: "FIBER_OBLIGATION_BINDING_MISMATCH", invoice: result };
     }
-    if (parsedClaim.settlesEventHash && !descriptions.some((value) => value.toLowerCase() === `eventmesh-settles:${parsedClaim.settlesEventHash.toLowerCase()}`)) {
+    const settlesEventHash = parsedClaim.settlesEventHash;
+    if (settlesEventHash && !descriptions.some((value) => value.toLowerCase() === `eventmesh-settles:${settlesEventHash.toLowerCase()}`)) {
       return { ok: false, reason: "FIBER_SETTLED_EVENT_BINDING_MISMATCH", invoice: result };
     }
-    if (parsedClaim.purposeHash && !descriptions.some((value) => value.toLowerCase() === `eventmesh-purpose:${parsedClaim.purposeHash.toLowerCase()}`)) {
+    const purposeHash = parsedClaim.purposeHash;
+    if (purposeHash && !descriptions.some((value) => value.toLowerCase() === `eventmesh-purpose:${purposeHash.toLowerCase()}`)) {
       return { ok: false, reason: "FIBER_PURPOSE_BINDING_MISMATCH", invoice: result };
     }
 
