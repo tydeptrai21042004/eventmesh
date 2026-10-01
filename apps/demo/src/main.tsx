@@ -661,7 +661,7 @@ function App() {
             {capabilities.fiberPayments ? <>
               <label>Payment hash<input value={paymentHash} spellCheck={false} onChange={e => setPaymentHash(e.target.value)}/></label>
               <div className="grid two compact"><label>Amount<input value={amount} onChange={e => setAmount(e.target.value)}/></label><label>Currency<select value={currency} onChange={e => setCurrency(e.target.value)}><option>Fibt</option><option>Fibb</option><option>Fibd</option></select></label></div>
-              <button disabled={mutateBlocked || has("PAYMENT_SETTLED") || closed || !has("SERVICE_ACCEPTED")} onClick={settle}>{has("PAYMENT_SETTLED") ? "Payment verified" : "Verify receiver payment proof"}</button>
+              <button disabled={mutateBlocked || has("PAYMENT_SETTLED") || has("SESSION_COMPLETED") || closed || !has("RESULT_COMMITTED")} onClick={settle}>{has("PAYMENT_SETTLED") ? "Payment verified" : "Verify receiver payment proof"}</button>
             </> : <p className="subtle">Receiver-side Fiber verification is disabled. EventMesh will not manufacture a PAYMENT_SETTLED event.</p>}
           </article>
 

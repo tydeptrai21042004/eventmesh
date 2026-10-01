@@ -1,4 +1,4 @@
-# EventMesh v0.2 Protocol
+# EventMesh v0.2 Wire Protocol + Commitment v3
 
 ## 1. Scope
 
@@ -16,7 +16,7 @@ EventMesh/eventmesh-v0.2.0/close
 EventMesh/eventmesh-v0.2.0/payment-evidence
 ```
 
-The stable protocol evidence includes `SignedSession`, `SignedEvent`, `SignedAck`, `SignedClose`, and receiver-signed Fiber observations. The CKB anchor domain remains `EVENTMESH_V02` for compatibility.
+The stable protocol evidence includes `SignedSession`, `SignedEvent`, `SignedAck`, `SignedClose`, and receiver-signed Fiber observations. Legacy sessions/closes remain readable as v0.2 evidence. New profiled sessions add a `commitmentVersion: 3` close layer and use the `EVENTMESH_V03` CKB commitment domain.
 
 ## 3. Session/event rules
 
@@ -83,19 +83,26 @@ After receiver FNN verification, the receiving EventMesh operator signs:
 }
 ```
 
-The ACCEPTing ACK operator and the observation signer must be the same session participant. New exports include this signed observation and verification rejects missing, mismatched, or tampered evidence when the evidence section is present. Historical v0.2 exports without an evidence section remain verifiable for backward compatibility, but do not receive this stronger observation-authentication guarantee.
+The ACCEPTing ACK operator and the observation signer must be the same session participant. For commitment v3, the PAYMENT_SETTLED ACK additionally contains the exact `evidenceHash`; the close commits a Merkle root over the complete signed observations. Removing or replacing the evidence therefore invalidates the v3 proof. Historical v0.2 exports without this binding remain verifiable for backward compatibility, but do not receive the v3 observation-commitment guarantee.
 
-## 6. v0.2 payment claim commitment
+## 6. Payment claim and receiver-observation commitments
 
 For every accepted `PAYMENT_SETTLED` claim:
 
 ```text
-leaf = SHA256(canonical(FiberPaymentClaim))
+claimLeaf = SHA256(canonical(FiberPaymentClaim))
 ```
 
-Claims are sorted by payment hash and Merkleized into `paymentEvidenceRoot`. This commits amount, currency, session, UDT and any obligation/result/purpose/payee claim fields.
+Claims are sorted by payment hash and Merkleized into the legacy-compatible `paymentEvidenceRoot`.
 
-For wire compatibility, `EVENTMESH_V02` does **not** additionally commit the receiver-observation signature. That signed observation travels in the transcript and is independently verified. A future anchor version can add a dedicated signed-observation root.
+Commitment v3 additionally computes:
+
+```text
+observationLeaf = SHA256(canonical(SignedFiberPaymentEvidence))
+paymentObservationRoot = MerkleRoot(sorted observationLeaf values)
+```
+
+Every accepted payment ACK must bind the corresponding signed observation through `ack.evidenceHash`. A v3 verifier therefore rejects a proof if signed receiver evidence is removed, substituted, signed by the wrong operator, or detached from its ACK.
 
 ## 7. Durable delivery and reconciliation
 
@@ -111,11 +118,22 @@ Repeated delivery is idempotent. `/peer/sessions/:id/head` exposes only reconcil
 
 ## 8. Close
 
-The close commits to `sessionId`, `eventCount`, `transcriptRoot`, `finalStateHash`, `fiberPayments[]`, `paymentEvidenceRoot`, and `closedAt`. Both A and B independently recompute roots before signing the same close body.
+Legacy v0.2 closes commit `sessionId`, `eventCount`, `transcriptRoot`, `finalStateHash`, `fiberPayments[]`, `paymentEvidenceRoot`, and `closedAt`.
+
+New profiled sessions produce commitment-v3 closes that additionally commit:
+
+```text
+commitmentVersion = 3
+paymentObservationRoot
+applicationProfileHash
+chainContextHash
+```
+
+The application profile (`id`, `version`, `rulesHash`) is signed into the session. Both operators validate the transcript under that exact profile and independently derive the final application state before signing the same close body. Caller-supplied final-state JSON is not authoritative for profiled sessions.
 
 ## 9. CKB commitment and lifecycle
 
-Canonical output data remains:
+Legacy close output data remains:
 
 ```text
 EVENTMESH_V02
@@ -125,7 +143,22 @@ EVENTMESH_V02
 || paymentEvidenceRoot
 ```
 
-Anchor lifecycle:
+Commitment-v3 output data is:
+
+```text
+EVENTMESH_V03
+|| SHA256(sessionId)
+|| transcriptRoot
+|| finalStateHash
+|| paymentEvidenceRoot
+|| paymentObservationRoot
+|| applicationProfileHash
+|| chainContextHash
+```
+
+The v3 payload is 237 bytes, so a standard secp output needs at least 298 CKB under the adapter's capacity calculation. The adapter automatically raises the requested capacity when necessary.
+
+Anchor lifecycle remains:
 
 ```text
 prepare/sign -> persist deterministic txHash -> broadcast -> PENDING
@@ -136,4 +169,16 @@ A timeout after broadcast is treated as ambiguous. Recovery queries the persiste
 
 ## 10. Adapter boundary
 
-Application-specific semantics live outside core in an `EventMeshAdapter`. An adapter may validate event ordering/payloads and derive a final application state, but cannot weaken session signatures, ACK rules, Fiber receiver verification, or CKB commitment verification.
+Application-specific semantics live outside core in an `EventMeshAdapter`. New sessions sign the selected application profile and its `rulesHash`. The operator and independent verifier both enforce the profile.
+
+The built-in paid-service profile enforces role ownership and ordering:
+
+```text
+A: SERVICE_REQUESTED
+B: SERVICE_ACCEPTED
+B: RESULT_COMMITTED
+A: PAYMENT_SETTLED (optional, receiver-FNN verified by B)
+B: SESSION_COMPLETED
+```
+
+When a payment is present it is bound to the request ID, the exact RESULT_COMMITTED event hash, and a canonical purpose hash. The final state is derived deterministically from the accepted transcript.

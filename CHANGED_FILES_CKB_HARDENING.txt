@@ -1,0 +1,17 @@
+README.md
+api/demo.ts
+apps/demo/src/main.tsx
+apps/operator/package.json
+apps/operator/src/app.ts
+apps/verifier/src/index.ts
+docs/HOW_TO_VERIFY.md
+docs/PRODUCTION_READINESS.md
+docs/PROTOCOL.md
+packages/adapter-sdk/src/index.ts
+packages/adapter-sdk/src/paid-service.ts
+packages/ckb/src/index.ts
+packages/core/src/index.ts
+tests/adapter.test.ts
+tests/ckb.test.ts
+tests/core.test.ts
+tests/operator.integration.test.ts

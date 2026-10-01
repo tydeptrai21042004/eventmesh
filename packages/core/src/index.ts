@@ -6,6 +6,8 @@ import { z } from "zod";
 export const ZERO_HASH = `0x${"00".repeat(32)}`;
 export const PROTOCOL = "eventmesh-v0.2.0";
 export const ANCHOR_DOMAIN = "EVENTMESH_V02";
+export const ANCHOR_DOMAIN_V3 = "EVENTMESH_V03";
+export const CLOSE_COMMITMENT_VERSION = 3 as const;
 export const SIGNING_DOMAIN = {
   SESSION: "session",
   EVENT: "event",
@@ -29,10 +31,27 @@ export const CkbScriptSchema = z.object({
 }).strict();
 export type CkbScript = z.infer<typeof CkbScriptSchema>;
 
+export const ApplicationProfileSchema = z.object({
+  id: z.string().min(1).max(80),
+  version: z.string().min(1).max(40),
+  rulesHash: H32
+}).strict();
+export type ApplicationProfile = z.infer<typeof ApplicationProfileSchema>;
+
+export const ChainContextSchema = z.object({
+  ckbNetwork: z.enum(["mainnet", "testnet", "devnet"]),
+  ckbGenesisHash: H32.optional(),
+  fiberNetwork: z.string().min(1).max(80).optional(),
+  fiberChainHash: H32.optional()
+}).strict();
+export type ChainContext = z.infer<typeof ChainContextSchema>;
+
 export const SessionSchema = z.object({
   sessionId: z.string().min(1).max(128),
   protocol: z.literal(PROTOCOL),
   environment: z.enum(["DEMO", "TESTNET"]).optional(),
+  applicationProfile: ApplicationProfileSchema.optional(),
+  chainContext: ChainContextSchema.optional(),
   operatorA: Pub,
   operatorB: Pub,
   operatorAUrl: z.string().url(),
@@ -74,6 +93,9 @@ export const AckBodySchema = z.object({
   eventHash: H32,
   decision: z.enum(["ACCEPT", "REJECT"]),
   operator: Pub,
+  // For PAYMENT_SETTLED, new operators bind the exact receiver-owned
+  // observation into the ACK instead of treating it as detachable metadata.
+  evidenceHash: H32.optional(),
   createdAt: z.string().datetime()
 });
 export type AckBody = z.infer<typeof AckBodySchema>;
@@ -148,12 +170,18 @@ export const SignedFiberPaymentEvidenceSchema = z.object({
 export type SignedFiberPaymentEvidence = z.infer<typeof SignedFiberPaymentEvidenceSchema>;
 
 export const CloseBodySchema = z.object({
+  // Legacy v0.2 closes omit commitmentVersion and the v3 extension roots.
+  // New closes set version 3 and commit receiver observations + protocol context.
+  commitmentVersion: z.literal(CLOSE_COMMITMENT_VERSION).optional(),
   sessionId: z.string().min(1),
   eventCount: z.number().int().nonnegative(),
   transcriptRoot: H32,
   finalStateHash: H32,
   fiberPayments: z.array(H32),
   paymentEvidenceRoot: H32,
+  paymentObservationRoot: H32.optional(),
+  applicationProfileHash: H32.optional(),
+  chainContextHash: H32.optional(),
   closedAt: z.string().datetime()
 });
 export type CloseBody = z.infer<typeof CloseBodySchema>;
@@ -194,6 +222,14 @@ export function sha256Hex(value: string | Uint8Array) {
   hash.update(value);
   return `0x${hash.digest("hex")}`;
 }
+export const GENERIC_BILATERAL_PROFILE: ApplicationProfile = {
+  id: "generic-bilateral",
+  version: "1.0.0",
+  rulesHash: sha256Hex(canonical({
+    domain: "EventMesh/GenericBilateralProfile/v1",
+    semantics: "all accepted signed events are summarized deterministically; no application-specific interpretation"
+  }))
+};
 export const strip0x = (value: string) => value.startsWith("0x") ? value.slice(2) : value;
 export const bytesToHex = (bytes: Uint8Array) => `0x${Buffer.from(bytes).toString("hex")}`;
 export const hexToBytes = (hex: string) => Uint8Array.from(Buffer.from(strip0x(hex), "hex"));
@@ -307,6 +343,21 @@ export const computeTranscriptRoot = (items: Array<{ event: SignedEvent; ack: Si
     .sort((a, b) => a.event.sequence - b.event.sequence)
     .map((item) => transcriptLeaf(item.event, item.ack)));
 export const finalStateHashFrom = (value: unknown) => sha256Hex(canonical(value));
+export const applicationProfileHashFrom = (session: Pick<Session, "applicationProfile">) =>
+  sha256Hex(canonical(session.applicationProfile ?? null));
+export const chainContextHashFrom = (session: Pick<Session, "chainContext">) =>
+  sha256Hex(canonical(session.chainContext ?? null));
+
+export function deriveGenericBilateralFinalState(items: Array<{ event: SignedEvent; ack: SignedAck }>) {
+  const ordered = [...items].sort((a, b) => a.event.sequence - b.event.sequence);
+  return {
+    kind: "generic-bilateral",
+    eventCount: ordered.length,
+    acceptedEventHashes: ordered.map((item) => item.event.eventHash.toLowerCase()),
+    lastEventHash: ordered.at(-1)?.event.eventHash.toLowerCase() ?? ZERO_HASH,
+    transcriptRoot: computeTranscriptRoot(ordered)
+  } as const;
+}
 
 export function acceptedFiberPaymentClaims(items: Array<{ event: SignedEvent; ack?: SignedAck }>) {
   const claims = new Map<string, FiberPaymentClaim>();
@@ -325,19 +376,34 @@ export const paymentEvidenceLeaf = (claim: FiberPaymentClaim) => sha256Hex(canon
 export const computePaymentEvidenceRoot = (items: Array<{ event: SignedEvent; ack?: SignedAck }>) =>
   merkleRoot(acceptedFiberPaymentClaims(items).map(paymentEvidenceLeaf));
 
+export type AnchorCommitmentExtensionsV3 = {
+  paymentObservationRoot: string;
+  applicationProfileHash: string;
+  chainContextHash: string;
+};
+
 export function buildAnchorDataHex(
   sessionId: string,
   transcriptRoot: string,
   finalStateHash: string,
-  paymentEvidenceRoot: string
+  paymentEvidenceRoot: string,
+  extensions?: AnchorCommitmentExtensionsV3
 ) {
-  return `0x${Buffer.concat([
-    Buffer.from(ANCHOR_DOMAIN),
+  const chunks = [
+    Buffer.from(extensions ? ANCHOR_DOMAIN_V3 : ANCHOR_DOMAIN),
     Buffer.from(strip0x(sha256Hex(sessionId)), "hex"),
     Buffer.from(strip0x(transcriptRoot), "hex"),
     Buffer.from(strip0x(finalStateHash), "hex"),
     Buffer.from(strip0x(paymentEvidenceRoot), "hex")
-  ]).toString("hex")}`;
+  ];
+  if (extensions) {
+    chunks.push(
+      Buffer.from(strip0x(extensions.paymentObservationRoot), "hex"),
+      Buffer.from(strip0x(extensions.applicationProfileHash), "hex"),
+      Buffer.from(strip0x(extensions.chainContextHash), "hex")
+    );
+  }
+  return `0x${Buffer.concat(chunks).toString("hex")}`;
 }
 
 export function verifyTranscript(transcript: TranscriptExport) {
@@ -428,6 +494,9 @@ export function verifyTranscript(transcript: TranscriptExport) {
             const expectedObserver = ack.operator;
             if (observed.observer !== expectedObserver) errors.push(`Fiber payment evidence signed by wrong operator at event ${event.sequence}`);
             if (canonical(observed.evidence.claim) !== canonical(claim.data)) errors.push(`Fiber payment evidence claim mismatch at event ${event.sequence}`);
+            if (ack.evidenceHash && ack.evidenceHash.toLowerCase() !== observed.evidenceHash.toLowerCase()) {
+              errors.push(`ACK payment evidence hash mismatch at event ${event.sequence}`);
+            }
           } else if (legacyObserved) {
             if (canonical(legacyObserved.claim) !== canonical(claim.data)) errors.push(`Legacy Fiber payment evidence claim mismatch at event ${event.sequence}`);
           } else if (hasEvidenceSection) {
@@ -458,6 +527,39 @@ export function verifyTranscript(transcript: TranscriptExport) {
       if (computePaymentEvidenceRoot(finalItems).toLowerCase() !== close.paymentEvidenceRoot.toLowerCase()) {
         errors.push("Close paymentEvidenceRoot mismatch");
       }
+      if (close.commitmentVersion === CLOSE_COMMITMENT_VERSION) {
+        if (!session.applicationProfile) errors.push("Close commitment v3 requires a signed applicationProfile");
+        if (!session.chainContext) errors.push("Close commitment v3 requires a signed chainContext");
+        const acceptedPayments = acceptedFiberPaymentHashes(finalItems);
+        const observedForAccepted = acceptedPayments
+          .map((paymentHash) => signedEvidenceByPayment.get(paymentHash))
+          .filter((value): value is SignedFiberPaymentEvidence => !!value);
+        if (!close.paymentObservationRoot) {
+          errors.push("Close paymentObservationRoot missing for commitment v3");
+        } else if (observedForAccepted.length !== acceptedPayments.length) {
+          errors.push("Close commitment v3 requires signed receiver evidence for every accepted payment");
+        } else if (computeSignedPaymentEvidenceRoot(observedForAccepted).toLowerCase() !== close.paymentObservationRoot.toLowerCase()) {
+          errors.push("Close paymentObservationRoot mismatch");
+        }
+        for (const item of finalItems) {
+          if (item.event.type !== "PAYMENT_SETTLED" || item.ack.decision !== "ACCEPT") continue;
+          const claim = FiberPaymentClaimSchema.safeParse(item.event.payload);
+          if (!claim.success) continue;
+          const observed = signedEvidenceByPayment.get(claim.data.paymentHash.toLowerCase());
+          if (!item.ack.evidenceHash) errors.push(`PAYMENT_SETTLED ACK missing evidenceHash at event ${item.event.sequence}`);
+          else if (observed && item.ack.evidenceHash.toLowerCase() !== observed.evidenceHash.toLowerCase()) {
+            errors.push(`PAYMENT_SETTLED ACK evidenceHash mismatch at event ${item.event.sequence}`);
+          }
+        }
+        const expectedProfileHash = applicationProfileHashFrom(session);
+        const expectedChainHash = chainContextHashFrom(session);
+        if (!close.applicationProfileHash || close.applicationProfileHash.toLowerCase() !== expectedProfileHash.toLowerCase()) {
+          errors.push("Close applicationProfileHash mismatch");
+        }
+        if (!close.chainContextHash || close.chainContextHash.toLowerCase() !== expectedChainHash.toLowerCase()) {
+          errors.push("Close chainContextHash mismatch");
+        }
+      }
       if (finalState !== undefined && finalStateHashFrom(finalState).toLowerCase() !== close.finalStateHash.toLowerCase()) {
         errors.push("Close finalStateHash mismatch");
       }
@@ -473,7 +575,17 @@ export function verifyTranscript(transcript: TranscriptExport) {
           session.sessionId,
           close.transcriptRoot,
           close.finalStateHash,
-          close.paymentEvidenceRoot
+          close.paymentEvidenceRoot,
+          close.commitmentVersion === CLOSE_COMMITMENT_VERSION
+            && close.paymentObservationRoot
+            && close.applicationProfileHash
+            && close.chainContextHash
+            ? {
+                paymentObservationRoot: close.paymentObservationRoot,
+                applicationProfileHash: close.applicationProfileHash,
+                chainContextHash: close.chainContextHash
+              }
+            : undefined
         );
         if (transcript.ckbAnchor.dataHex.toLowerCase() !== expectedAnchor.toLowerCase()) {
           errors.push("CKB anchor data does not match close commitment");

@@ -68,8 +68,11 @@ No shared database is the source of truth. No sender-side "payment success" asse
 - payment hash + session + amount + currency + optional UDT script binding;
 - optional obligation/result/purpose/payee binding for multi-job and milestone sessions;
 - receiver FNN observations signed by the receiving EventMesh operator;
-- deterministic `paymentEvidenceRoot` in the dual-signed close;
-- `EVENTMESH_V02` CKB commitment with tx identity persisted before broadcast;
+- legacy-compatible `paymentEvidenceRoot` plus commitment-v3 `paymentObservationRoot`;
+- PAYMENT_SETTLED ACKs bind the exact receiver-signed observation through `evidenceHash`;
+- signed application profile/rules hash + chain context on new sessions;
+- deterministic final-state derivation on both operators for profiled sessions;
+- backward-compatible `EVENTMESH_V02` plus strengthened `EVENTMESH_V03` CKB commitments, with tx identity persisted before broadcast;
 - configurable PENDING → COMMITTED → CONFIRMED reconciliation depth;
 - independent CKB `get_transaction` verification;
 - standalone transcript/Fiber/CKB verifier;
@@ -181,6 +184,8 @@ The structural check requires the published session ID, independent operator URL
 
 ## CKB commitment
 
+Legacy proofs retain:
+
 ```text
 EVENTMESH_V02
 || SHA256(sessionId)
@@ -189,9 +194,20 @@ EVENTMESH_V02
 || paymentEvidenceRoot
 ```
 
-The verifier derives these bytes itself and accepts an anchor only after CKB reports the transaction committed and the exact output data is present.
+New profiled sessions use commitment v3:
 
-v0.2 uses one commitment per proof session for clarity. A later production design should batch multiple session commitments into a higher-level root if on-chain capacity becomes material; per-event on-chain storage is explicitly out of scope.
+```text
+EVENTMESH_V03
+|| SHA256(sessionId)
+|| transcriptRoot
+|| finalStateHash
+|| paymentEvidenceRoot
+|| paymentObservationRoot
+|| applicationProfileHash
+|| chainContextHash
+```
+
+The verifier derives these bytes itself and accepts an anchor only after CKB reports the transaction committed and the exact output data is present. Direct per-session anchoring remains the reference implementation; batching/rolling anchors remain a later capacity optimization.
 
 ## Adapter boundary
 

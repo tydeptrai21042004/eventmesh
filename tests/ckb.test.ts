@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { inspectAnchorRpc, minimumStandardSecpOutputCapacityCkb } from "@eventmesh/ckb";
-import { buildAnchorDataHex, computePaymentEvidenceRoot, computeTranscriptRoot, finalStateHashFrom } from "@eventmesh/core";
+import { buildAnchorDataHex, computePaymentEvidenceRoot, computeTranscriptRoot, finalStateHashFrom, sha256Hex } from "@eventmesh/core";
 
 const txHash = `0x${"55".repeat(32)}`;
 const dataHex = `0x${"66".repeat(64)}`;
@@ -16,6 +16,17 @@ describe("CKB anchor verification", () => {
     const v02 = buildAnchorDataHex("ses_capacity", computeTranscriptRoot([]), finalStateHashFrom({}), computePaymentEvidenceRoot([]));
     expect((v02.length - 2) / 2).toBe(141);
     expect(minimumStandardSecpOutputCapacityCkb(v02)).toBe(202);
+  });
+
+  it("accounts for v3 commitment occupied capacity", () => {
+    const empty = computeTranscriptRoot([]);
+    const v3 = buildAnchorDataHex("ses_capacity_v3", empty, finalStateHashFrom({}), computePaymentEvidenceRoot([]), {
+      paymentObservationRoot: sha256Hex("observations"),
+      applicationProfileHash: sha256Hex("profile"),
+      chainContextHash: sha256Hex("chain")
+    });
+    expect((v3.length - 2) / 2).toBe(237);
+    expect(minimumStandardSecpOutputCapacityCkb(v3)).toBe(298);
   });
 
   it("requires committed status and exact output data", async () => {

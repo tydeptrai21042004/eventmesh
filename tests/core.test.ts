@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
   ANCHOR_DOMAIN,
+  ANCHOR_DOMAIN_V3,
+  CLOSE_COMMITMENT_VERSION,
+  GENERIC_BILATERAL_PROFILE,
   PROTOCOL,
   SIGNING_DOMAIN,
   ZERO_HASH,
   acceptedFiberPaymentHashes,
+  applicationProfileHashFrom,
   buildAnchorDataHex,
+  chainContextHashFrom,
   computeFiberPaymentPurposeHash,
   computePaymentEvidenceRoot,
+  computeSignedPaymentEvidenceRoot,
   computeTranscriptRoot,
   createSessionId,
+  deriveGenericBilateralFinalState,
   finalStateHashFrom,
   publicKeyFromPrivate,
   randomPrivateKeyHex,
@@ -58,6 +65,7 @@ describe("EventMesh v0.2 core", () => {
   it("uses the v0.2 protocol and anchor domain", () => {
     expect(PROTOCOL).toBe("eventmesh-v0.2.0");
     expect(ANCHOR_DOMAIN).toBe("EVENTMESH_V02");
+    expect(ANCHOR_DOMAIN_V3).toBe("EVENTMESH_V03");
   });
 
   it("domain-separates signatures", () => {
@@ -154,6 +162,84 @@ describe("EventMesh v0.2 core", () => {
     const tamperedEvidence = tampered.paymentEvidence![0] as any;
     tamperedEvidence.evidence.payeePublicKey = "02attacker";
     expect(verifyTranscript(tampered).errors).toContain("Invalid signed Fiber payment evidence");
+  });
+
+  it("v3 close commits signed receiver evidence, ACK evidenceHash, profile, and chain context", () => {
+    const f = fixture();
+    f.session.applicationProfile = GENERIC_BILATERAL_PROFILE;
+    f.session.chainContext = { ckbNetwork: "testnet", fiberNetwork: "fiber" };
+    const claim: FiberPaymentClaim = {
+      paymentHash: `0x${"71".repeat(32)}`,
+      sessionId: f.session.sessionId,
+      amount: "100000000",
+      currency: "Fibt"
+    };
+    const event = signEvent({
+      sessionId: f.session.sessionId,
+      sequence: 1,
+      previousHash: ZERO_HASH,
+      type: "PAYMENT_SETTLED",
+      payload: claim,
+      sender: f.a,
+      createdAt: new Date().toISOString()
+    }, f.aPriv);
+    const evidence = signFiberPaymentEvidence({
+      claim,
+      verifier: "RECEIVER_FNN",
+      verifiedAt: new Date().toISOString(),
+      invoiceStatus: "Paid"
+    }, f.b, f.bPriv);
+    const ack = signAck({
+      eventHash: event.eventHash,
+      decision: "ACCEPT",
+      operator: f.b,
+      evidenceHash: evidence.evidenceHash,
+      createdAt: new Date().toISOString()
+    }, f.bPriv);
+    const items = [{ event, ack }];
+    const finalState = deriveGenericBilateralFinalState(items);
+    const close = {
+      commitmentVersion: CLOSE_COMMITMENT_VERSION,
+      sessionId: f.session.sessionId,
+      eventCount: 1,
+      transcriptRoot: computeTranscriptRoot(items),
+      finalStateHash: finalStateHashFrom(finalState),
+      fiberPayments: acceptedFiberPaymentHashes(items),
+      paymentEvidenceRoot: computePaymentEvidenceRoot(items),
+      paymentObservationRoot: computeSignedPaymentEvidenceRoot([evidence]),
+      applicationProfileHash: applicationProfileHashFrom(f.session),
+      chainContextHash: chainContextHashFrom(f.session),
+      closedAt: new Date().toISOString()
+    } as const;
+    const extensions = {
+      paymentObservationRoot: close.paymentObservationRoot,
+      applicationProfileHash: close.applicationProfileHash,
+      chainContextHash: close.chainContextHash
+    };
+    const transcript: TranscriptExport = {
+      session: signedSession(f),
+      events: items,
+      paymentEvidence: [evidence],
+      close: {
+        close,
+        finalState,
+        signatureA: signProtocolObject(SIGNING_DOMAIN.CLOSE, close, f.aPriv),
+        signatureB: signProtocolObject(SIGNING_DOMAIN.CLOSE, close, f.bPriv)
+      },
+      ckbAnchor: {
+        txHash: `0x${"72".repeat(32)}`,
+        dataHex: buildAnchorDataHex(f.session.sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot, extensions)
+      }
+    };
+    expect(verifyTranscript(transcript)).toEqual({ ok: true, errors: [] });
+
+    const stripped = structuredClone(transcript);
+    delete stripped.paymentEvidence;
+    expect(verifyTranscript(stripped).errors).toContain("Close commitment v3 requires signed receiver evidence for every accepted payment");
+
+    const detached = structuredClone(transcript);
+    delete detached.events[0].ack!.evidenceHash;
+    expect(verifyTranscript(detached).errors).toContain("PAYMENT_SETTLED ACK missing evidenceHash at event 1");
   });
 
   it("validates a dual-signed close and v0.2 CKB commitment", () => {

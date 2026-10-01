@@ -1,0 +1,90 @@
+{
+  "generated": "2026-10-01",
+  "changed_files": [
+    {
+      "path": "README.md",
+      "sha256": "61455f24e6a3e41804e2741d5d0087a6f9d3b3f71e15d0d8c429dd7fe44c30d0",
+      "bytes": 13354
+    },
+    {
+      "path": "api/demo.ts",
+      "sha256": "e6ee09b9aa4fb1a9848a778f67e8608fd196061a39201d1d64a72ac37bf1c4e0",
+      "bytes": 46547
+    },
+    {
+      "path": "apps/demo/src/main.tsx",
+      "sha256": "9e8203c0fe84e0c3087c5912ae9941ba1404af73b9d16102f7b4de323c3c698a",
+      "bytes": 43506
+    },
+    {
+      "path": "apps/operator/package.json",
+      "sha256": "afed27d3a574392837979963441e3942009518536a5e8e4f6be4829548154b00",
+      "bytes": 331
+    },
+    {
+      "path": "apps/operator/src/app.ts",
+      "sha256": "ca7b50c2b934c496a5a5b3b29366d5f8b4c24b87b57fd9e75d20145203a70d19",
+      "bytes": 66232
+    },
+    {
+      "path": "apps/verifier/src/index.ts",
+      "sha256": "acf3708551c48dc0d094603b61e6aa38bca39c10eef1b014c06683c78de1e7ce",
+      "bytes": 8400
+    },
+    {
+      "path": "docs/HOW_TO_VERIFY.md",
+      "sha256": "b171f1652f1dcb3f66c66d62ac3879d511902d7afe698eb3e6e2f6d495e06d47",
+      "bytes": 6332
+    },
+    {
+      "path": "docs/PRODUCTION_READINESS.md",
+      "sha256": "ca33cd6f0af1a9384bd56590165e686e7af31fc7c8efc166b201c8b5361252ec",
+      "bytes": 6184
+    },
+    {
+      "path": "docs/PROTOCOL.md",
+      "sha256": "69c1ed6b8d7409570fd78142cf33f1b31b7e8eadb6202046a25887d6b10fb307",
+      "bytes": 6827
+    },
+    {
+      "path": "packages/adapter-sdk/src/index.ts",
+      "sha256": "422496c6597be7a9e42175368b41d614eecf8105d4a8f3b5ea7a6958d32b754a",
+      "bytes": 1685
+    },
+    {
+      "path": "packages/adapter-sdk/src/paid-service.ts",
+      "sha256": "18943a409cd783caf7bd3b8b3393a4e104bd828e05028864f888875b5a7cde7d",
+      "bytes": 8259
+    },
+    {
+      "path": "packages/ckb/src/index.ts",
+      "sha256": "84ed1471601ff86175123d3d26cd78b19449611963d0e283a5646b786636ba11",
+      "bytes": 7358
+    },
+    {
+      "path": "packages/core/src/index.ts",
+      "sha256": "076552923a783892198f6e43f1811dae29325cfaca0fe57fed52eb25a7491aa6",
+      "bytes": 28085
+    },
+    {
+      "path": "tests/adapter.test.ts",
+      "sha256": "4ea8f5c3934bfedb669b67a46da93dcdcd2ee8779c647a07ae93924290154a43",
+      "bytes": 5526
+    },
+    {
+      "path": "tests/ckb.test.ts",
+      "sha256": "24941b4506d0d2ea9d09cbdb96a8442a694c1419f30a72a572d6bd1277032b7d",
+      "bytes": 3307
+    },
+    {
+      "path": "tests/core.test.ts",
+      "sha256": "d71d084abdf37730dbb0b5a4c78d4748b0b014250aebcb19f708f0f5eea0dcd1",
+      "bytes": 12255
+    },
+    {
+      "path": "tests/operator.integration.test.ts",
+      "sha256": "f2792eb80e04d67cbd97d09334c4ddb4b08e1cdc1ab15e0acb785fc2b6132c56",
+      "bytes": 10768
+    }
+  ]
+}

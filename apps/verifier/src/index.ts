@@ -3,12 +3,15 @@ import {
   acceptedFiberPaymentClaims,
   buildAnchorDataHex,
   canonical,
+  deriveGenericBilateralFinalState,
+  GENERIC_BILATERAL_PROFILE,
+  CLOSE_COMMITMENT_VERSION,
   verifyTranscript,
   type TranscriptExport
 } from "@eventmesh/core";
 import { verifyAnchorRpcDetailed } from "@eventmesh/ckb";
 import { FiberRpcClient } from "@eventmesh/fiber";
-import { paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
+import { PAID_SERVICE_PROFILE, paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
 
 function usage() {
   console.error(`Usage:
@@ -67,6 +70,39 @@ let failed = !offline.ok;
 console.log("EventMesh v0.2 Independent Verification");
 console.log(`[${offline.ok ? "PASS" : "FAIL"}] offline transcript invariants`);
 for (const error of offline.errors) console.log(`       ${error}`);
+
+const signedProfile = transcript.session.session.applicationProfile;
+if (signedProfile) {
+  const profileMatches = (expected: typeof GENERIC_BILATERAL_PROFILE) =>
+    signedProfile.id === expected.id
+    && signedProfile.version === expected.version
+    && signedProfile.rulesHash.toLowerCase() === expected.rulesHash.toLowerCase();
+  if (profileMatches(PAID_SERVICE_PROFILE)) {
+    const appResult = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    if (!appResult.ok) {
+      console.log("[FAIL] signed paid-service application profile");
+      for (const error of appResult.errors) console.log(`       ${error}`);
+      failed = true;
+    } else if (transcript.close?.finalState !== undefined && canonical(transcript.close.finalState) !== canonical(appResult.finalState)) {
+      console.log("[FAIL] close finalState differs from signed-profile deterministic derivation");
+      failed = true;
+    } else {
+      console.log("[PASS] signed paid-service profile and deterministic final state");
+    }
+  } else if (profileMatches(GENERIC_BILATERAL_PROFILE)) {
+    const finalItems = transcript.events.flatMap((row) => row.ack ? [{ event: row.event, ack: row.ack }] : []);
+    const derived = deriveGenericBilateralFinalState(finalItems);
+    if (transcript.close?.finalState !== undefined && canonical(transcript.close.finalState) !== canonical(derived)) {
+      console.log("[FAIL] close finalState differs from generic deterministic derivation");
+      failed = true;
+    } else {
+      console.log("[PASS] signed generic-bilateral profile and deterministic final state");
+    }
+  } else {
+    console.log("[FAIL] unknown or rulesHash-mismatched signed application profile");
+    failed = true;
+  }
+}
 
 const adapterName = flags.get("--adapter");
 if (adapterName) {
@@ -131,11 +167,22 @@ if (flags.has("--require-fiber") && !claims.length) {
 
 const ckbRpc = flags.get("--ckb-rpc");
 if (transcript.close && transcript.ckbAnchor) {
+  const close = transcript.close.close;
   const expected = buildAnchorDataHex(
     transcript.session.session.sessionId,
-    transcript.close.close.transcriptRoot,
-    transcript.close.close.finalStateHash,
-    transcript.close.close.paymentEvidenceRoot
+    close.transcriptRoot,
+    close.finalStateHash,
+    close.paymentEvidenceRoot,
+    close.commitmentVersion === CLOSE_COMMITMENT_VERSION
+      && close.paymentObservationRoot
+      && close.applicationProfileHash
+      && close.chainContextHash
+      ? {
+          paymentObservationRoot: close.paymentObservationRoot,
+          applicationProfileHash: close.applicationProfileHash,
+          chainContextHash: close.chainContextHash
+        }
+      : undefined
   );
   if (transcript.ckbAnchor.dataHex.toLowerCase() !== expected.toLowerCase()) {
     console.log("[FAIL] CKB commitment bytes mismatch local derivation");

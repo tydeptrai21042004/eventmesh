@@ -4,13 +4,19 @@ import {
   PROTOCOL,
   SIGNING_DOMAIN,
   ZERO_HASH,
+  CLOSE_COMMITMENT_VERSION,
   acceptedFiberPaymentHashes,
+  applicationProfileHashFrom,
   buildAnchorDataHex,
   canonical,
+  chainContextHashFrom,
+  computeFiberPaymentPurposeHash,
   computePaymentEvidenceRoot,
+  computeSignedPaymentEvidenceRoot,
   computeTranscriptRoot,
   createSessionId,
   finalStateHashFrom,
+  FiberPaymentClaimSchema,
   publicKeyFromPrivate,
   sha256Hex,
   signAck,
@@ -24,6 +30,7 @@ import {
   type SignedEvent,
   type SignedSession
 } from "@eventmesh/core";
+import { PAID_SERVICE_PROFILE, paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
 import { FiberRpcClient } from "@eventmesh/fiber";
 import { DEMO_STORAGE_DURABLE, DEMO_STORAGE_MODE, clearDemoSession, mutateDemoStore, readDemoStore } from "./demo-store.js";
 
@@ -254,6 +261,8 @@ async function createSession(req: any, input: any) {
     const session = {
       sessionId: createSessionId(), protocol: PROTOCOL,
       environment: keys.environment,
+      applicationProfile: PAID_SERVICE_PROFILE,
+      chainContext: { ckbNetwork: "testnet", fiberNetwork: "fiber" },
       operatorA: keys.pubA, operatorB: keys.pubB,
       operatorAUrl: `${baseUrl(req)}/api/demo?operator=A`,
       operatorBUrl: `${baseUrl(req)}/api/demo?operator=B`,
@@ -292,6 +301,19 @@ function validatePortableSnapshot(snapshot: any) {
   const verification = verifyTranscript(transcript as any);
   if (!verification.ok) throw new Error(`SNAPSHOT_VERIFICATION_FAILED:${verification.errors.join("|")}`);
   const signedSession = snapshot.signedSession as SignedSession;
+  const profile = signedSession.session.applicationProfile;
+  if (profile) {
+    if (profile.id !== PAID_SERVICE_PROFILE.id
+      || profile.version !== PAID_SERVICE_PROFILE.version
+      || profile.rulesHash.toLowerCase() !== PAID_SERVICE_PROFILE.rulesHash.toLowerCase()) {
+      throw new Error("SNAPSHOT_APPLICATION_PROFILE_UNSUPPORTED_OR_MISMATCH");
+    }
+    const appResult = validateTranscriptWithAdapter(transcript as any, paidServiceReferenceAdapter);
+    if (!appResult.ok) throw new Error(`SNAPSHOT_APPLICATION_PROFILE_INVALID:${appResult.errors.join("|")}`);
+    if (snapshot.close?.finalState !== undefined && canonical(snapshot.close.finalState) !== canonical(appResult.finalState)) {
+      throw new Error("SNAPSHOT_FINAL_STATE_DERIVATION_MISMATCH");
+    }
+  }
   const mode = modeFromSignedSession(signedSession);
   const keys = keysForMode(mode);
   if (signedSession.session.operatorA.toLowerCase() !== keys.pubA.toLowerCase()) throw new Error("SNAPSHOT_OPERATOR_A_MISMATCH");
@@ -347,7 +369,8 @@ async function restorePortableSnapshot(snapshot: any) {
         sessionId,
         snapshot.close.close.transcriptRoot,
         snapshot.close.close.finalStateHash,
-        snapshot.close.close.paymentEvidenceRoot
+        snapshot.close.close.paymentEvidenceRoot,
+        anchorExtensionsFromClose(snapshot.close.close)
       );
       if (String(snapshot.anchorOperation.dataHex || "").toLowerCase() !== expectedDataHex.toLowerCase()) {
         throw new Error("SNAPSHOT_ANCHOR_OPERATION_COMMITMENT_MISMATCH");
@@ -486,7 +509,23 @@ function validateEventInput(rows: any[], sender: "A" | "B", type: string, payloa
   if (type === "PAYMENT_SETTLED") {
     if (sender !== "A") throw new Error("PAYMENT_SETTLED_MUST_BE_SENT_BY_A");
     if (!acceptedEvent(rows, "SERVICE_ACCEPTED")) throw new Error("SERVICE_ACCEPT_REQUIRED");
-    return payload;
+    const request = acceptedEvent(rows, "SERVICE_REQUESTED");
+    const result = acceptedEvent(rows, "RESULT_COMMITTED");
+    if (!result) throw new Error("RESULT_COMMITMENT_REQUIRED_BEFORE_PAYMENT");
+    const requestId = requestIdOf(request?.payload);
+    const claim = FiberPaymentClaimSchema.parse(payload);
+    if (claim.obligationId && claim.obligationId !== requestId) throw new Error("PAYMENT_OBLIGATION_ID_MISMATCH");
+    if (claim.settlesEventHash && claim.settlesEventHash.toLowerCase() !== result.eventHash.toLowerCase()) {
+      throw new Error("PAYMENT_SETTLES_EVENT_HASH_MISMATCH");
+    }
+    const bound = {
+      ...claim,
+      obligationId: requestId,
+      settlesEventHash: result.eventHash.toLowerCase()
+    };
+    const purposeHash = computeFiberPaymentPurposeHash(bound);
+    if (claim.purposeHash && claim.purposeHash.toLowerCase() !== purposeHash.toLowerCase()) throw new Error("PAYMENT_PURPOSE_HASH_MISMATCH");
+    return FiberPaymentClaimSchema.parse({ ...bound, purposeHash });
   }
 
   const request = acceptedEvent(rows, "SERVICE_REQUESTED");
@@ -574,7 +613,13 @@ async function appendEvent(input: any) {
       }
     }
 
-    const ack: SignedAck = signAck({ eventHash: event.eventHash, decision: "ACCEPT", operator: receiverPub, createdAt: new Date().toISOString() }, receiverKey);
+    const ack: SignedAck = signAck({
+      eventHash: event.eventHash,
+      decision: "ACCEPT",
+      operator: receiverPub,
+      ...(paymentEvidence ? { evidenceHash: paymentEvidence.evidenceHash } : {}),
+      createdAt: new Date().toISOString()
+    }, receiverKey);
     existing.push({ eventHash: event.eventHash.toLowerCase(), sequence, signedEvent: event, ack, status: "FINAL" });
     store.events[sessionId] = existing;
     return { ok: true, workspaceMode: mode, event, ack, paymentEvidence };
@@ -599,17 +644,70 @@ async function closeSession(input: any) {
     if (missing.length) throw new Error(`REFERENCE_FLOW_INCOMPLETE:${missing.join(",")}`);
     const items = rows.map((r: any) => ({ event: r.signedEvent as SignedEvent, ack: r.ack as SignedAck }));
     if (items.some((x: any) => !x.ack || x.ack.decision !== "ACCEPT")) throw new Error("ALL_EVENTS_MUST_BE_ACCEPTED_BEFORE_CLOSE");
-    const finalState = input.finalState ?? { completed: true, sessionId };
+    const acceptedPayments = acceptedFiberPaymentHashes(items);
+    let finalState: unknown;
+    let body: any;
+    const profile = signedSession.session.applicationProfile;
+    if (!profile) {
+      // Backward compatibility for active browser snapshots created before the
+      // signed application-profile upgrade. New sessions always take the v3 path.
+      finalState = input.finalState ?? { completed: true, sessionId };
+      body = {
+        sessionId,
+        eventCount: items.length,
+        transcriptRoot: computeTranscriptRoot(items),
+        finalStateHash: finalStateHashFrom(finalState),
+        fiberPayments: acceptedPayments,
+        paymentEvidenceRoot: computePaymentEvidenceRoot(items),
+        closedAt: new Date().toISOString()
+      };
+    } else {
+      if (profile.id !== PAID_SERVICE_PROFILE.id
+        || profile.version !== PAID_SERVICE_PROFILE.version
+        || profile.rulesHash.toLowerCase() !== PAID_SERVICE_PROFILE.rulesHash.toLowerCase()) {
+        throw new Error("APPLICATION_PROFILE_UNSUPPORTED_OR_RULES_HASH_MISMATCH");
+      }
+      const evidenceByPayment = new Map(Object.values(store.paymentEvidence)
+        .filter((row: any) => row.sessionId === sessionId)
+        .map((row: any) => [String(row.evidence?.evidence?.claim?.paymentHash || "").toLowerCase(), row.evidence as SignedFiberPaymentEvidence]));
+      const signedEvidence = acceptedPayments.map((paymentHash) => {
+        const evidence = evidenceByPayment.get(paymentHash);
+        if (!evidence) throw new Error(`SIGNED_PAYMENT_EVIDENCE_REQUIRED:${paymentHash}`);
+        return evidence;
+      });
+      for (const row of items) {
+        if (row.event.type !== "PAYMENT_SETTLED" || row.ack.decision !== "ACCEPT") continue;
+        const claim = FiberPaymentClaimSchema.parse(row.event.payload);
+        const evidence = evidenceByPayment.get(claim.paymentHash.toLowerCase());
+        if (!row.ack.evidenceHash || !evidence || row.ack.evidenceHash.toLowerCase() !== evidence.evidenceHash.toLowerCase()) {
+          throw new Error(`PAYMENT_ACK_EVIDENCE_BINDING_REQUIRED:${row.event.sequence}`);
+        }
+      }
+      const transcript = {
+        session: signedSession,
+        events: items,
+        ...(signedEvidence.length ? { paymentEvidence: signedEvidence } : {})
+      };
+      const application = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+      if (!application.ok || application.finalState === undefined) {
+        throw new Error(`APPLICATION_PROFILE_TRANSCRIPT_INVALID:${application.errors.join("|")}`);
+      }
+      finalState = application.finalState;
+      body = {
+        commitmentVersion: CLOSE_COMMITMENT_VERSION,
+        sessionId,
+        eventCount: items.length,
+        transcriptRoot: computeTranscriptRoot(items),
+        finalStateHash: finalStateHashFrom(finalState),
+        fiberPayments: acceptedPayments,
+        paymentEvidenceRoot: computePaymentEvidenceRoot(items),
+        paymentObservationRoot: computeSignedPaymentEvidenceRoot(signedEvidence),
+        applicationProfileHash: applicationProfileHashFrom(signedSession.session),
+        chainContextHash: chainContextHashFrom(signedSession.session),
+        closedAt: new Date().toISOString()
+      };
+    }
     if (Buffer.byteLength(canonical(finalState)) > 32 * 1024) throw new Error("FINAL_STATE_TOO_LARGE");
-    const body = {
-      sessionId,
-      eventCount: items.length,
-      transcriptRoot: computeTranscriptRoot(items),
-      finalStateHash: finalStateHashFrom(finalState),
-      fiberPayments: acceptedFiberPaymentHashes(items),
-      paymentEvidenceRoot: computePaymentEvidenceRoot(items),
-      closedAt: new Date().toISOString()
-    };
     const signedClose = {
       close: body, finalState,
       signatureA: signProtocolObject(SIGNING_DOMAIN.CLOSE, body, keys.keyA),
@@ -619,6 +717,18 @@ async function closeSession(input: any) {
     session.status = "CLOSED";
     return { ok: true, workspaceMode: mode, close: signedClose };
   });
+}
+
+function anchorExtensionsFromClose(close: any) {
+  if (close?.commitmentVersion !== CLOSE_COMMITMENT_VERSION
+    || !close?.paymentObservationRoot
+    || !close?.applicationProfileHash
+    || !close?.chainContextHash) return undefined;
+  return {
+    paymentObservationRoot: close.paymentObservationRoot,
+    applicationProfileHash: close.applicationProfileHash,
+    chainContextHash: close.chainContextHash
+  };
 }
 
 function ckbBroadcastEnabled() {
@@ -638,7 +748,13 @@ async function anchorSession(input: any) {
     if (session.anchor) return { duplicateAnchor: session.anchor };
 
     const close = session.signedClose.close;
-    const dataHex = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
+    const dataHex = buildAnchorDataHex(
+      sessionId,
+      close.transcriptRoot,
+      close.finalStateHash,
+      close.paymentEvidenceRoot,
+      anchorExtensionsFromClose(close)
+    );
     const commitmentHash = sha256Hex(dataHex);
     const existing = store.anchorOps[sessionId];
 
@@ -679,7 +795,8 @@ async function anchorSession(input: any) {
       sessionId,
       transcriptRoot: close.transcriptRoot,
       finalStateHash: close.finalStateHash,
-      paymentEvidenceRoot: close.paymentEvidenceRoot
+      paymentEvidenceRoot: close.paymentEvidenceRoot,
+      ...anchorExtensionsFromClose(close)
     });
     if (prepared.dataHex.toLowerCase() !== String((reserved as any).dataHex).toLowerCase()) {
       throw new Error("ANCHOR_PREPARED_COMMITMENT_MISMATCH");

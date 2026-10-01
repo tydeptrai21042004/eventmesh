@@ -189,4 +189,4 @@ Do not call the project independently proven until public evidence shows:
 
 ## Application-semantic verification
 
-For the bundled paid-service reference profile, add `--adapter paid-service-reference`. The verifier then validates the exact event order/cross-event invariants and checks that a present close `finalState` equals the deterministic adapter-derived state. This is optional for generic EventMesh transcripts; external integrations should add their own adapter validation rather than putting business logic into core.
+For signed built-in profiles, the verifier now enforces the profile automatically. The paid-service profile checks bilateral event authorship, event ordering, payment-to-result binding, and deterministic close `finalState`. `--adapter paid-service-reference` remains available as an explicit check for legacy/unprofiled material. External integrations should add their own adapter validation rather than putting business logic into core.

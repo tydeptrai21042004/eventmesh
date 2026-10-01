@@ -16,10 +16,10 @@ EventMesh is now a stronger Testnet/beta operator, but it is still **not an audi
 
 - `PAYMENT_SETTLED` can optionally bind a payment to `obligationId`, `settlesEventHash`, a deterministic `purposeHash`, and an expected Fiber payee key.
 - Receiver-owned FNN observations are signed by the EventMesh operator that performed receiver verification.
-- New operator exports include receiver-signed observations, and transcript verification rejects missing/tampered observations when an evidence section is present. Legacy v0.2 exports without that section remain readable but do not gain the signed-observation guarantee.
+- Commitment-v3 PAYMENT_SETTLED ACKs bind the exact receiver observation through `evidenceHash`, and the close commits `paymentObservationRoot`. Removing or substituting receiver evidence invalidates the v3 proof. Legacy v0.2 exports remain readable but do not gain this stronger guarantee.
 - Payment-hash reuse protection remains global across local sessions.
 
-The v0.2 CKB commitment remains backward compatible: `paymentEvidenceRoot` commits the canonical accepted **payment claims**. The newly signed receiver observation is exported and signature-checked but is not added to `EVENTMESH_V02`; changing the anchor bytes requires a future wire/anchor version.
+Legacy `EVENTMESH_V02` anchors remain backward compatible. New profiled sessions use `commitmentVersion: 3` and `EVENTMESH_V03`, committing both the accepted payment-claim root and the signed receiver-observation root, plus application-profile and chain-context hashes.
 
 ### CKB anchoring
 

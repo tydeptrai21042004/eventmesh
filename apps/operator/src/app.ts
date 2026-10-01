@@ -5,8 +5,11 @@ import { join } from "node:path";
 import { z } from "zod";
 import {
   AckBodySchema,
+  ApplicationProfileSchema,
+  ChainContextSchema,
   CkbScriptSchema,
   CloseBodySchema,
+  CLOSE_COMMITMENT_VERSION,
   EventBodySchema,
   FiberPaymentClaimSchema,
   SignedFiberPaymentEvidenceSchema,
@@ -19,12 +22,18 @@ import {
   SIGNING_DOMAIN,
   ZERO_HASH,
   acceptedFiberPaymentHashes,
+  applicationProfileHashFrom,
   buildAnchorDataHex,
   canonical,
+  chainContextHashFrom,
+  computeFiberPaymentPurposeHash,
   computePaymentEvidenceRoot,
+  computeSignedPaymentEvidenceRoot,
   computeTranscriptRoot,
   createSessionId,
+  deriveGenericBilateralFinalState,
   finalStateHashFrom,
+  GENERIC_BILATERAL_PROFILE,
   signAck,
   signFiberPaymentEvidence,
   signEvent,
@@ -38,6 +47,7 @@ import {
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
 import { CkbAnchorClient, inspectAnchorRpc } from "@eventmesh/ckb";
+import { PAID_SERVICE_PROFILE, paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
 import { Store } from "./store.js";
 import { loadIdentity } from "./identity.js";
 import { adminTokenMatches, extractAdminToken, validatePeerUrl } from "./security.js";
@@ -57,6 +67,7 @@ export type OperatorAppOptions = {
   maxBodyBytes?: number;
   peerRateLimitMax?: number;
   peerRateLimitWindowMs?: number;
+  peerRateLimitMaxTrackedPeers?: number;
   fiber?: FiberRpcClient;
   ckb?: CkbAnchorClient;
   ckbRpcUrl?: string;
@@ -86,6 +97,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   const maxBodyBytes = options.maxBodyBytes ?? 256 * 1024;
   const peerRateLimitMax = options.peerRateLimitMax ?? (publicMode ? 120 : 1000);
   const peerRateLimitWindowMs = options.peerRateLimitWindowMs ?? 60_000;
+  const peerRateLimitMaxTrackedPeers = Math.max(128, options.peerRateLimitMaxTrackedPeers ?? 4096);
   const ckbMinConfirmations = Math.max(0, options.ckbMinConfirmations ?? (publicMode ? 2 : 0));
   if (publicMode && !options.adminToken) throw new Error("PUBLIC_MODE_REQUIRES_ADMIN_TOKEN");
   if (publicMode && !options.selfUrl.startsWith("https://")) throw new Error("PUBLIC_MODE_REQUIRES_HTTPS_SELF_URL");
@@ -111,6 +123,17 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const now = Date.now();
     const key = req.ip;
     let bucket = peerRate.get(key);
+    if (!bucket && peerRate.size >= peerRateLimitMaxTrackedPeers) {
+      for (const [candidate, value] of peerRate) {
+        if (now >= value.resetAt) peerRate.delete(candidate);
+      }
+      while (peerRate.size >= peerRateLimitMaxTrackedPeers) {
+        const oldest = [...peerRate.entries()].sort((a, b) => a[1].resetAt - b[1].resetAt)[0]?.[0];
+        if (!oldest) break;
+        peerRate.delete(oldest);
+      }
+    }
+    bucket = peerRate.get(key);
     if (!bucket || now >= bucket.resetAt) {
       bucket = { count: 0, resetAt: now + peerRateLimitWindowMs };
       peerRate.set(key, bucket);
@@ -232,6 +255,127 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       .find((evidence) => evidence.evidence.claim.paymentHash.toLowerCase() === claim.data.paymentHash.toLowerCase());
   }
 
+  function supportedProfile(profile: unknown): "generic" | "paid-service" | "legacy" {
+    if (!profile) return "legacy";
+    const parsed = ApplicationProfileSchema.safeParse(profile);
+    if (!parsed.success) throw new Error("APPLICATION_PROFILE_INVALID");
+    const matches = (expected: typeof GENERIC_BILATERAL_PROFILE) =>
+      parsed.data.id === expected.id
+      && parsed.data.version === expected.version
+      && parsed.data.rulesHash.toLowerCase() === expected.rulesHash.toLowerCase();
+    if (matches(GENERIC_BILATERAL_PROFILE)) return "generic";
+    if (matches(PAID_SERVICE_PROFILE)) return "paid-service";
+    throw new Error("APPLICATION_PROFILE_UNSUPPORTED_OR_RULES_HASH_MISMATCH");
+  }
+
+  function requestedProfile(name?: string) {
+    if (!name || name === "generic-bilateral-v1") return GENERIC_BILATERAL_PROFILE;
+    if (name === "paid-service-v1") return PAID_SERVICE_PROFILE;
+    throw new Error("APPLICATION_PROFILE_UNSUPPORTED");
+  }
+
+  function normalizeProfilePayload(
+    signed: SignedSession,
+    events: ReturnType<Store["listEvents"]>,
+    type: string,
+    payload: unknown
+  ) {
+    if (supportedProfile(signed.session.applicationProfile) !== "paid-service" || type !== "PAYMENT_SETTLED") return payload;
+    const claim = FiberPaymentClaimSchema.parse(payload);
+    const requested = events.find((row) => row.status === "FINAL" && row.ack?.decision === "ACCEPT" && row.event.type === "SERVICE_REQUESTED");
+    const result = events.find((row) => row.status === "FINAL" && row.ack?.decision === "ACCEPT" && row.event.type === "RESULT_COMMITTED");
+    if (!requested || !result) throw new Error("PAID_SERVICE_RESULT_REQUIRED_BEFORE_PAYMENT");
+    const requestId = typeof (requested.event.payload as any)?.requestId === "string"
+      ? String((requested.event.payload as any).requestId)
+      : "";
+    if (!requestId) throw new Error("PAID_SERVICE_REQUEST_ID_MISSING");
+    if (claim.obligationId && claim.obligationId !== requestId) throw new Error("PAYMENT_OBLIGATION_ID_MISMATCH");
+    if (claim.settlesEventHash && claim.settlesEventHash.toLowerCase() !== result.event.eventHash.toLowerCase()) {
+      throw new Error("PAYMENT_SETTLES_EVENT_HASH_MISMATCH");
+    }
+    const bound = {
+      ...claim,
+      obligationId: requestId,
+      settlesEventHash: result.event.eventHash.toLowerCase()
+    };
+    const purposeHash = computeFiberPaymentPurposeHash(bound);
+    if (claim.purposeHash && claim.purposeHash.toLowerCase() !== purposeHash.toLowerCase()) {
+      throw new Error("PAYMENT_PURPOSE_HASH_MISMATCH");
+    }
+    return FiberPaymentClaimSchema.parse({ ...bound, purposeHash });
+  }
+
+  function validateProfileEvent(signed: SignedSession, event: z.infer<typeof SignedEventSchema>) {
+    if (supportedProfile(signed.session.applicationProfile) !== "paid-service") return;
+    const expectedSender = new Map<string, string>([
+      ["SERVICE_REQUESTED", signed.session.operatorA],
+      ["SERVICE_ACCEPTED", signed.session.operatorB],
+      ["RESULT_COMMITTED", signed.session.operatorB],
+      ["PAYMENT_SETTLED", signed.session.operatorA],
+      ["SESSION_COMPLETED", signed.session.operatorB]
+    ]);
+    const requiredSender = expectedSender.get(event.type);
+    if (requiredSender && event.sender.toLowerCase() !== requiredSender.toLowerCase()) {
+      throw new Error(`APPLICATION_PROFILE_WRONG_EVENT_AUTHOR:${event.type}`);
+    }
+    const result = paidServiceReferenceAdapter.validateEvent(event);
+    if (!result.ok) throw new Error(`APPLICATION_PROFILE_EVENT_INVALID:${result.reason}`);
+  }
+
+  function deriveProfileFinalState(signed: SignedSession, events: ReturnType<Store["listEvents"]>) {
+    const finalItems = events.map((item) => ({ event: item.event, ack: item.ack! }));
+    const profile = supportedProfile(signed.session.applicationProfile);
+    if (profile === "legacy") return undefined;
+    if (profile === "generic") return deriveGenericBilateralFinalState(finalItems);
+    const transcript = {
+      session: signed,
+      events: finalItems,
+      paymentEvidence: store.listPaymentEvidence(signed.session.sessionId)
+    };
+    const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    if (!result.ok || result.finalState === undefined) {
+      throw new Error(`APPLICATION_PROFILE_TRANSCRIPT_INVALID:${result.errors.join("|")}`);
+    }
+    return result.finalState;
+  }
+
+  function commitmentV3Fields(signed: SignedSession, events: ReturnType<Store["listEvents"]>) {
+    const acceptedPayments = acceptedFiberPaymentHashes(events);
+    const byPayment = new Map(store.listPaymentEvidence(signed.session.sessionId)
+      .map((evidence) => [evidence.evidence.claim.paymentHash.toLowerCase(), evidence] as const));
+    const evidence = acceptedPayments.map((paymentHash) => {
+      const found = byPayment.get(paymentHash);
+      if (!found) throw new Error(`SIGNED_PAYMENT_EVIDENCE_REQUIRED:${paymentHash}`);
+      return found;
+    });
+    for (const row of events) {
+      if (row.event.type !== "PAYMENT_SETTLED" || row.ack?.decision !== "ACCEPT") continue;
+      const claim = FiberPaymentClaimSchema.parse(row.event.payload);
+      const observed = byPayment.get(claim.paymentHash.toLowerCase());
+      if (!row.ack.evidenceHash || !observed || row.ack.evidenceHash.toLowerCase() !== observed.evidenceHash.toLowerCase()) {
+        throw new Error(`PAYMENT_ACK_EVIDENCE_BINDING_REQUIRED:${row.event.sequence}`);
+      }
+    }
+    return {
+      commitmentVersion: CLOSE_COMMITMENT_VERSION,
+      paymentObservationRoot: computeSignedPaymentEvidenceRoot(evidence),
+      applicationProfileHash: applicationProfileHashFrom(signed.session),
+      chainContextHash: chainContextHashFrom(signed.session)
+    } as const;
+  }
+
+  function anchorExtensions(close: z.infer<typeof CloseBodySchema>) {
+    if (close.commitmentVersion !== CLOSE_COMMITMENT_VERSION
+      || !close.paymentObservationRoot
+      || !close.applicationProfileHash
+      || !close.chainContextHash) return undefined;
+    return {
+      paymentObservationRoot: close.paymentObservationRoot,
+      applicationProfileHash: close.applicationProfileHash,
+      chainContextHash: close.chainContextHash
+    };
+  }
+
   async function createAndStoreAnchor(sessionId: string) {
     if (!options.ckb) throw new Error("CKB_ANCHOR_DISABLED");
     const record = store.getSession(sessionId);
@@ -245,7 +389,8 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       sessionId,
       transcriptRoot: close.transcriptRoot,
       finalStateHash: close.finalStateHash,
-      paymentEvidenceRoot: close.paymentEvidenceRoot
+      paymentEvidenceRoot: close.paymentEvidenceRoot,
+      ...anchorExtensions(close)
     });
     const pending = { txHash: prepared.txHash, dataHex: prepared.dataHex, status: "PENDING" as const };
     const write = store.saveAnchor(sessionId, pending);
@@ -273,7 +418,8 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       sessionId,
       close.transcriptRoot,
       close.finalStateHash,
-      close.paymentEvidenceRoot
+      close.paymentEvidenceRoot,
+      anchorExtensions(close)
     );
     const verification = await inspectAnchorRpc(options.ckbRpcUrl, record.anchor.txHash, expected, ckbMinConfirmations);
     if (!verification.ok) {
@@ -302,7 +448,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     ckbAnchorEnabled: !!options.ckb,
     ckbVerificationEnabled: !!options.ckbRpcUrl,
     ckbMinConfirmations,
-    peerRateLimit: { maxRequests: peerRateLimitMax, windowMs: peerRateLimitWindowMs },
+    peerRateLimit: { maxRequests: peerRateLimitMax, windowMs: peerRateLimitWindowMs, maxTrackedPeers: peerRateLimitMaxTrackedPeers },
     maxBodyBytes,
     pendingOutbox: store.listOutbox("PENDING").length
   }));
@@ -311,6 +457,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     publicKey: identity.publicKey,
     selfUrl: options.selfUrl,
     protocol: PROTOCOL,
+    applicationProfiles: [GENERIC_BILATERAL_PROFILE, PAID_SERVICE_PROFILE],
     peerApi: "/peer",
     adminApi: "/admin"
   }));
@@ -586,7 +733,9 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const body = z.object({
       peerUrl: z.string().url().optional(),
       expiresInSeconds: z.number().int().positive().max(86400).optional(),
-      maxEvents: z.number().int().positive().max(10000).optional()
+      maxEvents: z.number().int().positive().max(10000).optional(),
+      applicationProfile: z.enum(["generic-bilateral-v1", "paid-service-v1"]).optional(),
+      chainContext: ChainContextSchema.optional()
     }).parse(req.body ?? {});
     const rawPeerUrl = body.peerUrl ?? options.defaultPeerUrl;
     if (!rawPeerUrl) return reply.code(400).send({ error: "PEER_URL_REQUIRED" });
@@ -596,14 +745,24 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const peer = z.object({
       publicKey: z.string().regex(/^0x[0-9a-f]{66}$/i),
       protocol: z.string(),
-      selfUrl: z.string().url().optional()
+      selfUrl: z.string().url().optional(),
+      applicationProfiles: z.array(ApplicationProfileSchema).optional()
     }).parse(await identityResponse.json());
     if (peer.protocol !== PROTOCOL) return reply.code(409).send({ error: "PEER_PROTOCOL_MISMATCH", peerProtocol: peer.protocol, protocol: PROTOCOL });
 
     const now = new Date();
+    const applicationProfile = requestedProfile(body.applicationProfile);
+    if (!peer.applicationProfiles?.some((candidate) =>
+      candidate.id === applicationProfile.id
+      && candidate.version === applicationProfile.version
+      && candidate.rulesHash.toLowerCase() === applicationProfile.rulesHash.toLowerCase())) {
+      return reply.code(409).send({ error: "PEER_APPLICATION_PROFILE_UNSUPPORTED", applicationProfile });
+    }
     const session = SessionSchema.parse({
       sessionId: createSessionId(),
       protocol: PROTOCOL,
+      applicationProfile,
+      chainContext: body.chainContext ?? { ckbNetwork: "testnet", fiberNetwork: "fiber" },
       operatorA: identity.publicKey,
       operatorB: peer.publicKey,
       operatorAUrl: normalizedUrl(options.selfUrl),
@@ -647,6 +806,8 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   const joinSession: Handler = async (req, reply) => {
     const input = z.object({ session: SessionSchema, signatureA: z.string() }).parse(req.body);
     if (input.session.sessionId !== req.params.id) return reply.code(400).send({ error: "SESSION_ID_MISMATCH" });
+    try { supportedProfile(input.session.applicationProfile); }
+    catch (error) { return reply.code(409).send({ error: String((error as Error).message) }); }
     if (input.session.operatorB !== identity.publicKey) return reply.code(403).send({ error: "NOT_INVITED_OPERATOR" });
     if (normalizedUrl(input.session.operatorBUrl) !== normalizedUrl(options.selfUrl)) return reply.code(400).send({ error: "OPERATOR_B_URL_MISMATCH" });
     try { await checkedPeerBase(input.session.operatorAUrl); }
@@ -669,22 +830,27 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     try { assertSessionOpen(record.signed, record.status); assertSessionParticipant(record.signed); }
     catch (error) { return reply.code(409).send({ error: String((error as Error).message) }); }
     const body = z.object({ type: z.string().min(1).max(80), payload: z.unknown() }).parse(req.body);
-    if (body.type === "PAYMENT_SETTLED") {
-      const claim = FiberPaymentClaimSchema.safeParse(body.payload);
-      if (!claim.success || claim.data.sessionId !== req.params.id) return reply.code(400).send({ error: "INVALID_FIBER_PAYMENT_CLAIM" });
-    }
     const events = store.listEvents(req.params.id);
     if (events.some((item) => item.status === "PROPOSED")) return reply.code(409).send({ error: "PENDING_EVENT_MUST_BE_ACKNOWLEDGED" });
     if (events.length >= record.signed.session.maxEvents) return reply.code(409).send({ error: "MAX_EVENTS_REACHED" });
+    let payload: unknown;
+    try { payload = normalizeProfilePayload(record.signed, events, body.type, body.payload); }
+    catch (error) { return reply.code(409).send({ error: String((error as Error).message) }); }
+    if (body.type === "PAYMENT_SETTLED") {
+      const claim = FiberPaymentClaimSchema.safeParse(payload);
+      if (!claim.success || claim.data.sessionId !== req.params.id) return reply.code(400).send({ error: "INVALID_FIBER_PAYMENT_CLAIM" });
+    }
     const event = signEvent(EventBodySchema.parse({
       sessionId: req.params.id,
       sequence: events.length + 1,
       previousHash: events.length ? events[events.length - 1].event.eventHash : ZERO_HASH,
       type: body.type,
-      payload: body.payload,
+      payload,
       sender: identity.publicKey,
       createdAt: new Date().toISOString()
     }), identity.privateKey);
+    try { validateProfileEvent(record.signed, event); }
+    catch (error) { return reply.code(409).send({ error: String((error as Error).message) }); }
     const write = store.saveEvent(event);
     if (write === "CONFLICT") return reply.code(409).send({ error: "EVENT_CONFLICT" });
     const delivery = await queueAndDeliver({
@@ -745,6 +911,13 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     try { assertSessionOpen(sessionRecord.signed, sessionRecord.status); assertSessionParticipant(sessionRecord.signed); }
     catch (error) { return reply.code(409).send({ error: String((error as Error).message) }); }
     const events = store.listEvents(req.params.id);
+    try {
+      validateProfileEvent(sessionRecord.signed, event);
+      const normalizedPayload = normalizeProfilePayload(sessionRecord.signed, events, event.type, event.payload);
+      if (canonical(normalizedPayload) !== canonical(event.payload)) throw new Error("APPLICATION_PROFILE_EVENT_BINDING_MISMATCH");
+    } catch (error) {
+      return reply.code(409).send({ error: String((error as Error).message) });
+    }
     if (events.length >= session.maxEvents) return reply.code(409).send({ error: "MAX_EVENTS_REACHED" });
     const expectedSequence = events.length + 1;
     const expectedPrevious = events.length ? events[events.length - 1].event.eventHash : ZERO_HASH;
@@ -793,6 +966,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       eventHash: record.event.eventHash,
       decision,
       operator: identity.publicKey,
+      ...(paymentEvidence ? { evidenceHash: paymentEvidence.evidenceHash } : {}),
       createdAt: new Date().toISOString()
     }), identity.privateKey);
     if (store.saveAck(ack) === "CONFLICT") return reply.code(409).send({ error: "ACK_EQUIVOCATION" });
@@ -833,6 +1007,10 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       if (paymentEvidence.observer !== ack.operator || !verifyFiberPaymentEvidence(paymentEvidence)) {
         return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_SIGNATURE_INVALID" });
       }
+      if (supportedProfile(session.signed.session.applicationProfile) !== "legacy"
+        && (!ack.evidenceHash || ack.evidenceHash.toLowerCase() !== paymentEvidence.evidenceHash.toLowerCase())) {
+        return reply.code(409).send({ error: "ACK_PAYMENT_EVIDENCE_HASH_MISMATCH" });
+      }
       if (store.claimPayment(req.params.id, claim.data, event.event.eventHash) === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_REUSE" });
       if (store.savePaymentEvidence(req.params.id, event.event.eventHash, paymentEvidence) === "CONFLICT") return reply.code(409).send({ error: "FIBER_PAYMENT_EVIDENCE_CONFLICT" });
     }
@@ -856,9 +1034,20 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       if (events.some((item) => item.status !== "FINAL" || !item.ack)) return reply.code(409).send({ error: "ALL_EVENTS_MUST_BE_FINAL" });
       if (events.some((item) => item.ack?.decision !== "ACCEPT")) return reply.code(409).send({ error: "REJECTED_EVENT_PREVENTS_CLOSE" });
       const input = z.object({ finalState: z.unknown().optional() }).parse(req.body ?? {});
-      const finalState = input.finalState ?? { status: "closed", eventCount: events.length };
       const finalItems = events.map((item) => ({ event: item.event, ack: item.ack! }));
+      let finalState: unknown;
+      let v3Fields: ReturnType<typeof commitmentV3Fields> | undefined;
+      try {
+        const profile = supportedProfile(record.signed.session.applicationProfile);
+        finalState = profile === "legacy"
+          ? (input.finalState ?? { status: "closed", eventCount: events.length })
+          : deriveProfileFinalState(record.signed, events);
+        if (profile !== "legacy") v3Fields = commitmentV3Fields(record.signed, events);
+      } catch (error) {
+        return reply.code(409).send({ error: String((error as Error).message) });
+      }
       const close = CloseBodySchema.parse({
+        ...(v3Fields ?? {}),
         sessionId: req.params.id,
         eventCount: events.length,
         transcriptRoot: computeTranscriptRoot(finalItems),
@@ -915,7 +1104,21 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const events = store.listEvents(req.params.id);
     if (events.some((item) => item.status !== "FINAL" || !item.ack)) return reply.code(409).send({ error: "LOCAL_TRANSCRIPT_NOT_FINAL" });
     if (events.some((item) => item.ack?.decision !== "ACCEPT")) return reply.code(409).send({ error: "REJECTED_EVENT_PREVENTS_CLOSE" });
-    if (finalStateHashFrom(input.finalState).toLowerCase() !== input.close.finalStateHash.toLowerCase()) return reply.code(409).send({ error: "FINAL_STATE_HASH_MISMATCH" });
+    let expectedFinalState: unknown = input.finalState;
+    let expectedV3: ReturnType<typeof commitmentV3Fields> | undefined;
+    try {
+      const profile = supportedProfile(record.signed.session.applicationProfile);
+      if (profile !== "legacy") {
+        expectedFinalState = deriveProfileFinalState(record.signed, events);
+        expectedV3 = commitmentV3Fields(record.signed, events);
+        if (canonical(expectedFinalState) !== canonical(input.finalState)) {
+          return reply.code(409).send({ error: "APPLICATION_FINAL_STATE_DERIVATION_MISMATCH", expectedFinalState });
+        }
+      }
+    } catch (error) {
+      return reply.code(409).send({ error: String((error as Error).message) });
+    }
+    if (finalStateHashFrom(expectedFinalState).toLowerCase() !== input.close.finalStateHash.toLowerCase()) return reply.code(409).send({ error: "FINAL_STATE_HASH_MISMATCH" });
     const finalItems = events.map((item) => ({ event: item.event, ack: item.ack! }));
     const localRoot = computeTranscriptRoot(finalItems);
     if (localRoot.toLowerCase() !== input.close.transcriptRoot.toLowerCase() || events.length !== input.close.eventCount) {
@@ -928,6 +1131,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const localPaymentEvidenceRoot = computePaymentEvidenceRoot(events);
     if (localPaymentEvidenceRoot.toLowerCase() !== input.close.paymentEvidenceRoot.toLowerCase()) {
       return reply.code(409).send({ error: "PAYMENT_EVIDENCE_ROOT_MISMATCH", localPaymentEvidenceRoot });
+    }
+    if (expectedV3) {
+      if (input.close.commitmentVersion !== expectedV3.commitmentVersion
+        || input.close.paymentObservationRoot?.toLowerCase() !== expectedV3.paymentObservationRoot.toLowerCase()
+        || input.close.applicationProfileHash?.toLowerCase() !== expectedV3.applicationProfileHash.toLowerCase()
+        || input.close.chainContextHash?.toLowerCase() !== expectedV3.chainContextHash.toLowerCase()) {
+        return reply.code(409).send({ error: "CLOSE_V3_COMMITMENT_MISMATCH", expected: expectedV3 });
+      }
     }
     const signatureB = signProtocolObject(SIGNING_DOMAIN.CLOSE, input.close, identity.privateKey);
     if (store.saveClose(req.params.id, { close: input.close, finalState: input.finalState, signatureA: input.signatureA, signatureB }) === "CONFLICT") {
@@ -961,7 +1172,13 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       })
     }).parse(req.body);
     const close = record.close.close;
-    const expected = buildAnchorDataHex(req.params.id, close.transcriptRoot, close.finalStateHash, close.paymentEvidenceRoot);
+    const expected = buildAnchorDataHex(
+      req.params.id,
+      close.transcriptRoot,
+      close.finalStateHash,
+      close.paymentEvidenceRoot,
+      anchorExtensions(close)
+    );
     if (anchor.dataHex.toLowerCase() !== expected.toLowerCase()) return reply.code(409).send({ error: "ANCHOR_COMMITMENT_MISMATCH" });
     if (!options.ckbRpcUrl) return reply.code(503).send({ error: "CKB_RPC_REQUIRED_TO_VERIFY_ANCHOR" });
     const verification = await inspectAnchorRpc(options.ckbRpcUrl, anchor.txHash, expected, ckbMinConfirmations);

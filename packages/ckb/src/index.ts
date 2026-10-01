@@ -6,6 +6,9 @@ export type AnchorCommitment = {
   transcriptRoot: string;
   finalStateHash: string;
   paymentEvidenceRoot: string;
+  paymentObservationRoot?: string;
+  applicationProfileHash?: string;
+  chainContextHash?: string;
 };
 
 export type PreparedAnchor = {
@@ -56,11 +59,17 @@ export class CkbAnchorClient {
     await signer.connect();
     const address = await signer.getRecommendedAddress();
     const { script: lock } = await ccc.Address.fromString(address, client);
+    const hasV3 = !!input.paymentObservationRoot && !!input.applicationProfileHash && !!input.chainContextHash;
     const dataHex = buildAnchorDataHex(
       input.sessionId,
       input.transcriptRoot,
       input.finalStateHash,
-      input.paymentEvidenceRoot
+      input.paymentEvidenceRoot,
+      hasV3 ? {
+        paymentObservationRoot: input.paymentObservationRoot!,
+        applicationProfileHash: input.applicationProfileHash!,
+        chainContextHash: input.chainContextHash!
+      } : undefined
     );
     const minimumCapacityCkb = minimumStandardSecpOutputCapacityCkb(dataHex);
     const outputCapacityCkb = Math.max(this.capacityCkb, minimumCapacityCkb);

@@ -4,6 +4,7 @@ import {
   SIGNING_DOMAIN,
   ZERO_HASH,
   publicKeyFromPrivate,
+  computeFiberPaymentPurposeHash,
   signAck,
   signEvent,
   signProtocolObject,
@@ -62,11 +63,17 @@ function buildTranscript(): TranscriptExport {
   append("SERVICE_REQUESTED", { requestId, service: "dataset-transform" }, keyA, operatorA, keyB, operatorB);
   append("SERVICE_ACCEPTED", { requestId }, keyB, operatorB, keyA, operatorA);
   append("RESULT_COMMITTED", { requestId, resultHash: `0x${"ab".repeat(32)}` }, keyB, operatorB, keyA, operatorA);
-  append("PAYMENT_SETTLED", {
-    paymentHash: `0x${"cd".repeat(32)}`,
+  const paymentBinding = {
     sessionId,
     amount: "100000000",
-    currency: "Fibt"
+    currency: "Fibt" as const,
+    obligationId: requestId,
+    settlesEventHash: rows.at(-1)!.event.eventHash
+  };
+  append("PAYMENT_SETTLED", {
+    paymentHash: `0x${"cd".repeat(32)}`,
+    ...paymentBinding,
+    purposeHash: computeFiberPaymentPurposeHash(paymentBinding)
   }, keyA, operatorA, keyB, operatorB);
   append("SESSION_COMPLETED", { requestId }, keyB, operatorB, keyA, operatorA);
 
@@ -90,9 +97,48 @@ describe("paid-service reference adapter", () => {
 
   it("rejects a transcript whose business events are out of order", () => {
     const transcript = buildTranscript();
-    [transcript.events[1], transcript.events[2]] = [transcript.events[2], transcript.events[1]];
+    transcript.events[1].event.sequence = 3;
+    transcript.events[2].event.sequence = 2;
     const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
     expect(result.ok).toBe(false);
-    expect(result.errors.join(" ")).toContain("expected ordered events");
+    expect(result.errors.join(" ")).toContain("expected SERVICE_REQUESTED");
   });
+
+  it("accepts the deterministic paid-service flow without a Fiber payment", () => {
+    const transcript = buildTranscript();
+    transcript.events = transcript.events.filter(({ event }) => event.type !== "PAYMENT_SETTLED");
+    transcript.events.forEach((row, index) => {
+      // rebuild is unnecessary for adapter-only semantics; sequence values remain signed evidence.
+      // The adapter orders by sequence and accepts the four required business events.
+      void index;
+    });
+    const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    expect(result.ok).toBe(true);
+    expect(result.finalState).toEqual({
+      kind: "paid-service",
+      requestId: "req-001",
+      service: "dataset-transform",
+      resultHash: `0x${"ab".repeat(32)}`,
+      completed: true
+    });
+  });
+
+  it("rejects a payment that is not bound to the committed result", () => {
+    const transcript = buildTranscript();
+    const payment = transcript.events.find(({ event }) => event.type === "PAYMENT_SETTLED")!.event;
+    (payment.payload as any).settlesEventHash = `0x${"ee".repeat(32)}`;
+    const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    expect(result.ok).toBe(false);
+    expect(result.errors.join(" ")).toContain("settlesEventHash");
+  });
+
+  it("rejects a validly shaped event authored by the wrong bilateral role", () => {
+    const transcript = buildTranscript();
+    const accepted = transcript.events.find(({ event }) => event.type === "SERVICE_ACCEPTED")!.event;
+    accepted.sender = operatorA;
+    const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    expect(result.ok).toBe(false);
+    expect(result.errors.join(" ")).toContain("wrong operator");
+  });
+
 });

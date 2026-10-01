@@ -46,8 +46,8 @@ async function pair() {
   return { a, b };
 }
 
-async function createSession(a: Awaited<ReturnType<typeof buildOperatorApp>>): Promise<SignedSession> {
-  const response = await a.app.inject({ method: "POST", url: "/admin/sessions", payload: {} });
+async function createSession(a: Awaited<ReturnType<typeof buildOperatorApp>>, payload: Record<string, unknown> = {}): Promise<SignedSession> {
+  const response = await a.app.inject({ method: "POST", url: "/admin/sessions", payload });
   expect(response.statusCode).toBe(201);
   return response.json() as SignedSession;
 }
@@ -79,6 +79,9 @@ describe("two-operator HTTP + separate JSON-file stores", () => {
 
     const close = await a.app.inject({ method: "POST", url: `/admin/sessions/${id}/close`, payload: { finalState: { ok: true } } });
     expect(close.statusCode).toBe(200);
+    expect(close.json().close.close.commitmentVersion).toBe(3);
+    expect(close.json().close.finalState.kind).toBe("generic-bilateral");
+    expect(close.json().close.finalState).not.toEqual({ ok: true });
     expect(a.store.getSession(id)?.status).toBe("CLOSED");
     expect(b.store.getSession(id)?.status).toBe("CLOSED");
 
@@ -161,6 +164,44 @@ describe("two-operator HTTP + separate JSON-file stores", () => {
     expect(a.store.getSession(id)?.status).toBe("DISPUTED");
     expect(a.store.listConflicts(id).filter((conflict) => conflict.kind === "ACK")).toHaveLength(1);
   });
+
+
+  it("derives paid-service final state on both operators instead of signing caller JSON", async () => {
+    const { a, b } = await pair();
+    const signed = await createSession(a, { applicationProfile: "paid-service-v1" });
+    const id = signed.session.sessionId;
+    const requestId = "req-derived-state";
+
+    const send = async (sender: typeof a, receiver: typeof a, type: string, payload: unknown) => {
+      const proposed = await sender.app.inject({ method: "POST", url: `/admin/sessions/${id}/events`, payload: { type, payload } });
+      expect(proposed.statusCode).toBe(201);
+      const event = proposed.json();
+      const ack = await receiver.app.inject({ method: "POST", url: `/admin/sessions/${id}/events/${event.eventHash}/ack`, payload: { decision: "ACCEPT" } });
+      expect(ack.statusCode).toBe(200);
+      return event;
+    };
+
+    await send(a, b, "SERVICE_REQUESTED", { requestId, service: "dataset-transform" });
+    await send(b, a, "SERVICE_ACCEPTED", { requestId });
+    await send(b, a, "RESULT_COMMITTED", { requestId, resultHash: `0x${"ab".repeat(32)}` });
+    await send(b, a, "SESSION_COMPLETED", { requestId });
+
+    const closed = await a.app.inject({
+      method: "POST",
+      url: `/admin/sessions/${id}/close`,
+      payload: { finalState: { forgedByCaller: true } }
+    });
+    expect(closed.statusCode).toBe(200);
+    expect(closed.json().close.finalState).toEqual({
+      kind: "paid-service",
+      requestId,
+      service: "dataset-transform",
+      resultHash: `0x${"ab".repeat(32)}`,
+      completed: true
+    });
+    expect(a.store.getSession(id)?.close?.finalState).toEqual(b.store.getSession(id)?.close?.finalState);
+  });
+
 });
 
 describe("reviewer evidence summary", () => {
