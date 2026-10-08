@@ -40,11 +40,18 @@ export function isPrivateOrSpecialIp(address: string): boolean {
   return true;
 }
 
-export async function validatePeerUrl(input: string, options: {
+export type PeerUrlOptions = {
   publicMode: boolean;
   allowPrivatePeerUrls?: boolean;
   allowedHosts?: Set<string>;
-}): Promise<URL> {
+};
+
+/** DNS is resolved once for the final TCP connection, never only as a precheck. */
+export async function resolvePeerUrl(input: string, options: PeerUrlOptions): Promise<{
+  url: URL;
+  address: string;
+  family: 4 | 6;
+}> {
   const url = new URL(input);
   if (!["http:", "https:"].includes(url.protocol)) throw new Error("PEER_URL_SCHEME_NOT_ALLOWED");
   if (url.username || url.password) throw new Error("PEER_URL_CREDENTIALS_NOT_ALLOWED");
@@ -52,15 +59,23 @@ export async function validatePeerUrl(input: string, options: {
   if (options.publicMode && url.protocol !== "https:") throw new Error("PUBLIC_MODE_REQUIRES_HTTPS_PEER");
   if (options.allowedHosts?.size && !options.allowedHosts.has(url.hostname.toLowerCase())) throw new Error("PEER_HOST_NOT_ALLOWLISTED");
 
+  const literalHost = url.hostname.startsWith("[") && url.hostname.endsWith("]")
+    ? url.hostname.slice(1, -1) : url.hostname;
+  const literalVersion = isIP(literalHost);
+  const addresses = literalVersion
+    ? [{ address: literalHost, family: literalVersion as 4 | 6 }]
+    : await lookup(url.hostname, { all: true, verbatim: true });
+  if (!addresses.length) throw new Error("PEER_DNS_RESOLUTION_EMPTY");
   if (!options.allowPrivatePeerUrls) {
-    const literalVersion = isIP(url.hostname);
-    const addresses = literalVersion ? [{ address: url.hostname }] : await lookup(url.hostname, { all: true, verbatim: true });
-    if (!addresses.length) throw new Error("PEER_DNS_RESOLUTION_EMPTY");
     for (const resolved of addresses) {
-      if (isPrivateOrSpecialIp(resolved.address)) throw new Error(`PEER_ADDRESS_NOT_PUBLIC:${resolved.address}`);
+      if (isPrivateOrSpecialIp(resolved.address)) throw new Error("PEER_ADDRESS_NOT_PUBLIC");
     }
   }
-  return url;
+  return { url, address: addresses[0].address, family: addresses[0].family as 4 | 6 };
+}
+
+export async function validatePeerUrl(input: string, options: PeerUrlOptions): Promise<URL> {
+  return (await resolvePeerUrl(input, options)).url;
 }
 
 export function parseCorsOrigins(raw?: string): string[] {

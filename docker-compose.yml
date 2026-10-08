@@ -1,11 +1,17 @@
 services:
   operator-a:
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
     build:
       context: .
       dockerfile: Dockerfile.operator
     environment:
       OPERATOR_NAME: operator-a
       PORT: 4000
+      BIND_HOST: 0.0.0.0
       SELF_URL: http://operator-a:4000
       DEFAULT_PEER_URL: http://operator-b:4000
       DATA_DIR: /data
@@ -16,6 +22,8 @@ services:
       ALLOW_PRIVATE_PEER_URLS: ${ALLOW_PRIVATE_PEER_URLS:-true}
       PEER_HOST_ALLOWLIST: ${PEER_HOST_ALLOWLIST:-}
       PEER_REQUEST_TIMEOUT_MS: ${PEER_REQUEST_TIMEOUT_MS:-10000}
+      MAX_PEER_RESPONSE_BYTES: ${MAX_PEER_RESPONSE_BYTES:-4194304}
+      OUTBOX_RETRY_INTERVAL_MS: ${OUTBOX_RETRY_INTERVAL_MS:-15000}
       FIBER_ENABLED: ${FIBER_ENABLED:-false}
       FIBER_RPC_URL: ${OPERATOR_A_FIBER_RPC_URL:-}
       FIBER_RPC_TOKEN: ${OPERATOR_A_FIBER_RPC_TOKEN:-}
@@ -30,12 +38,18 @@ services:
     extra_hosts: ["host.docker.internal:host-gateway"]
 
   operator-b:
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
     build:
       context: .
       dockerfile: Dockerfile.operator
     environment:
       OPERATOR_NAME: operator-b
       PORT: 4000
+      BIND_HOST: 0.0.0.0
       SELF_URL: http://operator-b:4000
       DEFAULT_PEER_URL: http://operator-a:4000
       DATA_DIR: /data
@@ -46,6 +60,8 @@ services:
       ALLOW_PRIVATE_PEER_URLS: ${ALLOW_PRIVATE_PEER_URLS:-true}
       PEER_HOST_ALLOWLIST: ${PEER_HOST_ALLOWLIST:-}
       PEER_REQUEST_TIMEOUT_MS: ${PEER_REQUEST_TIMEOUT_MS:-10000}
+      MAX_PEER_RESPONSE_BYTES: ${MAX_PEER_RESPONSE_BYTES:-4194304}
+      OUTBOX_RETRY_INTERVAL_MS: ${OUTBOX_RETRY_INTERVAL_MS:-15000}
       FIBER_ENABLED: ${FIBER_ENABLED:-false}
       FIBER_RPC_URL: ${OPERATOR_B_FIBER_RPC_URL:-}
       FIBER_RPC_TOKEN: ${OPERATOR_B_FIBER_RPC_TOKEN:-}

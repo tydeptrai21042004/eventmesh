@@ -53,6 +53,27 @@ async function createSession(a: Awaited<ReturnType<typeof buildOperatorApp>>, pa
 }
 
 describe("two-operator HTTP + separate JSON-file stores", () => {
+  it("serializes concurrent ACK requests into a single signed ACK without a false dispute", async () => {
+    const { a, b } = await pair();
+    const signed = await createSession(a);
+    const id = signed.session.sessionId;
+    const eventResponse = await a.app.inject({
+      method: "POST", url: `/admin/sessions/${id}/events`, payload: { type: "CONCURRENT_TEST", payload: { n: 1 } }
+    });
+    expect(eventResponse.statusCode).toBe(201);
+    const event = eventResponse.json();
+    const [first, second] = await Promise.all([
+      b.app.inject({ method: "POST", url: `/admin/sessions/${id}/events/${event.eventHash}/ack`, payload: { decision: "ACCEPT" } }),
+      b.app.inject({ method: "POST", url: `/admin/sessions/${id}/events/${event.eventHash}/ack`, payload: { decision: "ACCEPT" } })
+    ]);
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(first.json().ackHash).toBe(second.json().ackHash);
+    expect(b.store.getSession(id)?.status).toBe("ACTIVE");
+    expect(b.store.listConflicts(id)).toEqual([]);
+    expect(b.store.listOutbox("DELIVERED", id).filter((row) => row.kind === "ACK")).toHaveLength(1);
+  });
+
   it("completes a bilateral transcript and never reopens CLOSED on join replay", async () => {
     const { a, b } = await pair();
     const signed = await createSession(a);

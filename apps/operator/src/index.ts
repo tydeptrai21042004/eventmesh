@@ -50,6 +50,8 @@ const { app } = await buildOperatorApp({
   maxBodyBytes: Number(process.env.MAX_BODY_BYTES ?? 262_144),
   peerRateLimitMax: Number(process.env.PEER_RATE_LIMIT_MAX ?? (publicMode ? 120 : 1000)),
   peerRateLimitWindowMs: Number(process.env.PEER_RATE_LIMIT_WINDOW_MS ?? 60_000),
+  maxPeerResponseBytes: Number(process.env.MAX_PEER_RESPONSE_BYTES ?? 4_194_304),
+  outboxRetryIntervalMs: Number(process.env.OUTBOX_RETRY_INTERVAL_MS ?? 15_000),
   fiber,
   ckb,
   ckbRpcUrl: process.env.CKB_RPC_URL,
@@ -57,4 +59,5 @@ const { app } = await buildOperatorApp({
   autoAnchorOnClose: process.env.CKB_AUTO_ANCHOR_ON_CLOSE === "true"
 });
 
-await app.listen({ port, host: process.env.BIND_HOST ?? "0.0.0.0" });
+// Direct local development is loopback-only unless explicitly exposed.
+await app.listen({ port, host: process.env.BIND_HOST ?? (publicMode ? "0.0.0.0" : "127.0.0.1") });

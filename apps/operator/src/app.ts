@@ -34,6 +34,7 @@ import {
   deriveGenericBilateralFinalState,
   finalStateHashFrom,
   GENERIC_BILATERAL_PROFILE,
+  sha256Hex,
   signAck,
   signFiberPaymentEvidence,
   signEvent,
@@ -51,6 +52,7 @@ import { PAID_SERVICE_PROFILE, paidServiceReferenceAdapter, validateTranscriptWi
 import { Store } from "./store.js";
 import { loadIdentity } from "./identity.js";
 import { adminTokenMatches, extractAdminToken, validatePeerUrl } from "./security.js";
+import { pinnedPeerFetch, type PeerHttpResponse } from "./peer-http.js";
 
 export type OperatorAppOptions = {
   name: string;
@@ -68,6 +70,8 @@ export type OperatorAppOptions = {
   peerRateLimitMax?: number;
   peerRateLimitWindowMs?: number;
   peerRateLimitMaxTrackedPeers?: number;
+  maxPeerResponseBytes?: number;
+  outboxRetryIntervalMs?: number;
   fiber?: FiberRpcClient;
   ckb?: CkbAnchorClient;
   ckbRpcUrl?: string;
@@ -98,16 +102,44 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   const peerRateLimitMax = options.peerRateLimitMax ?? (publicMode ? 120 : 1000);
   const peerRateLimitWindowMs = options.peerRateLimitWindowMs ?? 60_000;
   const peerRateLimitMaxTrackedPeers = Math.max(128, options.peerRateLimitMaxTrackedPeers ?? 4096);
+  const maxPeerResponseBytes = options.maxPeerResponseBytes ?? 4 * 1024 * 1024;
+  const outboxRetryIntervalMs = options.outboxRetryIntervalMs ?? 15_000;
+  for (const [name, value] of Object.entries({ requestTimeoutMs, maxBodyBytes, peerRateLimitMax, peerRateLimitWindowMs, maxPeerResponseBytes, outboxRetryIntervalMs })) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`INVALID_OPERATOR_CONFIG:${name}`);
+  }
   const ckbMinConfirmations = Math.max(0, options.ckbMinConfirmations ?? (publicMode ? 2 : 0));
   if (publicMode && !options.adminToken) throw new Error("PUBLIC_MODE_REQUIRES_ADMIN_TOKEN");
   if (publicMode && !options.selfUrl.startsWith("https://")) throw new Error("PUBLIC_MODE_REQUIRES_HTTPS_SELF_URL");
 
   mkdirSync(options.dataDir, { recursive: true });
-  const identity = loadIdentity(options.dataDir, options.operatorPrivateKey);
+  const identity = loadIdentity(options.dataDir, options.operatorPrivateKey, publicMode);
   const store = new Store(join(options.dataDir, "eventmesh-state.json"));
   const app = Fastify({ logger: process.env.NODE_ENV !== "test", bodyLimit: maxBodyBytes });
   const corsOrigins = new Set(options.corsOrigins ?? ["http://localhost:3000"]);
   const peerRate = new Map<string, { count: number; resetAt: number }>();
+  const sessionQueues = new Map<string, Promise<void>>();
+  const deliveryInFlight = new Map<string, Promise<{ id: string; delivered: boolean; error?: string }>>();
+
+  // Requests for one session are ordered across awaits (including Fiber RPC).
+  // This guards against duplicate ACK/close signatures and accidental forks in
+  // this single-process operator. The store lock disallows a second writer.
+  function serialized(handler: Handler): Handler {
+    return async (req, reply) => {
+      const sessionId = String(req.params?.id ?? "");
+      if (!sessionId) return handler(req, reply);
+      const previous = sessionQueues.get(sessionId) ?? Promise.resolve();
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => { release = resolve; });
+      const tail = previous.then(() => pending);
+      sessionQueues.set(sessionId, tail);
+      await previous;
+      try { return await handler(req, reply); }
+      finally {
+        release();
+        if (sessionQueues.get(sessionId) === tail) sessionQueues.delete(sessionId);
+      }
+    };
+  }
 
   await app.register(cors, {
     origin(origin, callback) {
@@ -117,7 +149,17 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     methods: ["GET", "POST"]
   });
 
-  app.addHook("onClose", async () => store.close());
+  let recoveryTimer: ReturnType<typeof setInterval> | undefined;
+  let recoveryPromise: Promise<void> | undefined;
+  let stopping = false;
+  app.addHook("onClose", async () => {
+    stopping = true;
+    if (recoveryTimer) clearInterval(recoveryTimer);
+    if (recoveryPromise) await recoveryPromise;
+    // Wait for in-flight deliveries before releasing the single-writer lock.
+    await Promise.allSettled([...deliveryInFlight.values()]);
+    store.close();
+  });
   app.addHook("onRequest", async (req, reply) => {
     if (!req.url.startsWith("/peer/")) return;
     const now = Date.now();
@@ -164,10 +206,16 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     return normalizedUrl(url.toString());
   }
 
-  async function peerFetch(url: string, init?: RequestInit): Promise<Response> {
+  async function peerFetch(url: string, init?: { method?: "GET" | "POST"; headers?: Record<string, string>; body?: string }): Promise<PeerHttpResponse> {
     const parsed = new URL(url);
-    await checkedPeerBase(`${parsed.protocol}//${parsed.host}`);
-    return fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(requestTimeoutMs) });
+    if (!/^\/(?:identity|peer\/sessions\/[a-zA-Z0-9_-]+\/(?:join|events|acks|close|anchor|head))$/.test(parsed.pathname)) {
+      throw new Error("PEER_REQUEST_PATH_NOT_ALLOWED");
+    }
+    if (parsed.search || parsed.hash) throw new Error("PEER_REQUEST_PATH_NOT_ALLOWED");
+    return pinnedPeerFetch(url, {
+      publicMode, allowPrivatePeerUrls, allowedHosts: options.allowedPeerHosts,
+      timeoutMs: requestTimeoutMs, maxResponseBytes: maxPeerResponseBytes
+    }, init);
   }
 
   async function postJson<T>(url: string, body: unknown): Promise<T> {
@@ -177,7 +225,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       body: JSON.stringify(body)
     });
     const text = await response.text();
-    if (!response.ok) throw new Error(`Peer ${response.status}: ${text}`);
+    if (!response.ok) throw new Error(`PEER_HTTP_${response.status}`);
     return text ? JSON.parse(text) as T : ({} as T);
   }
 
@@ -194,11 +242,12 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const base = await checkedPeerBase(peerUrlFor(session));
     const response = await peerFetch(`${base}${path}`);
     const text = await response.text();
-    if (!response.ok) throw new Error(`Peer ${response.status}: ${text}`);
+    if (!response.ok) throw new Error(`PEER_HTTP_${response.status}`);
     return text ? JSON.parse(text) as T : ({} as T);
   }
 
-  async function deliverOutboxRow(row: ReturnType<Store["listOutbox"]>[number]) {
+  async function deliverOutboxRowOnce(row: ReturnType<Store["listOutbox"]>[number]) {
+    if (store.getOutbox(row.id)?.status === "DELIVERED") return { id: row.id, delivered: true };
     const session = store.getSession(row.sessionId);
     if (!session) {
       store.markOutboxAttempt(row.id, "SESSION_NOT_FOUND");
@@ -210,11 +259,50 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       store.markOutboxDelivered(row.id);
       return { id: row.id, delivered: true };
     } catch (error) {
-      const detail = String(error);
+      const detail = error instanceof Error ? error.message.slice(0, 200) : "PEER_DELIVERY_FAILED";
       store.markOutboxAttempt(row.id, detail);
       return { id: row.id, delivered: false, error: detail };
     }
   }
+
+  // All paths (auto-retry, admin drain, immediate send) share the same attempt.
+  function deliverOutboxRow(row: ReturnType<Store["listOutbox"]>[number]) {
+    const existing = deliveryInFlight.get(row.id);
+    if (existing) return existing;
+    const task = deliverOutboxRowOnce(row);
+    deliveryInFlight.set(row.id, task);
+    void task.finally(() => { if (deliveryInFlight.get(row.id) === task) deliveryInFlight.delete(row.id); }).catch(() => {});
+    return task;
+  }
+
+  let recoveryRunning = false;
+  let recoveryCycles = 0;
+  async function recoverPendingOutbox() {
+    if (recoveryRunning) return;
+    recoveryRunning = true;
+    try {
+      const now = Date.now();
+      const ready = store.listOutbox("PENDING").filter((row) => {
+        const lastAttempt = row.lastAttemptAt ? Date.parse(row.lastAttemptAt) : 0;
+        const baseDelay = Math.min(300_000, 2000 * 2 ** Math.min(8, Math.max(0, row.attempts - 1)));
+        const jitter = 0.8 + parseInt(sha256Hex(row.id).slice(2, 4), 16) / 255 * 0.4;
+        return !lastAttempt || !Number.isFinite(lastAttempt) || now - lastAttempt >= baseDelay * jitter;
+      }).slice(0, 25);
+      for (const row of ready) {
+        if (stopping) break;
+        await deliverOutboxRow(row);
+      }
+      if (++recoveryCycles % 240 === 0 && !stopping) store.pruneDeliveredOutbox();
+    } catch (error) {
+      app.log.error({ error }, "Outbox recovery failure");
+    } finally { recoveryRunning = false; }
+  }
+  recoveryTimer = setInterval(() => {
+    if (!recoveryPromise && !stopping) {
+      recoveryPromise = recoverPendingOutbox().finally(() => { recoveryPromise = undefined; });
+    }
+  }, outboxRetryIntervalMs);
+  recoveryTimer.unref();
 
   async function queueAndDeliver(input: {
     id: string;
@@ -226,7 +314,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const row = store.enqueueOutbox(input);
     if (row.status === "DELIVERED") return { id: row.id, status: "DELIVERED" as const, attempts: row.attempts };
     const result = await deliverOutboxRow(row);
-    const current = store.listOutbox(undefined, input.sessionId).find((item) => item.id === input.id)!;
+    const current = store.getOutbox(input.id)!;
     return {
       id: row.id,
       status: result.delivered ? "DELIVERED" as const : "PENDING" as const,
@@ -1279,16 +1367,16 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.get("/admin/sessions/:id/evidence-summary", getEvidenceSummary);
   app.get("/admin/outbox", listOutbox);
   app.post("/admin/outbox/drain", drainOutbox);
-  app.post("/admin/sessions/:id/reconcile", reconcileSession);
+  app.post("/admin/sessions/:id/reconcile", serialized(reconcileSession));
   app.post("/admin/sessions", createSession);
-  app.post("/admin/sessions/:id/join/retry", retrySessionJoin);
-  app.post("/admin/sessions/:id/events", proposeEvent);
-  app.post("/admin/sessions/:id/events/:eventHash/retry", retryEvent);
-  app.post("/admin/sessions/:id/events/:eventHash/ack", ackEvent);
-  app.post("/admin/sessions/:id/close", closeSession);
-  app.post("/admin/sessions/:id/anchor", createAnchor);
-  app.post("/admin/sessions/:id/anchor/reconcile", reconcileAnchorHandler);
-  app.post("/admin/sessions/:id/anchor/retry-peer", retryAnchorPeer);
+  app.post("/admin/sessions/:id/join/retry", serialized(retrySessionJoin));
+  app.post("/admin/sessions/:id/events", serialized(proposeEvent));
+  app.post("/admin/sessions/:id/events/:eventHash/retry", serialized(retryEvent));
+  app.post("/admin/sessions/:id/events/:eventHash/ack", serialized(ackEvent));
+  app.post("/admin/sessions/:id/close", serialized(closeSession));
+  app.post("/admin/sessions/:id/anchor", serialized(createAnchor));
+  app.post("/admin/sessions/:id/anchor/reconcile", serialized(reconcileAnchorHandler));
+  app.post("/admin/sessions/:id/anchor/retry-peer", serialized(retryAnchorPeer));
   app.post("/admin/fiber/new-invoice", newInvoice);
   app.post("/admin/fiber/send-payment", sendPayment);
   app.get("/admin/fiber/payments/:hash", getPayment);
@@ -1296,30 +1384,30 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
 
   // ---------- canonical v0.2 peer API ----------
   app.get("/peer/sessions/:id/head", getPeerHead);
-  app.post("/peer/sessions/:id/join", joinSession);
-  app.post("/peer/sessions/:id/events", receiveEvent);
-  app.post("/peer/sessions/:id/acks", receiveAck);
-  app.post("/peer/sessions/:id/close", receiveClose);
-  app.post("/peer/sessions/:id/anchor", receiveAnchor);
+  app.post("/peer/sessions/:id/join", serialized(joinSession));
+  app.post("/peer/sessions/:id/events", serialized(receiveEvent));
+  app.post("/peer/sessions/:id/acks", serialized(receiveAck));
+  app.post("/peer/sessions/:id/close", serialized(receiveClose));
+  app.post("/peer/sessions/:id/anchor", serialized(receiveAnchor));
 
   // ---------- v0.1 compatibility aliases (deprecated) ----------
   app.get("/sessions", listSessions);
   app.get("/sessions/:id", getSession);
   app.get("/sessions/:id/transcript", getTranscript);
   app.post("/sessions", createSession);
-  app.post("/sessions/:id/join/retry", retrySessionJoin);
-  app.post("/sessions/:id/join", joinSession);
-  app.post("/sessions/:id/events", proposeEvent);
-  app.post("/sessions/:id/events/receive", receiveEvent);
-  app.post("/sessions/:id/events/:eventHash/retry", retryEvent);
-  app.post("/sessions/:id/events/:eventHash/ack", ackEvent);
-  app.post("/sessions/:id/acks/receive", receiveAck);
-  app.post("/sessions/:id/close", closeSession);
-  app.post("/sessions/:id/close/receive", receiveClose);
-  app.post("/sessions/:id/anchor", createAnchor);
-  app.post("/sessions/:id/anchor/receive", receiveAnchor);
-  app.post("/sessions/:id/anchor/reconcile", reconcileAnchorHandler);
-  app.post("/sessions/:id/anchor/retry-peer", retryAnchorPeer);
+  app.post("/sessions/:id/join/retry", serialized(retrySessionJoin));
+  app.post("/sessions/:id/join", serialized(joinSession));
+  app.post("/sessions/:id/events", serialized(proposeEvent));
+  app.post("/sessions/:id/events/receive", serialized(receiveEvent));
+  app.post("/sessions/:id/events/:eventHash/retry", serialized(retryEvent));
+  app.post("/sessions/:id/events/:eventHash/ack", serialized(ackEvent));
+  app.post("/sessions/:id/acks/receive", serialized(receiveAck));
+  app.post("/sessions/:id/close", serialized(closeSession));
+  app.post("/sessions/:id/close/receive", serialized(receiveClose));
+  app.post("/sessions/:id/anchor", serialized(createAnchor));
+  app.post("/sessions/:id/anchor/receive", serialized(receiveAnchor));
+  app.post("/sessions/:id/anchor/reconcile", serialized(reconcileAnchorHandler));
+  app.post("/sessions/:id/anchor/retry-peer", serialized(retryAnchorPeer));
   app.post("/fiber/new-invoice", newInvoice);
   app.post("/fiber/send-payment", sendPayment);
   app.get("/fiber/payments/:hash", getPayment);
@@ -1327,7 +1415,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
 
   app.setErrorHandler((error, _req, reply) => {
     app.log.error(error);
-    reply.code((error as any).statusCode ?? 400).send({ error: "REQUEST_FAILED", detail: error.message });
+    if (error instanceof z.ZodError) {
+      return reply.code(400).send({ error: "INVALID_REQUEST", fields: error.issues.slice(0, 8).map((issue) => ({ path: issue.path.join("."), code: issue.code })) });
+    }
+    const status = Number((error as any).statusCode);
+    if (Number.isInteger(status) && status >= 400 && status < 500) {
+      return reply.code(status).send({ error: "REQUEST_FAILED" });
+    }
+    return reply.code(500).send({ error: "INTERNAL_ERROR" });
   });
 
   return { app, store, identity };

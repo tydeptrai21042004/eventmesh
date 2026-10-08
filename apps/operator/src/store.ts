@@ -1,8 +1,13 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { dirname, resolve } from "node:path";
 import {
   canonical,
   sha256Hex,
+  SignedSessionSchema,
+  SignedEventSchema,
+  SignedAckSchema,
   SignedFiberPaymentEvidenceSchema,
   type ConflictEvidence,
   type FiberPaymentClaim,
@@ -73,24 +78,57 @@ type FileState = {
 const emptyState = (): FileState => ({
   version: 1,
   nextOrder: 1,
-  sessions: {},
-  events: {},
+  sessions: Object.create(null),
+  events: Object.create(null),
   conflicts: [],
-  paymentClaims: {},
-  paymentEvidence: {},
-  outbox: {}
+  paymentClaims: Object.create(null),
+  paymentEvidence: Object.create(null),
+  outbox: Object.create(null)
 });
+
+function record(value: unknown): Record<string, any> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("EVENTMESH_STATE_INVALID");
+  return Object.assign(Object.create(null), value);
+}
 
 function parseState(raw: string): FileState {
   const value = JSON.parse(raw);
-  if (!value || value.version !== 1) throw new Error("EVENTMESH_STATE_INVALID");
+  if (!value || value.version !== 1 || !Number.isSafeInteger(value.nextOrder) || value.nextOrder < 1 || !Array.isArray(value.conflicts)) {
+    throw new Error("EVENTMESH_STATE_INVALID");
+  }
 
   // v0.6 hardens receiver observations by requiring an operator signature.
   // Older state files may contain unsigned evidence rows; do not accidentally
   // promote those rows to trusted signed evidence. The accepted payment claim
   // remains in paymentClaims/events and can still be exported in legacy mode.
   const paymentEvidence: Record<string, PaymentEvidenceRow> = {};
-  for (const [paymentHash, row] of Object.entries(value.paymentEvidence || {})) {
+  const sessions = record(value.sessions ?? {});
+  const events = record(value.events ?? {});
+  const outbox = record(value.outbox ?? {});
+  for (const [id, row] of Object.entries(sessions)) {
+    if (!row || !SignedSessionSchema.safeParse(row.signed).success || row.signed.session.sessionId !== id
+      || typeof row.status !== "string" || !Number.isSafeInteger(row.order)) {
+      throw new Error("EVENTMESH_STATE_INVALID_SESSION");
+    }
+  }
+  for (const [hash, row] of Object.entries(events)) {
+    if (!row || !SignedEventSchema.safeParse(row.event).success
+      || row.event.eventHash.toLowerCase() !== hash.toLowerCase()
+      || typeof row.status !== "string"
+      || (row.ack && !SignedAckSchema.safeParse(row.ack).success)) {
+      throw new Error("EVENTMESH_STATE_INVALID_EVENT");
+    }
+  }
+  for (const [id, row] of Object.entries(outbox)) {
+    if (!row || row.id !== id || typeof row.sessionId !== "string"
+      || !["EVENT", "ACK", "ANCHOR_NOTICE"].includes(row.kind)
+      || !["PENDING", "DELIVERED"].includes(row.status)
+      || !Number.isSafeInteger(row.attempts) || row.attempts < 0
+      || typeof row.path !== "string" || !row.path.startsWith("/peer/sessions/")) {
+      throw new Error("EVENTMESH_STATE_INVALID_OUTBOX");
+    }
+  }
+  for (const [paymentHash, row] of Object.entries(record(value.paymentEvidence ?? {}))) {
     const candidate = (row as any)?.evidence;
     const parsed = SignedFiberPaymentEvidenceSchema.safeParse(candidate);
     if (parsed.success) {
@@ -104,49 +142,126 @@ function parseState(raw: string): FileState {
   return {
     ...emptyState(),
     ...value,
-    sessions: value.sessions || {},
-    events: value.events || {},
-    conflicts: value.conflicts || [],
-    paymentClaims: value.paymentClaims || {},
-    paymentEvidence,
-    outbox: value.outbox || {}
+    sessions,
+    events,
+    conflicts: value.conflicts,
+    paymentClaims: record(value.paymentClaims ?? {}),
+    paymentEvidence: record(paymentEvidence),
+    outbox
   };
 }
 
 /**
  * Durable operator state without a database engine. Each mutation rewrites one
- * compact JSON document through temp-file + rename, which is sufficient for the
- * single-process reference operator deployment model.
+ * compact JSON document through a synced temp-file + atomic rename, with an
+ * exclusive same-host writer lock. This is a single-host reference store, NOT
+ * an alternative to a transactional database for multi-replica deployments.
  */
 export class Store {
   private readonly path: string;
+  private readonly lockPath: string;
+  private readonly lockId = randomUUID();
+  private closed = false;
+  private durableSnapshot = "";
   private state: FileState;
 
   constructor(path: string) {
     this.path = resolve(path);
+    this.lockPath = `${this.path}.lock`;
     mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
+    this.acquireLock();
     try {
-      this.state = parseState(readFileSync(this.path, "utf8"));
-    } catch (error: any) {
-      if (error?.code !== "ENOENT") throw error;
-      this.state = emptyState();
-      this.persist();
+      try {
+        const contents = readFileSync(this.path, "utf8");
+        this.state = parseState(contents);
+        this.durableSnapshot = JSON.stringify(this.state);
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") throw error;
+        this.state = emptyState();
+        this.persist();
+      }
+    } catch (error) {
+      this.releaseLock();
+      throw error;
     }
   }
 
+  private acquireLock() {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = openSync(this.lockPath, "wx", 0o600);
+        try {
+          writeFileSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), id: this.lockId }));
+          fsyncSync(fd);
+        } finally { closeSync(fd); }
+        return;
+      } catch (error: any) {
+        if (error?.code !== "EEXIST") throw error;
+        let owner: any;
+        try { owner = JSON.parse(readFileSync(this.lockPath, "utf8")); }
+        catch { throw new Error("EVENTMESH_STORE_LOCK_UNREADABLE"); }
+        if (owner.host !== hostname() || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
+          throw new Error("EVENTMESH_STORE_ALREADY_LOCKED");
+        }
+        try { process.kill(owner.pid, 0); throw new Error("EVENTMESH_STORE_ALREADY_LOCKED"); }
+        catch (processError: any) {
+          if (processError?.code !== "ESRCH") throw processError;
+        }
+        // Only clear a demonstrably dead process's lock on this same host.
+        unlinkSync(this.lockPath);
+      }
+    }
+    throw new Error("EVENTMESH_STORE_ALREADY_LOCKED");
+  }
+
+  private releaseLock() {
+    try {
+      const owner = JSON.parse(readFileSync(this.lockPath, "utf8"));
+      if (owner.id === this.lockId) unlinkSync(this.lockPath);
+    } catch { /* do not delete another process's lock */ }
+  }
+
   private persist() {
-    const tmp = `${this.path}.${process.pid}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(this.state)}\n`, { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, this.path);
-    try { chmodSync(this.path, 0o600); } catch { /* best effort on non-POSIX filesystems */ }
+    if (this.closed) throw new Error("EVENTMESH_STORE_CLOSED");
+    const contents = `${JSON.stringify(this.state)}\n`;
+    const tmp = `${this.path}.${randomUUID()}.tmp`;
+    let fd: number | undefined;
+    let renamed = false;
+    try {
+      fd = openSync(tmp, "wx", 0o600);
+      writeFileSync(fd, contents, "utf8");
+      fsyncSync(fd);
+      closeSync(fd);
+      fd = undefined;
+      renameSync(tmp, this.path);
+      renamed = true;
+      // fsync the containing directory to make the rename durable on POSIX.
+      if (process.platform !== "win32") {
+        const dirFd = openSync(dirname(this.path), "r");
+        try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+      }
+      this.durableSnapshot = contents;
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd);
+      if (!renamed && existsSync(tmp)) unlinkSync(tmp);
+      // Prior to rename, no observable on-disk state changed. Roll back RAM.
+      if (!renamed && this.durableSnapshot) this.state = parseState(this.durableSnapshot);
+      // After rename the state may have committed; keep RAM consistent and
+      // fail the request rather than falsely claiming a durable commit.
+      if (renamed) this.durableSnapshot = contents;
+      throw error;
+    }
   }
 
   close() {
-    this.persist();
+    if (this.closed) return;
+    try { this.persist(); }
+    finally { this.closed = true; this.releaseLock(); }
   }
 
   getEventBySequence(sessionId: string, sequence: number) {
-    return Object.values(this.state.events).find((row) => row.event.sessionId === sessionId && row.event.sequence === sequence);
+    const value = Object.values(this.state.events).find((row) => row.event.sessionId === sessionId && row.event.sequence === sequence);
+    return value && structuredClone(value);
   }
 
   private conflict(sessionId: string, kind: ConflictEvidence["kind"], existing: unknown, incoming: unknown) {
@@ -158,7 +273,7 @@ export class Store {
     const sessionId = session.session.sessionId;
     const existing = this.state.sessions[sessionId];
     if (!existing) {
-      this.state.sessions[sessionId] = { signed: session, status, order: this.state.nextOrder++ };
+      this.state.sessions[sessionId] = { signed: structuredClone(session), status, order: this.state.nextOrder++ };
       this.persist();
       return "INSERTED";
     }
@@ -184,11 +299,11 @@ export class Store {
     const row = this.state.sessions[sessionId];
     if (!row) return undefined;
     return {
-      signed: row.signed,
+      signed: structuredClone(row.signed),
       status: row.status,
-      closeProposal: row.closeProposal,
-      close: row.close,
-      anchor: row.anchor
+      closeProposal: row.closeProposal && structuredClone(row.closeProposal),
+      close: row.close && structuredClone(row.close),
+      anchor: row.anchor && structuredClone(row.anchor)
     };
   }
 
@@ -208,9 +323,9 @@ export class Store {
       .map(([sessionId, row]) => ({
         sessionId,
         status: row.status,
-        session: row.signed.session,
-        close: row.close,
-        anchor: row.anchor
+        session: structuredClone(row.signed.session),
+        close: row.close && structuredClone(row.close),
+        anchor: row.anchor && structuredClone(row.anchor)
       }));
   }
 
@@ -227,26 +342,28 @@ export class Store {
       return "CONFLICT";
     }
 
-    this.state.events[key] = { event, status };
+    this.state.events[key] = { event: structuredClone(event), status };
     this.persist();
     return "INSERTED";
   }
 
   getEvent(eventHash: string) {
-    return this.state.events[eventHash.toLowerCase()];
+    const value = this.state.events[eventHash.toLowerCase()];
+    return value && structuredClone(value);
   }
 
   listEvents(sessionId: string) {
     return Object.values(this.state.events)
       .filter((row) => row.event.sessionId === sessionId)
-      .sort((a, b) => a.event.sequence - b.event.sequence);
+      .sort((a, b) => a.event.sequence - b.event.sequence)
+      .map((row) => structuredClone(row));
   }
 
   saveAck(ack: SignedAck): WriteResult {
     const row = this.state.events[ack.eventHash.toLowerCase()];
     if (!row) return "NOT_FOUND";
     if (!row.ack) {
-      row.ack = ack;
+      row.ack = structuredClone(ack);
       row.status = "FINAL";
       this.persist();
       return "INSERTED";
@@ -266,7 +383,7 @@ export class Store {
       this.persist();
       return "CONFLICT";
     }
-    existing.closeProposal = close;
+    existing.closeProposal = structuredClone(close);
     existing.status = "CLOSING";
     this.persist();
     return "INSERTED";
@@ -281,8 +398,8 @@ export class Store {
       this.persist();
       return "CONFLICT";
     }
-    existing.close = close;
-    existing.closeProposal ||= close;
+    existing.close = structuredClone(close);
+    existing.closeProposal ||= structuredClone(close);
     existing.status = "CLOSED";
     this.persist();
     return "INSERTED";
@@ -293,7 +410,7 @@ export class Store {
     if (!existing) return "NOT_FOUND";
     if (existing.anchor) {
       if (existing.anchor.txHash === anchor.txHash && existing.anchor.dataHex === anchor.dataHex) {
-        existing.anchor = anchor;
+        existing.anchor = structuredClone(anchor);
         this.persist();
         return "IDEMPOTENT";
       }
@@ -301,7 +418,7 @@ export class Store {
       this.persist();
       return "CONFLICT";
     }
-    existing.anchor = anchor;
+    existing.anchor = structuredClone(anchor);
     this.persist();
     return "INSERTED";
   }
@@ -310,7 +427,7 @@ export class Store {
     const paymentHash = claim.paymentHash.toLowerCase();
     const row = this.state.paymentClaims[paymentHash];
     if (!row) {
-      this.state.paymentClaims[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), claim };
+      this.state.paymentClaims[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), claim: structuredClone(claim) };
       this.persist();
       return "INSERTED";
     }
@@ -328,7 +445,7 @@ export class Store {
     const paymentHash = evidence.evidence.claim.paymentHash.toLowerCase();
     const row = this.state.paymentEvidence[paymentHash];
     if (!row) {
-      this.state.paymentEvidence[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), evidence };
+      this.state.paymentEvidence[paymentHash] = { sessionId, eventHash: eventHash.toLowerCase(), evidence: structuredClone(evidence) };
       this.persist();
       return "INSERTED";
     }
@@ -354,7 +471,7 @@ export class Store {
     return Object.entries(this.state.paymentEvidence)
       .filter(([, row]) => row.sessionId === sessionId)
       .sort(([a], [b]) => a.localeCompare(b))
-      .map(([, row]) => row.evidence);
+      .map(([, row]) => structuredClone(row.evidence));
   }
 
   enqueueOutbox(input: Omit<OutboxRow, "status" | "attempts" | "createdAt" | "updatedAt">): OutboxRow {
@@ -363,13 +480,13 @@ export class Store {
       if (existing.sessionId !== input.sessionId || existing.path !== input.path || canonical(existing.body) !== canonical(input.body)) {
         throw new Error("OUTBOX_ID_CONFLICT");
       }
-      return existing;
+      return structuredClone(existing);
     }
     const now = new Date().toISOString();
-    const row: OutboxRow = { ...input, status: "PENDING", attempts: 0, createdAt: now, updatedAt: now };
+    const row: OutboxRow = { ...structuredClone(input), status: "PENDING", attempts: 0, createdAt: now, updatedAt: now };
     this.state.outbox[input.id] = row;
     this.persist();
-    return row;
+    return structuredClone(row);
   }
 
   markOutboxAttempt(id: string, error?: string): OutboxRow | undefined {
@@ -382,7 +499,7 @@ export class Store {
     if (error) row.lastError = error;
     else delete row.lastError;
     this.persist();
-    return row;
+    return structuredClone(row);
   }
 
   markOutboxDelivered(id: string): OutboxRow | undefined {
@@ -394,13 +511,36 @@ export class Store {
     row.updatedAt = now;
     delete row.lastError;
     this.persist();
-    return row;
+    return structuredClone(row);
   }
 
   listOutbox(status?: "PENDING" | "DELIVERED", sessionId?: string): OutboxRow[] {
     return Object.values(this.state.outbox)
       .filter((row) => (!status || row.status === status) && (!sessionId || row.sessionId === sessionId))
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .map((row) => structuredClone(row));
+  }
+
+  getOutbox(id: string): OutboxRow | undefined {
+    const value = this.state.outbox[id];
+    return value && structuredClone(value);
+  }
+
+  /** Bound delivery bookkeeping growth; signed event/ACK evidence is retained. */
+  pruneDeliveredOutbox(keep = 2000, minAgeMs = 7 * 24 * 60 * 60 * 1000): number {
+    const delivered = Object.values(this.state.outbox)
+      .filter((row) => row.status === "DELIVERED")
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const cutoff = Date.now() - minAgeMs;
+    let removed = 0;
+    for (const row of delivered.slice(keep)) {
+      if (Date.parse(row.deliveredAt ?? row.updatedAt) < cutoff) {
+        delete this.state.outbox[row.id];
+        removed++;
+      }
+    }
+    if (removed) this.persist();
+    return removed;
   }
 
   sessionHead(sessionId: string) {
@@ -428,7 +568,7 @@ export class Store {
   listConflicts(sessionId: string): ConflictEvidence[] {
     return this.state.conflicts
       .filter((row) => row.sessionId === sessionId)
-      .map(({ sessionId: _sessionId, ...conflict }) => conflict);
+      .map(({ sessionId: _sessionId, ...conflict }) => structuredClone(conflict));
   }
 
   exportTranscript(sessionId: string): TranscriptExport | undefined {
