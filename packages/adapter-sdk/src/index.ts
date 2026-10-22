@@ -37,4 +37,4 @@ export function validateTranscriptWithAdapter<TState>(
   return { ok: true, errors, finalState: adapter.deriveFinalState(transcript) };
 }
 
-export { paidServiceReferenceAdapter, PAID_SERVICE_EVENT_TYPES, PAID_SERVICE_PROFILE } from "./paid-service.js";
+export { paidServiceReferenceAdapter, PAID_SERVICE_EVENT_TYPES, PAID_SERVICE_PROFILE, PAID_SERVICE_V2_PROFILE, paidServiceStrictAdapter } from "./paid-service.js";

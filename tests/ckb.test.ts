@@ -61,4 +61,14 @@ describe("CKB anchor verification", () => {
     vi.stubGlobal("fetch", vi.fn(async () => response({ tx_status: { status: "committed" }, transaction: { outputs_data: ["0x00"] } })));
     expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex)).toMatchObject({ ok: false, status: "COMMITMENT_NOT_FOUND" });
   });
+  it("rejects a transaction hash unknown to the RPC", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response(null)));
+    expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex)).toMatchObject({ ok: false, status: "TX_NOT_FOUND" });
+  });
+
+  it("distinguishes RPC transport failure from chain rejection", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("node offline"); }));
+    expect(await inspectAnchorRpc("http://ckb.test", txHash, dataHex)).toMatchObject({ ok: false, status: "RPC_EXCEPTION" });
+  });
+
 });

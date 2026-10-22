@@ -265,4 +265,30 @@ describe("reviewer evidence summary", () => {
     });
     expect(summary.ckb.anchorStatus).toBe("NONE");
   });
+  it("advertises strict v2 and prevents paid-service close without payment", async () => {
+    const { a, b } = await pair();
+    const advertised = await a.app.inject({ method: "GET", url: "/identity" });
+    expect(advertised.statusCode).toBe(200);
+    expect(advertised.json().applicationProfiles).toContainEqual(expect.objectContaining({ id: "paid-service", version: "2.0.0" }));
+
+    const signed = await createSession(a, { applicationProfile: "paid-service-v2" });
+    const id = signed.session.sessionId;
+    const send = async (sender: typeof a, receiver: typeof a, type: string, payload: unknown) => {
+      const proposed = await sender.app.inject({ method: "POST", url: `/admin/sessions/${id}/events`, payload: { type, payload } });
+      expect(proposed.statusCode).toBe(201);
+      const acknowledged = await receiver.app.inject({ method: "POST", url: `/admin/sessions/${id}/events/${proposed.json().eventHash}/ack`, payload: { decision: "ACCEPT" } });
+      expect(acknowledged.statusCode).toBe(200);
+    };
+    const requestId = "v2-no-unverified-payment";
+    await send(a, b, "SERVICE_REQUESTED", { requestId, service: "computation" });
+    await send(b, a, "SERVICE_ACCEPTED", { requestId });
+    await send(b, a, "RESULT_COMMITTED", { requestId, resultHash: `0x${"ab".repeat(32)}` });
+    await send(b, a, "SESSION_COMPLETED", { requestId });
+
+    const close = await a.app.inject({ method: "POST", url: `/admin/sessions/${id}/close`, payload: {} });
+    expect(close.statusCode).toBeGreaterThanOrEqual(400);
+    expect(a.store.getSession(id)?.status).not.toBe("CLOSED");
+    expect(b.store.getSession(id)?.status).not.toBe("CLOSED");
+  });
+
 });

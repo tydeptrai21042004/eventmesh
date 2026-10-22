@@ -26,7 +26,10 @@
     "build:demo": "npm --workspace @eventmesh/demo run build",
     "vercel-build": "npm run build:runtime && npm run build:demo",
     "build:runtime": "npm --workspace @eventmesh/core run build && npm --workspace @eventmesh/fiber run build && npm --workspace @eventmesh/ckb run build && npm --workspace @eventmesh/adapter-sdk run build",
-    "health:remote": "node scripts/verify-deployment.mjs"
+    "health:remote": "node scripts/verify-deployment.mjs",
+    "test:evidence": "node --test tests/*.node.test.mjs",
+    "test:faults": "vitest run tests/store.test.ts tests/crash-recovery.test.ts tests/operator.integration.test.ts tests/production-hardening.test.ts tests/ckb.test.ts",
+    "check:all": "npm run check && npm run test:evidence"
   },
   "devDependencies": {
     "@types/node": "22.15.0",

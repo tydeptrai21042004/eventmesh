@@ -12,7 +12,7 @@ import {
   type SignedEvent,
   type TranscriptExport
 } from "@eventmesh/core";
-import { paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
+import { PAID_SERVICE_PROFILE, PAID_SERVICE_V2_PROFILE, paidServiceReferenceAdapter, paidServiceStrictAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
 
 const keyA = `0x${"01".repeat(32)}`;
 const keyB = `0x${"02".repeat(32)}`;
@@ -139,6 +139,36 @@ describe("paid-service reference adapter", () => {
     const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
     expect(result.ok).toBe(false);
     expect(result.errors.join(" ")).toContain("wrong operator");
+  });
+
+  it("preserves the signed legacy v1 rules hash while making v2 a distinct contract", () => {
+    expect(PAID_SERVICE_PROFILE.version).toBe("1.0.0");
+    expect(PAID_SERVICE_V2_PROFILE.version).toBe("2.0.0");
+    expect(PAID_SERVICE_V2_PROFILE.rulesHash).not.toBe(PAID_SERVICE_PROFILE.rulesHash);
+  });
+
+  it("v2 refuses a completed but unpaid transcript; v1 remains compatible", () => {
+    const unpaid = buildTranscript();
+    unpaid.events = unpaid.events.filter(({ event }) => event.type !== "PAYMENT_SETTLED");
+    expect(validateTranscriptWithAdapter(unpaid, paidServiceReferenceAdapter).ok).toBe(true);
+    const strict = validateTranscriptWithAdapter(unpaid, paidServiceStrictAdapter);
+    expect(strict.ok).toBe(false);
+    expect(strict.errors.join(" ")).toContain("PAYMENT_SETTLED is required");
+  });
+
+  it("v2 accepts a payment-linked, fully acknowledged service transcript", () => {
+    const strict = validateTranscriptWithAdapter(buildTranscript(), paidServiceStrictAdapter);
+    expect(strict.ok).toBe(true);
+    expect(strict.finalState).toMatchObject({ completed: true, paymentHash: `0x${"cd".repeat(32)}` });
+  });
+
+  it("v2 refuses unsigned acknowledgement of payment settlement", () => {
+    const transcript = buildTranscript();
+    const settled = transcript.events.find(({ event }) => event.type === "PAYMENT_SETTLED")!;
+    settled.ack = undefined as unknown as SignedAck;
+    const result = validateTranscriptWithAdapter(transcript, paidServiceStrictAdapter);
+    expect(result.ok).toBe(false);
+    expect(result.errors.join(" ")).toContain("explicitly ACCEPTed");
   });
 
 });

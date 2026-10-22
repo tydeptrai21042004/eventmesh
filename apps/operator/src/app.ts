@@ -48,7 +48,7 @@ import {
 } from "@eventmesh/core";
 import { FiberRpcClient } from "@eventmesh/fiber";
 import { CkbAnchorClient, inspectAnchorRpc } from "@eventmesh/ckb";
-import { PAID_SERVICE_PROFILE, paidServiceReferenceAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
+import { PAID_SERVICE_PROFILE, PAID_SERVICE_V2_PROFILE, paidServiceReferenceAdapter, paidServiceStrictAdapter, validateTranscriptWithAdapter } from "@eventmesh/adapter-sdk";
 import { Store } from "./store.js";
 import { loadIdentity } from "./identity.js";
 import { adminTokenMatches, extractAdminToken, validatePeerUrl } from "./security.js";
@@ -343,7 +343,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       .find((evidence) => evidence.evidence.claim.paymentHash.toLowerCase() === claim.data.paymentHash.toLowerCase());
   }
 
-  function supportedProfile(profile: unknown): "generic" | "paid-service" | "legacy" {
+  function supportedProfile(profile: unknown): "generic" | "paid-service" | "paid-service-v2" | "legacy" {
     if (!profile) return "legacy";
     const parsed = ApplicationProfileSchema.safeParse(profile);
     if (!parsed.success) throw new Error("APPLICATION_PROFILE_INVALID");
@@ -353,12 +353,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       && parsed.data.rulesHash.toLowerCase() === expected.rulesHash.toLowerCase();
     if (matches(GENERIC_BILATERAL_PROFILE)) return "generic";
     if (matches(PAID_SERVICE_PROFILE)) return "paid-service";
+    if (matches(PAID_SERVICE_V2_PROFILE)) return "paid-service-v2";
     throw new Error("APPLICATION_PROFILE_UNSUPPORTED_OR_RULES_HASH_MISMATCH");
   }
 
   function requestedProfile(name?: string) {
     if (!name || name === "generic-bilateral-v1") return GENERIC_BILATERAL_PROFILE;
     if (name === "paid-service-v1") return PAID_SERVICE_PROFILE;
+    if (name === "paid-service-v2") return PAID_SERVICE_V2_PROFILE;
     throw new Error("APPLICATION_PROFILE_UNSUPPORTED");
   }
 
@@ -368,7 +370,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     type: string,
     payload: unknown
   ) {
-    if (supportedProfile(signed.session.applicationProfile) !== "paid-service" || type !== "PAYMENT_SETTLED") return payload;
+    if (!["paid-service", "paid-service-v2"].includes(supportedProfile(signed.session.applicationProfile)) || type !== "PAYMENT_SETTLED") return payload;
     const claim = FiberPaymentClaimSchema.parse(payload);
     const requested = events.find((row) => row.status === "FINAL" && row.ack?.decision === "ACCEPT" && row.event.type === "SERVICE_REQUESTED");
     const result = events.find((row) => row.status === "FINAL" && row.ack?.decision === "ACCEPT" && row.event.type === "RESULT_COMMITTED");
@@ -394,7 +396,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   }
 
   function validateProfileEvent(signed: SignedSession, event: z.infer<typeof SignedEventSchema>) {
-    if (supportedProfile(signed.session.applicationProfile) !== "paid-service") return;
+    if (!["paid-service", "paid-service-v2"].includes(supportedProfile(signed.session.applicationProfile))) return;
     const expectedSender = new Map<string, string>([
       ["SERVICE_REQUESTED", signed.session.operatorA],
       ["SERVICE_ACCEPTED", signed.session.operatorB],
@@ -420,7 +422,8 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       events: finalItems,
       paymentEvidence: store.listPaymentEvidence(signed.session.sessionId)
     };
-    const result = validateTranscriptWithAdapter(transcript, paidServiceReferenceAdapter);
+    const adapter = profile === "paid-service-v2" ? paidServiceStrictAdapter : paidServiceReferenceAdapter;
+    const result = validateTranscriptWithAdapter(transcript, adapter);
     if (!result.ok || result.finalState === undefined) {
       throw new Error(`APPLICATION_PROFILE_TRANSCRIPT_INVALID:${result.errors.join("|")}`);
     }
@@ -511,8 +514,19 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     );
     const verification = await inspectAnchorRpc(options.ckbRpcUrl, record.anchor.txHash, expected, ckbMinConfirmations);
     if (!verification.ok) {
-      store.saveAnchor(sessionId, { ...record.anchor, dataHex: expected, status: "PENDING" });
-      return { committed: false as const, verification };
+      // A network outage is not evidence that a previously observed commitment
+      // was rolled back. Preserve the last chain observation on RPC errors;
+      // explicit TX_NOT_FOUND / noncommitted observations still lower the state.
+      if (verification.status !== "RPC_EXCEPTION") {
+        store.saveAnchor(sessionId, { ...record.anchor, dataHex: expected, status: "PENDING" });
+      }
+      return {
+        committed: false as const,
+        verification,
+        recoveryAction: verification.status === "TX_NOT_FOUND"
+          ? "TRANSACTION_HASH_NOT_SEEN_CHECK_OPERATOR_PREPARED_TX_AND_MEMPOOL_BEFORE_REBROADCAST"
+          : verification.status === "RPC_EXCEPTION" ? "RETRY_RPC_READ" : "WAIT_AND_RECONCILE"
+      };
     }
     const committed = {
       ...record.anchor,
@@ -545,7 +559,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     publicKey: identity.publicKey,
     selfUrl: options.selfUrl,
     protocol: PROTOCOL,
-    applicationProfiles: [GENERIC_BILATERAL_PROFILE, PAID_SERVICE_PROFILE],
+    applicationProfiles: [GENERIC_BILATERAL_PROFILE, PAID_SERVICE_PROFILE, PAID_SERVICE_V2_PROFILE],
     peerApi: "/peer",
     adminApi: "/admin"
   }));
@@ -822,7 +836,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       peerUrl: z.string().url().optional(),
       expiresInSeconds: z.number().int().positive().max(86400).optional(),
       maxEvents: z.number().int().positive().max(10000).optional(),
-      applicationProfile: z.enum(["generic-bilateral-v1", "paid-service-v1"]).optional(),
+      applicationProfile: z.enum(["generic-bilateral-v1", "paid-service-v1", "paid-service-v2"]).optional(),
       chainContext: ChainContextSchema.optional()
     }).parse(req.body ?? {});
     const rawPeerUrl = body.peerUrl ?? options.defaultPeerUrl;
@@ -1271,7 +1285,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     if (!options.ckbRpcUrl) return reply.code(503).send({ error: "CKB_RPC_REQUIRED_TO_VERIFY_ANCHOR" });
     const verification = await inspectAnchorRpc(options.ckbRpcUrl, anchor.txHash, expected, ckbMinConfirmations);
     if (!verification.ok) {
-      store.saveAnchor(req.params.id, { ...anchor, dataHex: expected, status: "PENDING" });
+      if (verification.status !== "RPC_EXCEPTION") store.saveAnchor(req.params.id, { ...anchor, dataHex: expected, status: "PENDING" });
       return reply.code(202).send({
         accepted: false,
         pending: verification.status === "TX_NOT_COMMITTED" || verification.status === "COMMITTED_UNCONFIRMED",

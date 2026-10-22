@@ -25,6 +25,23 @@ export const PAID_SERVICE_PROFILE: ApplicationProfile = {
   rulesHash: sha256Hex(canonical(PAID_SERVICE_RULES))
 };
 
+// v1 remains byte-for-byte compatible with previously signed sessions.
+// v2 changes semantics through a NEW signed rules hash; never reinterpret v1.
+const PAID_SERVICE_V2_RULES = {
+  domain: "EventMesh/PaidServiceProfile/v2",
+  requiredEvents: ["SERVICE_REQUESTED", "SERVICE_ACCEPTED", "RESULT_COMMITTED", "PAYMENT_SETTLED", "SESSION_COMPLETED"],
+  ordering: "SERVICE_REQUESTED < SERVICE_ACCEPTED < RESULT_COMMITTED < PAYMENT_SETTLED < SESSION_COMPLETED",
+  paymentBinding: ["sessionId", "obligationId", "settlesEventHash", "purposeHash"],
+  finalState: ["requestId", "service", "resultHash", "paymentHash", "completed"],
+  acceptance: "receiver-verifies-settlement-before-ACK"
+} as const;
+
+export const PAID_SERVICE_V2_PROFILE: ApplicationProfile = {
+  id: "paid-service",
+  version: "2.0.0",
+  rulesHash: sha256Hex(canonical(PAID_SERVICE_V2_RULES))
+};
+
 export const PAID_SERVICE_EVENT_TYPES = [
   "SERVICE_REQUESTED",
   "SERVICE_ACCEPTED",
@@ -80,7 +97,7 @@ function validatePaidServiceEvent(event: SignedEvent): AdapterValidation {
   }
 }
 
-function validatePaidServiceTranscript(transcript: TranscriptExport): AdapterValidation {
+function validatePaidServiceTranscript(transcript: TranscriptExport, requirePayment = false): AdapterValidation {
   const events = [...transcript.events].sort((a, b) => a.event.sequence - b.event.sequence);
   if (events.some(({ ack }) => ack?.decision !== "ACCEPT")) {
     return { ok: false, reason: "all reference paid-service events must be explicitly ACCEPTed" };
@@ -108,6 +125,9 @@ function validatePaidServiceTranscript(transcript: TranscriptExport): AdapterVal
     if ((byType.get(type)?.length ?? 0) !== 1) return { ok: false, reason: `${type} must occur exactly once` };
   }
   if ((byType.get("PAYMENT_SETTLED")?.length ?? 0) > 1) return { ok: false, reason: "PAYMENT_SETTLED may occur at most once" };
+  if (requirePayment && (byType.get("PAYMENT_SETTLED")?.length ?? 0) !== 1) {
+    return { ok: false, reason: "PAYMENT_SETTLED is required for paid-service-v2 completion" };
+  }
 
   const index = (type: string) => events.findIndex(({ event }) => event.type === type);
   const requestIndex = index("SERVICE_REQUESTED");
@@ -166,7 +186,7 @@ export const paidServiceReferenceAdapter: EventMeshAdapter<{
   name: "paid-service-reference",
   eventTypes: PAID_SERVICE_EVENT_TYPES,
   validateEvent: validatePaidServiceEvent,
-  validateTranscript: validatePaidServiceTranscript,
+  validateTranscript: (transcript) => validatePaidServiceTranscript(transcript, false),
   deriveFinalState(transcript) {
     const events = [...transcript.events].sort((a, b) => a.event.sequence - b.event.sequence);
     const requested = events.find(({ event }) => event.type === "SERVICE_REQUESTED")!.event;
@@ -184,4 +204,11 @@ export const paidServiceReferenceAdapter: EventMeshAdapter<{
       completed: true
     };
   }
+};
+
+/** Strict payment-linked profile; does not silently alter legacy v1 evidence. */
+export const paidServiceStrictAdapter: EventMeshAdapter<ReturnType<typeof paidServiceReferenceAdapter.deriveFinalState>> = {
+  ...paidServiceReferenceAdapter,
+  name: "paid-service-strict-v2",
+  validateTranscript: (transcript) => validatePaidServiceTranscript(transcript, true)
 };
