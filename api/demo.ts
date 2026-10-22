@@ -258,7 +258,7 @@ async function createSession(req: any, input: any) {
     if (!Number.isFinite(requestedMaxEvents) || !Number.isInteger(requestedMaxEvents)) throw new Error("INVALID_MAX_EVENTS");
     const ttlSeconds = Math.min(Math.max(requestedTtl, 60), mode === "testnet" ? 7200 : 86400);
     const maxEvents = Math.min(Math.max(requestedMaxEvents, 1), mode === "testnet" ? 250 : 1000);
-    const session = {
+    const session: SignedSession["session"] = {
       sessionId: createSessionId(), protocol: PROTOCOL,
       environment: keys.environment,
       applicationProfile: PAID_SERVICE_PROFILE,
