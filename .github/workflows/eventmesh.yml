@@ -1,0 +1,137 @@
+name: EventMesh — One CI and Funded Testnet Workflow
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Runs roughly every 6 hours to detect faucet funding and follow up on pending TX.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eventmesh-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Compile, unit, fault matrix, evidence and dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+      - name: Install
+        id: install
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-fund --no-audit
+            echo 'REPRODUCIBLE_INSTALL=true' >> "$GITHUB_ENV"
+          else
+            echo 'WARNING: generate and commit package-lock.json for reproducible CI.'
+            npm install --no-fund --no-audit
+            echo 'REPRODUCIBLE_INSTALL=false' >> "$GITHUB_ENV"
+          fi
+      - name: Full code checks and fault tests
+        id: checks
+        shell: bash
+        run: |
+          mkdir -p artifacts/ci
+          set -o pipefail
+          npm run check:all 2>&1 | tee artifacts/ci/check.log
+          npm run test:faults 2>&1 | tee artifacts/ci/faults.log
+      - name: Audit production dependencies (report separately from tests)
+        continue-on-error: true
+        id: audit
+        shell: bash
+        run: |
+          set -o pipefail
+          npm audit --omit=dev --audit-level=high 2>&1 | tee artifacts/ci/dependency-audit.log
+      - name: Build fingerprint and execution evidence
+        if: always()
+        env:
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CHECK_OUTCOME: ${{ steps.checks.outcome }}
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+        run: node scripts/ci-evidence.mjs
+      - name: Upload all CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eventmesh-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/ci/
+          if-no-files-found: warn
+          retention-days: 30
+
+  security:
+    name: CodeQL JavaScript and TypeScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # CodeQL is kept in the SAME workflow, not a separate workflow file.
+    if: github.event_name != 'schedule'
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4
+
+  funded-testnet:
+    name: Watch wallet → one CKB anchor → independent confirmation
+    needs: quality
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Restore remembered transaction identity
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .github-testnet-state/
+          key: eventmesh-testnet-v1-${{ hashFiles('config/testnet-wallet.json', 'scripts/auto-testnet.mjs') }}
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-fund --no-audit; else npm install --no-fund --no-audit; fi
+          npm run build:runtime
+      # This uses a deliberately public TESTNET-ONLY key from config/testnet-wallet.json.
+      - name: Auto-check funding and submit at most one checkpoint
+        id: testnet
+        env:
+          CKB_RPC_URL: ${{ vars.CKB_RPC_URL || 'https://testnet.ckbapp.dev/' }}
+        run: node scripts/auto-testnet.mjs run
+      - name: Save transaction identity after any attempted broadcast
+        if: always() && steps.restore.outputs.cache-hit != 'true' && steps.testnet.outputs.state_written == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .github-testnet-state/
+          key: eventmesh-testnet-v1-${{ hashFiles('config/testnet-wallet.json', 'scripts/auto-testnet.mjs') }}
+      - name: Upload Testnet evidence (including unfunded status)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eventmesh-testnet-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/testnet/
+          if-no-files-found: warn
+          retention-days: 90
