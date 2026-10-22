@@ -30,14 +30,21 @@ describe("one-project database-free Vercel deployment contract", () => {
     const operator = readJson("apps/operator/package.json");
     expect(root.dependencies?.["@neondatabase/serverless"]).toBeUndefined();
     expect(operator.dependencies?.["better-sqlite3"]).toBeUndefined();
-    const example = readFileSync(".env.example", "utf8");
-    expect(example).not.toMatch(/^DATABASE_URL=/m);
-    expect(example).not.toMatch(/^ALLOW_EPHEMERAL_VERCEL_STATE=/m);
-    expect(example).toMatch(/^DEMO_MASTER_SECRET=/m);
+
+    // Deployment environment variables live in Vercel, not in a repository .env file.
+    const server = ["api/demo.ts", "api/demo-store.ts", "api/health.ts"]
+      .map((file) => readFileSync(file, "utf8"))
+      .join("\n");
+    const deployment = readFileSync("vercel.json", "utf8");
+    expect(`${server}\n${deployment}`).not.toMatch(/\b(?:DATABASE_URL|ALLOW_EPHEMERAL_VERCEL_STATE)\b/);
+    expect(server).toMatch(/process\.env\.DEMO_MASTER_SECRET/);
   });
 
-  it("does not expose secrets through VITE_ variables", () => {
-    const example = readFileSync(".env.example", "utf8");
-    expect(example).not.toMatch(/^VITE_.*(?:SECRET|PRIVATE|TOKEN)/m);
+  it("does not reference secret-prefixed VITE_ variables in frontend or deployment config", () => {
+    const client = readFileSync("apps/demo/src/main.tsx", "utf8");
+    const deployment = readFileSync("vercel.json", "utf8");
+    expect(`${client}\n${deployment}`).not.toMatch(
+      /\bVITE_[A-Z0-9_]*(?:SECRET|PRIVATE|TOKEN|PASSWORD|KEY)[A-Z0-9_]*/i
+    );
   });
 });
