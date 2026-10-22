@@ -10,6 +10,7 @@
     "allowSyntheticDefaultImports": true,
     "declaration": true,
     "sourceMap": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "jsx": "react-jsx"
   }
 }
