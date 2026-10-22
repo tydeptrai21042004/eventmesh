@@ -1,0 +1,12 @@
+{
+  "network": "CKB Pudge Testnet",
+  "address": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqvf44j50synupy06eclnthv0qfj7nf5zasheddzv",
+  "publicKeyCompressed": "0x038fb3b16f2dd3047a3d733d1ba9661fea443f90e7e507c638288a0149a9b73fe0",
+  "lockScript": {
+    "code_hash": "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
+    "hash_type": "type",
+    "args": "0x89ad6547c093e048fd671f9aeec78132f4d34176"
+  },
+  "purpose": "Public disposable wallet solely for automated CKB Pudge Testnet verification; key deliberately hardcoded for CI",
+  "privateKey": "0xf1298b46d999ee3ae9111b1b2de8c5160977f3a658b74167b55b4472b2012190"
+}
