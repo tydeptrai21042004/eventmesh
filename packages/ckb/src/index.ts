@@ -15,7 +15,9 @@ export type PreparedAnchor = {
   txHash: string;
   dataHex: string;
   status: "PREPARED";
-  /** Opaque signed CCC transaction. It is intentionally not JSON-serializable. */
+  /** CCC's portable JSON form includes the signed witnesses; no private key is included. */
+  signedTransactionJson: string;
+  /** Opaque signed CCC transaction, used only during immediate broadcast. */
   transaction: any;
   /** Client that prepared the transaction; kept only for the immediate broadcast step. */
   client: any;
@@ -85,7 +87,12 @@ export class CkbAnchorClient {
     const prepared = await signer.prepareTransaction(tx);
     const signed = await signer.signOnlyTransaction(prepared);
     const txHash = signed.hash();
-    return { txHash, dataHex, status: "PREPARED", transaction: signed, client };
+    // Round-trip the *signed* transaction before returning it. Persisting only
+    // the hash cannot recover a crash between preparing and broadcasting.
+    const signedTransactionJson = signed.stringify();
+    const decoded = ccc.Transaction.from(JSON.parse(signedTransactionJson));
+    if (decoded.hash().toLowerCase() !== txHash.toLowerCase()) throw new Error("CKB_SERIALIZATION_HASH_MISMATCH");
+    return { txHash, dataHex, status: "PREPARED", signedTransactionJson, transaction: signed, client };
   }
 
   /** Broadcast exactly the transaction whose identity was returned by prepareAnchor(). */
@@ -95,6 +102,19 @@ export class CkbAnchorClient {
       throw new Error(`CKB_BROADCAST_HASH_MISMATCH:${prepared.txHash}:${String(sentHash)}`);
     }
     return { txHash: prepared.txHash, dataHex: prepared.dataHex, status: "PENDING" as const };
+  }
+
+  /** Retry the same signed bytes after restart; never create fresh inputs. */
+  async rebroadcastSigned(signedTransactionJson: string, expectedTxHash: string) {
+    if (!/^0x[0-9a-f]{64}$/i.test(expectedTxHash)) throw new Error("CKB_EXPECTED_TX_HASH_INVALID");
+    if (signedTransactionJson.length > 262144) throw new Error("CKB_SIGNED_TRANSACTION_TOO_LARGE");
+    const transaction = ccc.Transaction.from(JSON.parse(signedTransactionJson));
+    if (transaction.hash().toLowerCase() !== expectedTxHash.toLowerCase()) {
+      throw new Error("CKB_REBROADCAST_HASH_MISMATCH");
+    }
+    const txHash = await this.createClient().sendTransaction(transaction);
+    if (String(txHash).toLowerCase() !== expectedTxHash.toLowerCase()) throw new Error("CKB_REBROADCAST_RESULT_MISMATCH");
+    return expectedTxHash;
   }
 
   async anchor(input: AnchorCommitment) {

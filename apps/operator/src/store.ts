@@ -73,6 +73,8 @@ type FileState = {
   paymentClaims: Record<string, PaymentClaimRow>;
   paymentEvidence: Record<string, PaymentEvidenceRow>;
   outbox: Record<string, OutboxRow>;
+  /** Signed CKB wire representation. It is never part of exported transcript evidence. */
+  preparedAnchors: Record<string, { txHash: string; dataHex: string; signedTransactionJson: string }>;
 };
 
 const emptyState = (): FileState => ({
@@ -83,7 +85,8 @@ const emptyState = (): FileState => ({
   conflicts: [],
   paymentClaims: Object.create(null),
   paymentEvidence: Object.create(null),
-  outbox: Object.create(null)
+  outbox: Object.create(null),
+  preparedAnchors: Object.create(null)
 });
 
 function record(value: unknown): Record<string, any> {
@@ -105,6 +108,14 @@ function parseState(raw: string): FileState {
   const sessions = record(value.sessions ?? {});
   const events = record(value.events ?? {});
   const outbox = record(value.outbox ?? {});
+  const preparedAnchors = record(value.preparedAnchors ?? {});
+  for (const [sessionId, tx] of Object.entries(preparedAnchors)) {
+    if (!(sessionId in sessions) || !tx || !/^0x[0-9a-f]{64}$/i.test(tx.txHash)
+      || !/^0x[0-9a-f]+$/i.test(tx.dataHex)
+      || typeof tx.signedTransactionJson !== "string" || tx.signedTransactionJson.length > 262144) {
+      throw new Error("EVENTMESH_STATE_INVALID_PREPARED_ANCHOR");
+    }
+  }
   for (const [id, row] of Object.entries(sessions)) {
     if (!row || !SignedSessionSchema.safeParse(row.signed).success || row.signed.session.sessionId !== id
       || typeof row.status !== "string" || !Number.isSafeInteger(row.order)) {
@@ -147,7 +158,8 @@ function parseState(raw: string): FileState {
     conflicts: value.conflicts,
     paymentClaims: record(value.paymentClaims ?? {}),
     paymentEvidence: record(paymentEvidence),
-    outbox
+    outbox,
+    preparedAnchors
   };
 }
 
@@ -403,6 +415,24 @@ export class Store {
     existing.status = "CLOSED";
     this.persist();
     return "INSERTED";
+  }
+
+  savePreparedAnchor(sessionId: string, prepared: { txHash: string; dataHex: string; signedTransactionJson: string }): WriteResult {
+    if (!this.state.sessions[sessionId]) return "NOT_FOUND";
+    if (!/^0x[0-9a-f]{64}$/i.test(prepared.txHash) || !/^0x[0-9a-f]+$/i.test(prepared.dataHex)
+      || typeof prepared.signedTransactionJson !== "string" || prepared.signedTransactionJson.length > 262144) {
+      throw new Error("INVALID_PREPARED_ANCHOR");
+    }
+    const existing = this.state.preparedAnchors[sessionId];
+    if (existing) return canonical(existing) === canonical(prepared) ? "IDEMPOTENT" : "CONFLICT";
+    this.state.preparedAnchors[sessionId] = structuredClone(prepared);
+    this.persist();
+    return "INSERTED";
+  }
+
+  getPreparedAnchor(sessionId: string) {
+    const prepared = this.state.preparedAnchors[sessionId];
+    return prepared && structuredClone(prepared);
   }
 
   saveAnchor(sessionId: string, anchor: any): WriteResult {

@@ -11,6 +11,14 @@ const dataDir = process.env.DATA_DIR ?? `.data/${name}`;
 mkdirSync(dataDir, { recursive: true });
 
 const publicMode = process.env.PUBLIC_MODE === "true";
+// Docker publishes operator ports; "development" does not mean "private".
+// Reject any listen address that can be reached off-host without admin auth.
+const bindHost = process.env.BIND_HOST ?? (publicMode ? "0.0.0.0" : "127.0.0.1");
+const loopbackHosts = new Set(["127.0.0.1", "::1", "localhost"]);
+const externallyReachable = !loopbackHosts.has(bindHost.toLowerCase());
+if (externallyReachable && !process.env.ADMIN_TOKEN) {
+  throw new Error("EXPOSED_OPERATOR_REQUIRES_ADMIN_TOKEN: configure an independent strong ADMIN_TOKEN for each operator");
+}
 const allowPrivatePeerUrls = process.env.ALLOW_PRIVATE_PEER_URLS === "true" || !publicMode;
 const allowedPeerHosts = new Set<string>((process.env.PEER_HOST_ALLOWLIST ?? "")
   .split(",")
@@ -39,6 +47,7 @@ const { app } = await buildOperatorApp({
   name,
   selfUrl,
   dataDir,
+  externallyReachable,
   defaultPeerUrl: process.env.DEFAULT_PEER_URL,
   operatorPrivateKey: process.env.OPERATOR_PRIVATE_KEY,
   publicMode,
@@ -60,4 +69,4 @@ const { app } = await buildOperatorApp({
 });
 
 // Direct local development is loopback-only unless explicitly exposed.
-await app.listen({ port, host: process.env.BIND_HOST ?? (publicMode ? "0.0.0.0" : "127.0.0.1") });
+await app.listen({ port, host: bindHost });

@@ -51,6 +51,30 @@ describe("crash safety, privacy and single-writer operation", () => {
   });
 });
 
+describe("publicly bound operator authorization", () => {
+  it("rejects an exposed HTTP listener without an admin token even in development mode", async () => {
+    const { buildOperatorApp } = await import("../apps/operator/src/app.js");
+    const dir = newDir();
+    await expect(buildOperatorApp({ name: "exposed", selfUrl: "http://localhost:4000", dataDir: dir,
+      publicMode: false, externallyReachable: true })).rejects.toThrow("EXPOSED_OPERATOR_REQUIRES_ADMIN_TOKEN");
+    expect(existsSync(join(dir, "eventmesh-state.json"))).toBe(false);
+  });
+
+  it("enforces admin authorization when an exposed listener is configured", async () => {
+    const { buildOperatorApp } = await import("../apps/operator/src/app.js");
+    const app = await buildOperatorApp({ name: "secure", selfUrl: "http://localhost:4000", dataDir: newDir(),
+      publicMode: false, externallyReachable: true, adminToken: "some-long-test-admin-token" });
+    try {
+      const denied = await app.app.inject({ method: "GET", url: "/admin/sessions" });
+      expect(denied.statusCode).toBe(401);
+      const allowed = await app.app.inject({ method: "GET", url: "/admin/sessions", headers: {
+        "x-eventmesh-admin-token": "some-long-test-admin-token"
+      } });
+      expect(allowed.statusCode).toBe(200);
+    } finally { await app.app.close(); }
+  });
+});
+
 describe("pinned peer transport", () => {
   it("uses the same checked IP for socket establishment", async () => {
     const checked = await resolvePeerUrl("http://127.0.0.1:4010", { publicMode: false, allowPrivatePeerUrls: true });

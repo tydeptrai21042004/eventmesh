@@ -61,6 +61,8 @@ export type OperatorAppOptions = {
   defaultPeerUrl?: string;
   operatorPrivateKey?: string;
   publicMode?: boolean;
+  /** True if the HTTP listener is externally reachable, even when publicMode=false. */
+  externallyReachable?: boolean;
   allowPrivatePeerUrls?: boolean;
   allowedPeerHosts?: Set<string>;
   adminToken?: string;
@@ -109,6 +111,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   }
   const ckbMinConfirmations = Math.max(0, options.ckbMinConfirmations ?? (publicMode ? 2 : 0));
   if (publicMode && !options.adminToken) throw new Error("PUBLIC_MODE_REQUIRES_ADMIN_TOKEN");
+  if (options.externallyReachable && !options.adminToken) throw new Error("EXPOSED_OPERATOR_REQUIRES_ADMIN_TOKEN");
   if (publicMode && !options.selfUrl.startsWith("https://")) throw new Error("PUBLIC_MODE_REQUIRES_HTTPS_SELF_URL");
 
   mkdirSync(options.dataDir, { recursive: true });
@@ -472,6 +475,18 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     const record = store.getSession(sessionId);
     if (!record?.close) throw new Error("CLOSE_REQUIRED_BEFORE_ANCHOR");
     if (record.anchor) return record.anchor;
+    const recovered = store.getPreparedAnchor(sessionId);
+    if (recovered) {
+      // The previous process crashed after saving the exact signed transaction.
+      // Reconstruct the pending anchor identity; do not select or sign new inputs.
+      const close = record.close.close;
+      const expected = buildAnchorDataHex(sessionId, close.transcriptRoot, close.finalStateHash,
+        close.paymentEvidenceRoot, anchorExtensions(close));
+      if (recovered.dataHex.toLowerCase() !== expected.toLowerCase()) throw new Error("PREPARED_ANCHOR_COMMITMENT_MISMATCH");
+      const pending = { txHash: recovered.txHash, dataHex: recovered.dataHex, status: "PENDING" as const };
+      if (store.saveAnchor(sessionId, pending) === "CONFLICT") throw new Error("ANCHOR_CONFLICT");
+      return pending;
+    }
     const close = record.close.close;
 
     // Prepare + sign first so the transaction identity is deterministic, persist
@@ -484,6 +499,12 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       ...anchorExtensions(close)
     });
     const pending = { txHash: prepared.txHash, dataHex: prepared.dataHex, status: "PENDING" as const };
+    const persisted = store.savePreparedAnchor(sessionId, {
+      txHash: prepared.txHash,
+      dataHex: prepared.dataHex,
+      signedTransactionJson: prepared.signedTransactionJson
+    });
+    if (persisted === "CONFLICT") throw new Error("PREPARED_ANCHOR_CONFLICT");
     const write = store.saveAnchor(sessionId, pending);
     if (write === "CONFLICT") throw new Error("ANCHOR_CONFLICT");
 
@@ -514,6 +535,21 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     );
     const verification = await inspectAnchorRpc(options.ckbRpcUrl, record.anchor.txHash, expected, ckbMinConfirmations);
     if (!verification.ok) {
+      // A disappeared hash permits rebroadcast ONLY of the exact persisted signed
+      // transaction, never a newly funded/signature-adjusted transaction.
+      if (verification.status === "TX_NOT_FOUND" && options.ckb) {
+        const prepared = store.getPreparedAnchor(sessionId);
+        if (prepared && prepared.txHash.toLowerCase() === record.anchor.txHash.toLowerCase()
+          && prepared.dataHex.toLowerCase() === expected.toLowerCase()) {
+          try {
+            await options.ckb.rebroadcastSigned(prepared.signedTransactionJson, prepared.txHash);
+            return { committed: false as const, verification, recoveryAction: "EXACT_SIGNED_TX_REBROADCAST_CHECK_CONFIRMATIONS" };
+          } catch (error) {
+            app.log.warn({ error, txHash: prepared.txHash }, "CKB exact-transaction rebroadcast could not be confirmed");
+            return { committed: false as const, verification, recoveryAction: "EXACT_REBROADCAST_AMBIGUOUS_RETRY_RPC" };
+          }
+        }
+      }
       // A network outage is not evidence that a previously observed commitment
       // was rolled back. Preserve the last chain observation on RPC errors;
       // explicit TX_NOT_FOUND / noncommitted observations still lower the state.
@@ -552,7 +588,15 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     ckbMinConfirmations,
     peerRateLimit: { maxRequests: peerRateLimitMax, windowMs: peerRateLimitWindowMs, maxTrackedPeers: peerRateLimitMaxTrackedPeers },
     maxBodyBytes,
-    pendingOutbox: store.listOutbox("PENDING").length
+    pendingOutbox: store.listOutbox("PENDING").length,
+    outboxAttention: (() => {
+      const pending = store.listOutbox("PENDING");
+      const oldest = pending.reduce((min, row) => Math.min(min, Date.parse(row.createdAt)), Infinity);
+      return {
+        oldestPendingSeconds: Number.isFinite(oldest) ? Math.max(0, Math.floor((Date.now() - oldest) / 1000)) : 0,
+        repeatedlyFailed: pending.filter((row) => row.attempts >= 10).length
+      };
+    })()
   }));
   app.get("/identity", async () => ({
     name: options.name,

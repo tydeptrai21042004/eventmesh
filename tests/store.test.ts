@@ -160,6 +160,33 @@ describe("Store immutability and equivocation evidence", () => {
     second.close();
   });
 
+  it("durably retains exact signed CKB transaction without exporting it to peers", () => {
+    const dir = mkdtempSync(join(tmpdir(), "eventmesh-anchor-"));
+    dirs.push(dir);
+    const path = join(dir, "eventmesh-state.json");
+    const aPriv = randomPrivateKeyHex();
+    const bPriv = randomPrivateKeyHex();
+    const signed = signedSession(aPriv, bPriv);
+    const id = signed.session.sessionId;
+    const prepared = {
+      txHash: `0x${"ab".repeat(32)}`,
+      dataHex: `0x${"cd".repeat(32)}`,
+      signedTransactionJson: '{"witnesses":["0x1234"]}'
+    };
+    const first = new Store(path);
+    expect(first.saveSession(signed)).toBe("INSERTED");
+    expect(first.savePreparedAnchor(id, prepared)).toBe("INSERTED");
+    expect(first.savePreparedAnchor(id, prepared)).toBe("IDEMPOTENT");
+    expect(first.savePreparedAnchor(id, { ...prepared, txHash: `0x${"fe".repeat(32)}` })).toBe("CONFLICT");
+    expect(JSON.stringify(first.exportTranscript(id))).not.toContain("signedTransactionJson");
+    first.close();
+    const reopened = new Store(path);
+    expect(reopened.getPreparedAnchor(id)).toEqual(prepared);
+    expect(reopened.saveAnchor(id, { txHash: prepared.txHash, dataHex: prepared.dataHex, status: "PENDING" })).toBe("INSERTED");
+    expect(JSON.stringify(reopened.exportTranscript(id))).not.toContain("signedTransactionJson");
+    reopened.close();
+  });
+
   it("makes close immutable and marks a conflicting close as disputed", () => {
     const { store, session, aPriv, bPriv } = setup();
     const c1 = signedClose(session.sessionId, aPriv, bPriv, { n: 1 });

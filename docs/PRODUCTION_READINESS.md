@@ -33,7 +33,7 @@ Legacy `EVENTMESH_V02` anchors remain backward compatible. New profiled sessions
 
 - Configurable Fastify request-body ceiling (`MAX_BODY_BYTES`).
 - Basic per-source peer request rate limiting (`PEER_RATE_LIMIT_MAX`, `PEER_RATE_LIMIT_WINDOW_MS`).
-- Admin and peer APIs remain separated by route namespace and public-mode admin token policy.
+- Admin and peer APIs remain separated by route namespace. The operator entrypoint also refuses any externally bound listener without `ADMIN_TOKEN`, **even when `PUBLIC_MODE=false`**. The Compose topology binds its process to `0.0.0.0` inside containers, so set an administrator token *before* starting Compose. Never expose plain-HTTP admin tokens to untrusted networks; add TLS termination and access controls.
 
 ## Canonical real-user topology
 
@@ -58,7 +58,7 @@ Do **not** deploy both operator private keys into one service and call that an i
 4. **Distributed rate limiting:** the included limiter is process-local. Multi-instance deployments need a shared gateway/limiter.
 5. **Background delivery worker:** the outbox is durable, but retries are currently request/admin driven. A persistent host should run a bounded worker with exponential backoff and dead-letter alerting.
 6. **Recovery from remote-ahead state:** local signed evidence can be safely re-delivered. Automatic import of full remote evidence is intentionally not implemented until peer-authenticated evidence-sync is added.
-7. **CKB prepared transaction recovery:** the tx hash is persisted before broadcast. A process crash after prepare but before broadcast preserves identity but not a portable serialized signed transaction; a future CKB adapter should persist the signed transaction bytes for exact post-restart broadcast.
+7. **CKB prepared transaction recovery:** the prepared signed CCC transaction is now retained privately in the durable operator state before the tx hash is exposed or broadcast. Reconciliation rebroadcasts those exact signed transaction bytes only after an RPC returns `TX_NOT_FOUND`. An RPC timeout, a spent-input rejection, or persistent absence is not proof of success; inspect node responses and confirm the exact transaction independently before declaring it anchored. Existing pending records made before this patch do not have saved signed bytes and still require manual recovery.
 8. **Observability:** add metrics/traces/alerts for pending outbox age, dispute counts, Fiber verification failures, anchor latency, and reconciliation drift.
 9. **Abuse controls:** add organization/project quotas, scoped API keys, audit logs, payload retention/redaction policy, and incident tooling.
 10. **Independent security review and load/fault testing** before mainnet funds or production secrets.
@@ -79,3 +79,11 @@ A controlled beta should not start until all of these are true:
 - a third machine verifies the exported transcript from independent RPC endpoints.
 
 See `docs/GO_LIVE_CHECKLIST.md` for the operational checklist.
+
+## Testnet/CI evidence boundaries (October 2026 hardening)
+
+Only the **existing** `.github/workflows/eventmesh.yml` is changed. The funded Testnet job submits or verifies a synthetic EventMesh CKB checkpoint. `CONFIRMED` requires a matching transaction output and at least two real on-chain confirmations. This proves CKB checkpoint code execution, **not** Fiber settlement, independent application integration, or EM-01/EM-02 completion. GitHub Actions tests are accepted as CI/regression evidence, but do not retroactively become live multi-operator evidence.
+
+For local Compose, supply a distinct `ADMIN_TOKEN` for each independently operated deployment (the supplied two-operator demo uses a single env variable and therefore is **not** proof of independent custody). `ADMIN_TOKEN` must never be committed. `PUBLIC_MODE=true` additionally requires an HTTPS public `SELF_URL`.
+
+**Still open:** independent two-host/FNN A/B workflow with measured baseline, independent market feedback, a committed transitive npm lockfile (requires network access), peer transport authentication, key rotation/KMS, transactional multi-replica persistence, independently conducted security assessment, and production alerts. One repository patch cannot truthfully certify these external deliverables.
