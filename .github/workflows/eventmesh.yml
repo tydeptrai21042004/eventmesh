@@ -71,6 +71,16 @@ jobs:
           path: artifacts/ci/
           if-no-files-found: warn
           retention-days: 30
+      # If the archive omitted package-lock.json, npm install created a candidate.
+      # Artifact is only a proposal; maintainers must review + commit it for npm ci.
+      - name: Upload generated dependency lockfile candidate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eventmesh-lockfile-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: package-lock.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   security:
     name: CodeQL JavaScript and TypeScript
@@ -92,7 +102,7 @@ jobs:
       - uses: github/codeql-action/analyze@v4
 
   funded-testnet:
-    name: Watch wallet → one CKB anchor → independent confirmation
+    name: Real CKB Testnet checkpoint (synthetic payload, not live Fiber)
     needs: quality
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -127,6 +137,24 @@ jobs:
         with:
           path: .github-testnet-state/
           key: eventmesh-testnet-v1-${{ hashFiles('config/testnet-wallet.json', 'scripts/auto-testnet.mjs') }}
+      - name: Check evidence scope (do not confuse synthetic CKB with Fiber)
+        if: always() && steps.testnet.outcome == 'success'
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { existsSync, readFileSync } from 'node:fs';
+          const path = 'artifacts/testnet/report.json';
+          if (!existsSync(path)) throw new Error('CKB_TESTNET_REPORT_MISSING');
+          const report = JSON.parse(readFileSync(path, 'utf8'));
+          if (!String(report.note || '').includes('synthetic CKB checkpoint')) throw new Error('EVIDENCE_SCOPE_MISSING');
+          if (report.status === 'CONFIRMED') {
+            if (report.inspection?.ok !== true || report.inspection?.dataMatches !== true ||
+                Number(report.inspection?.confirmations) < 2 || !/^0x[0-9a-f]{64}$/i.test(report.txHash || '')) {
+              throw new Error('UNSUPPORTED_CKB_CONFIRMATION_CLAIM');
+            }
+          }
+          console.log('Recorded scope:', report.status, '— real CKB checkpoint only; Fiber not demonstrated');
+          NODE
       - name: Upload Testnet evidence (including unfunded status)
         if: always()
         uses: actions/upload-artifact@v4
