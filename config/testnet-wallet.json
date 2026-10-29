@@ -1,12 +1,11 @@
 {
   "network": "CKB Pudge Testnet",
-  "address": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqvf44j50synupy06eclnthv0qfj7nf5zasheddzv",
-  "publicKeyCompressed": "0x038fb3b16f2dd3047a3d733d1ba9661fea443f90e7e507c638288a0149a9b73fe0",
+  "address": "ckt1qzda0cr08m85hc8jlnfp3zer7xulejywt49kt2rr0vthywaa50xwsqfpd6vdtgrjylyz4qn8r0rzxy7dza28xhcsqmqam",
+  "publicKeyCompressed": "0x036ac2ac508c460db81cd9f7445c0f0261f02e75e31cfa9c00f4891da979e39587",
   "lockScript": {
     "code_hash": "0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8",
     "hash_type": "type",
-    "args": "0x89ad6547c093e048fd671f9aeec78132f4d34176"
+    "args": "0x216e98d5a07227c82a82671bc62313cd1754735f"
   },
-  "purpose": "Public disposable wallet solely for automated CKB Pudge Testnet verification; key deliberately hardcoded for CI",
-  "privateKey": "0xf1298b46d999ee3ae9111b1b2de8c5160977f3a658b74167b55b4472b2012190"
+  "purpose": "EventMesh public faucet recipient (private key ONLY in GitHub Actions Secrets or local environment). No Mainnet funds."
 }

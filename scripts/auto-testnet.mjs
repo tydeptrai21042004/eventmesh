@@ -2,8 +2,9 @@
  * EventMesh one-workflow funded CKB Pudge Testnet runner.
  *
  * `probe` needs no npm dependencies or signing credentials.
- * `run` uses the dedicated, deliberately public Pudge Testnet key in config/testnet-wallet.json.
- * Never send Mainnet or valuable funds to this wallet.
+ * `probe` reads the public wallet address/lock script from config/testnet-wallet.json.
+ * `run` requires CKB_TESTNET_PRIVATE_KEY (GitHub Actions Secret or local env).
+ * Never store private keys in the repository, or send Mainnet funds to this Testnet wallet.
  * CKB proof = a deterministic synthetic EventMesh commitment anchored on CKB;
  * it is NOT evidence of live Fiber settlement or a two-operator paid service.
  */
@@ -20,7 +21,7 @@ const cfg = JSON.parse(readFileSync(resolve(root, 'config/testnet-wallet.json'),
 const dir = resolve(root, 'artifacts/testnet');
 const stateDir = resolve(root, '.github-testnet-state');
 const statePath = resolve(stateDir, 'anchor.json');
-const NO_KEY_MESSAGE = 'CKB Pudge Testnet private key missing from config/testnet-wallet.json';
+const NO_KEY_MESSAGE = 'Set CKB_TESTNET_PRIVATE_KEY as a GitHub Actions Secret or local environment variable; do not commit a signing key';
 
 export function hexSha256(s) { return `0x${createHash('sha256').update(s).digest('hex')}`; }
 export function commitment() {
@@ -104,7 +105,7 @@ function readTransactionState() {
   return state;
 }
 
-export async function execute({ mode='probe', rpc=process.env.CKB_RPC_URL || DEFAULT_RPC, transport=fetch, privateKey=cfg.privateKey || '' } = {}) {
+export async function execute({ mode='probe', rpc=process.env.CKB_RPC_URL || DEFAULT_RPC, transport=fetch, privateKey=process.env.CKB_TESTNET_PRIVATE_KEY || process.env.CKB_PRIVATE_KEY || '' } = {}) {
   if (!/^https:\/\//.test(rpc) && !/^http:\/\/127\.0\.0\.1(?::\d+)?\/?$/.test(rpc)) throw new Error('CKB_RPC_URL_MUST_USE_HTTPS');
   const c = commitment();
   let wallet;

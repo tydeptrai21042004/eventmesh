@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createECDH } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { commitment, probeTestnet, EXPECTED_DATA, hexSha256, execute } from '../scripts/auto-testnet.mjs';
@@ -44,14 +43,47 @@ test('network failures do not masquerade as unfunded state', async () => {
   assert.equal(result.status,'RPC_UNAVAILABLE');
 });
 
-// Dedicated public Testnet-only key is deliberately committed for zero-setup CI.
-// Ensure the signer key matches the advertised faucet wallet without logging it.
-test('hardcoded Testnet key matches configured secp256k1 public identity', () => {
+// The receiving address is public, but a signing key must NEVER be committed.
+// Reconstruct the canonical CKB full-address encoding from the configured
+// standard secp256k1 lock script using Bech32m (CKB address payload type 0x00).
+test('configured faucet address is a valid Bech32m encoding of public lock script', () => {
   const config = JSON.parse(readFileSync(new URL('../config/testnet-wallet.json', import.meta.url), 'utf8'));
+  const CHARS = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+  const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+  const polymod = (values) => {
+    let chk = 1;
+    for (const v of values) {
+      const top = chk >>> 25;
+      chk = ((chk & 0x1ffffff) << 5) ^ v;
+      for (let i = 0; i < 5; i++) if (top & (1 << i)) chk ^= GEN[i];
+    }
+    return chk >>> 0;
+  };
+  const convertBits = (bytes) => {
+    let acc = 0, bits = 0; const result = [];
+    for (const x of bytes) {
+      acc = ((acc << 8) | x) & 0xffff;
+      bits += 8;
+      while (bits >= 5) { bits -= 5; result.push((acc >>> bits) & 31); }
+    }
+    if (bits) result.push((acc << (5 - bits)) & 31);
+    return result;
+  };
+  const expandHrp = (hrp) => [...hrp].map(c => c.charCodeAt(0) >>> 5).concat([0], [...hrp].map(c => c.charCodeAt(0) & 31));
   assert.equal(config.network, 'CKB Pudge Testnet');
-  assert.match(config.address, /^ckt1/);
-  assert.match(config.privateKey, /^0x[0-9a-f]{64}$/i);
-  const signer = createECDH('secp256k1');
-  signer.setPrivateKey(Buffer.from(config.privateKey.slice(2), 'hex'));
-  assert.equal(`0x${signer.getPublicKey('hex', 'compressed')}`, config.publicKeyCompressed);
+  assert.equal(Object.hasOwn(config, 'privateKey'), false, 'Never commit Testnet private keys');
+  assert.match(config.publicKeyCompressed, /^0x0[23][0-9a-f]{64}$/i);
+  assert.match(config.lockScript.args, /^0x[0-9a-f]{40}$/i);
+  assert.equal(config.lockScript.hash_type, 'type');
+  assert.equal(config.lockScript.code_hash, '0x9bd7e06f3ecf4be0f2fcd2188b23f1b9fcc88e5d4b65a8637b17723bbda3cce8');
+  const raw = Buffer.concat([
+    Buffer.from([0]),
+    Buffer.from(config.lockScript.code_hash.slice(2), 'hex'),
+    Buffer.from([1]),
+    Buffer.from(config.lockScript.args.slice(2), 'hex'),
+  ]);
+  const words = convertBits(raw);
+  const check = polymod([...expandHrp('ckt'), ...words, 0, 0, 0, 0, 0, 0]) ^ 0x2bc830a3;
+  const suffix = Array.from({length: 6}, (_, i) => CHARS[(check >>> (5 * (5 - i))) & 31]).join('');
+  assert.equal(config.address, `ckt1${words.map(x => CHARS[x]).join('')}${suffix}`);
 });
