@@ -14,7 +14,7 @@ function collect(env, addLog = false) {
     if (addLog) writeFileSync(join(dir, 'artifacts/ci/check.log'), 'FAKE UNIT FIXTURE: sample log\n');
     const run = spawnSync(process.execPath, [script], {
       cwd: dir, encoding: 'utf8',
-      env: { ...process.env, INSTALL_OUTCOME: 'unknown', CHECK_OUTCOME: 'unknown', ...env }
+      env: { ...process.env, INSTALL_OUTCOME: 'unknown', CHECK_OUTCOME: 'unknown', FAULT_OUTCOME: 'unknown', COMPARE_OUTCOME: 'unknown', ...env }
     });
     assert.equal(run.status, 0, run.stderr);
     return JSON.parse(readFileSync(join(dir, 'artifacts/ci/manifest.json'), 'utf8'));
@@ -28,14 +28,34 @@ test('CI evidence fails closed without verified check outcomes', () => {
   assert.equal(result.liveCkbVerified, false);
 });
 test('CI evidence hashes logs and marks only explicitly successful checks as PASS', () => {
-  const result = collect({ INSTALL_OUTCOME: 'success', CHECK_OUTCOME: 'success', REPRODUCIBLE_INSTALL: 'false' }, true);
+  const result = collect({
+    INSTALL_OUTCOME: 'success',
+    CHECK_OUTCOME: 'success',
+    FAULT_OUTCOME: 'success',
+    COMPARE_OUTCOME: 'success',
+    REPRODUCIBLE_INSTALL: 'false'
+  }, true);
   assert.equal(result.result, 'PASS');
   assert.equal(result.reproducibleInstall, false);
+  assert.equal(result.checks.faultMatrix, 'success');
+  assert.equal(result.checks.alternativesComparison, 'success');
   assert.equal(result.logs.sha256, createHash('sha256').update('FAKE UNIT FIXTURE: sample log\n').digest('hex'));
   assert.equal(result.liveFiberVerified, false);
   assert.equal(result.liveCkbVerified, false);
 });
 test('one failed check must produce a FAIL report even if a log exists', () => {
-  const result = collect({ INSTALL_OUTCOME: 'success', CHECK_OUTCOME: 'failure' }, true);
+  const result = collect({ INSTALL_OUTCOME: 'success', CHECK_OUTCOME: 'failure', FAULT_OUTCOME: 'success', COMPARE_OUTCOME: 'success' }, true);
   assert.equal(result.result, 'FAIL');
+});
+
+test('missing fault matrix outcome must not produce PASS', () => {
+  const result = collect({ INSTALL_OUTCOME: 'success', CHECK_OUTCOME: 'success', COMPARE_OUTCOME: 'success' }, true);
+  assert.equal(result.result, 'FAIL');
+  assert.equal(result.checks.faultMatrix, 'unknown');
+});
+
+test('missing baseline comparison outcome must not produce PASS', () => {
+  const result = collect({ INSTALL_OUTCOME: 'success', CHECK_OUTCOME: 'success', FAULT_OUTCOME: 'success' }, true);
+  assert.equal(result.result, 'FAIL');
+  assert.equal(result.checks.alternativesComparison, 'unknown');
 });
