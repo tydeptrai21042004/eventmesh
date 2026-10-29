@@ -49,6 +49,9 @@ jobs:
           set -o pipefail
           npm run check:all 2>&1 | tee artifacts/ci/check.log
           npm run test:faults 2>&1 | tee artifacts/ci/faults.log
+          # These local comparisons do NOT use real Fiber or spend funds.
+          npm run compare:alternatives > artifacts/ci/alternatives.json
+          npm run compare:failures > artifacts/ci/reviewer-failure-matrix.json
       - name: Audit production dependencies (report separately from tests)
         continue-on-error: true
         id: audit
