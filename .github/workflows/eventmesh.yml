@@ -15,6 +15,17 @@ on:
         required: true
         type: boolean
         default: false
+      live_fiber_mode:
+        description: 'Separate real FNN + CKB job. Requires configured persistent self-hosted runner.'
+        required: true
+        type: choice
+        default: 'off'
+        options: ['off', 'preflight', 'payment-and-anchor', 'reconcile']
+      live_approval:
+        description: 'For payment-and-anchor ONLY: type RUN_ONE_TESTNET_PAYMENT_AND_ANCHOR'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -54,10 +65,23 @@ jobs:
           mkdir -p artifacts/ci
           set -o pipefail
           npm run check:all 2>&1 | tee artifacts/ci/check.log
+      - name: Detailed fault regression tests (run even when core check fails)
+        id: faults
+        if: always() && steps.install.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p artifacts/ci
+          set -o pipefail
           npm run test:faults 2>&1 | tee artifacts/ci/faults.log
-          # These local comparisons do NOT use real Fiber or spend funds.
-          npm run compare:alternatives > artifacts/ci/alternatives.json
-          npm run compare:failures > artifacts/ci/reviewer-failure-matrix.json
+      - name: Baseline comparison and reviewer failure matrix
+        id: comparison
+        if: always() && steps.install.outcome == 'success'
+        shell: bash
+        run: |
+          mkdir -p artifacts/ci
+          set -o pipefail
+          npm run compare:alternatives 2>&1 | tee artifacts/ci/alternatives.log
+          npm run compare:failures 2>&1 | tee artifacts/ci/failure-matrix.log
       - name: Audit production dependencies (report separately from tests)
         continue-on-error: true
         id: audit
@@ -70,6 +94,8 @@ jobs:
         env:
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
           CHECK_OUTCOME: ${{ steps.checks.outcome }}
+          FAULT_OUTCOME: ${{ steps.faults.outcome }}
+          COMPARE_OUTCOME: ${{ steps.comparison.outcome }}
           AUDIT_OUTCOME: ${{ steps.audit.outcome }}
         run: node scripts/ci-evidence.mjs
       - name: Upload all CI evidence
@@ -111,7 +137,7 @@ jobs:
       - uses: github/codeql-action/analyze@v4
 
   funded-testnet:
-    name: Real CKB Testnet checkpoint (synthetic payload, not live Fiber)
+    name: Legacy synthetic CKB checkpoint + RPC diagnostics (NO FIBER)
     needs: quality
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -172,11 +198,92 @@ jobs:
           }
           console.log('Recorded scope:', report.status, '— real CKB checkpoint only; Fiber not demonstrated');
           NODE
+      - name: Read-only CKB RPC/network diagnostics (DNS, chain, indexer, balance)
+        if: always()
+        env:
+          CKB_RPC_URL: ${{ vars.CKB_RPC_URL || 'https://testnet.ckbapp.dev/' }}
+          CKB_TESTNET_PRIVATE_KEY: ${{ secrets.CKB_TESTNET_PRIVATE_KEY }}
+        run: node scripts/ckb-ci-diagnostics.mjs
       - name: Upload Testnet evidence (including unfunded status)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: eventmesh-testnet-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/testnet/
+          if-no-files-found: warn
+          retention-days: 90
+
+  real-fiber-testnet:
+    name: MANUAL — real two-FNN payment + real CKB anchor
+    needs: quality
+    if: github.event_name == 'workflow_dispatch' && inputs.live_fiber_mode != 'off'
+    # Run on a dedicated PERSISTENT self-hosted machine, not ephemeral GitHub-hosted CI.
+    # Provision labels and its private 0700 journal directory before enabling this job.
+    runs-on: [self-hosted, linux, x64, eventmesh-testnet]
+    environment: fiber-testnet-live
+    timeout-minutes: 45
+    concurrency:
+      group: eventmesh-single-real-testnet-payment
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install and build checked runtime
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-fund --no-audit; else npm install --no-fund --no-audit; fi
+          npm run build:runtime
+      - name: Validate execution gate (no payment yet)
+        shell: bash
+        env:
+          MODE: ${{ inputs.live_fiber_mode }}
+          LIVE_APPROVAL: ${{ inputs.live_approval }}
+          STATE_DIR: ${{ vars.EVENTMESH_DURABLE_STATE_DIR }}
+        run: |
+          set -euo pipefail
+          echo "[EVENTMESH_GATE] selected_mode=$MODE"
+          if [[ "$MODE" == 'payment-and-anchor' && "$LIVE_APPROVAL" != 'RUN_ONE_TESTNET_PAYMENT_AND_ANCHOR' ]]; then
+            echo '::error title=Manual payment gate::Type the exact approval phrase in Run workflow.'
+            exit 1
+          fi
+          if [[ "$MODE" != 'preflight' && -z "$STATE_DIR" ]]; then
+            echo '::error title=Missing persistent journal::Configure variable EVENTMESH_DURABLE_STATE_DIR on your self-hosted runner environment.'
+            exit 1
+          fi
+          echo '[EVENTMESH_GATE] No funds spent during gate validation.'
+      - name: Real independent FNN preflight / paid proof / on-chain checkpoint
+        id: live
+        shell: bash
+        env:
+          OPERATOR_A_URL: ${{ vars.OPERATOR_A_URL }}
+          OPERATOR_B_URL: ${{ vars.OPERATOR_B_URL }}
+          OPERATOR_A_TOKEN: ${{ secrets.OPERATOR_A_TOKEN }}
+          OPERATOR_B_TOKEN: ${{ secrets.OPERATOR_B_TOKEN }}
+          EVENTMESH_DURABLE_STATE_DIR: ${{ vars.EVENTMESH_DURABLE_STATE_DIR }}
+          EVENTMESH_LIVE_APPROVAL: ${{ inputs.live_approval }}
+          EVENTMESH_TESTNET_NETWORK_CONFIRM: TESTNET_ONLY
+          EVENTMESH_ALLOW_FIBER_PAYMENT: YES_ONE_TESTNET_PAYMENT
+          EVENTMESH_PAYMENT_SHANNONS: ${{ vars.EVENTMESH_PAYMENT_SHANNONS || '100000000' }}
+          EVENTMESH_MAX_PAYMENT_SHANNONS: ${{ vars.EVENTMESH_MAX_PAYMENT_SHANNONS || '100000000' }}
+          EVENTMESH_CKB_RECONCILE_POLLS: ${{ vars.EVENTMESH_CKB_RECONCILE_POLLS || '6' }}
+          EVENTMESH_VERBOSE_DIAGNOSTICS: 'true'
+          SELECTED_MODE: ${{ inputs.live_fiber_mode }}
+        run: |
+          set -euo pipefail
+          case "$SELECTED_MODE" in
+            payment-and-anchor) MODE=run ;;
+            preflight|reconcile) MODE="$SELECTED_MODE" ;;
+            *) echo '::error::Unknown live mode'; exit 2 ;;
+          esac
+          node scripts/github-live-fiber.mjs "$MODE"
+      - name: Upload real payment/CKB evidence and diagnostic status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eventmesh-real-fiber-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/real-fiber-testnet/
           if-no-files-found: warn
           retention-days: 90
