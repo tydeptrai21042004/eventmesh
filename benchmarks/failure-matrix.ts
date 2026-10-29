@@ -151,7 +151,7 @@ export async function runFailureMatrix() {
         'No two live Fiber nodes or genuine payment were used.', 'The three designs have different trust models.']
     };
   } finally {
-    await Promise.allSettled([a?.app.close(), b?.app.close()].filter((x): x is Promise<void> => !!x));
+    await Promise.allSettled([a?.app.close(), b?.app.close()]);
     rmSync(root, { force: true, recursive: true });
   }
 }
