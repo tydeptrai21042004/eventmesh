@@ -3,6 +3,7 @@ import {
   acceptedFiberPaymentClaims,
   buildAnchorDataHex,
   canonical,
+  finalStateHashFrom,
   deriveGenericBilateralFinalState,
   GENERIC_BILATERAL_PROFILE,
   CLOSE_COMMITMENT_VERSION,
@@ -122,12 +123,21 @@ if (signedProfile) {
       for (const error of appResult.errors) console.log(`       ${error}`);
       failed = true;
       assurance.applicationProfile = "FAILED";
-    } else if (transcript.close?.finalState !== undefined && canonical(transcript.close.finalState) !== canonical(appResult.finalState)) {
+    } else if (profileMatches(PAID_SERVICE_V2_PROFILE) && transcript.close && transcript.close.finalState === undefined) {
+      // A v2 verifier must not describe unprovided application state as verified.
+      // Signed-hash-only historical closes remain valid at the core layer.
       assurance.applicationProfile = "FAILED";
-      console.log("[FAIL] close finalState differs from signed-profile deterministic derivation");
+      console.log("[FAIL] strict paid-service close must disclose verifiable finalState");
+      failed = true;
+    } else if (transcript.close?.finalState !== undefined && (
+      canonical(transcript.close.finalState) !== canonical(appResult.finalState)
+      || finalStateHashFrom(appResult.finalState).toLowerCase() !== transcript.close.close.finalStateHash.toLowerCase()
+    )) {
+      assurance.applicationProfile = "FAILED";
+      console.log("[FAIL] signed-profile final state does not match the close commitment");
       failed = true;
     } else {
-      console.log("[PASS] signed paid-service profile and deterministic final state");
+      console.log("[PASS] signed paid-service profile semantics" + (transcript.close ? " and committed final state" : " (no close supplied)"));
       assurance.applicationProfile = "VERIFIED";
     }
   } else if (profileMatches(GENERIC_BILATERAL_PROFILE)) {

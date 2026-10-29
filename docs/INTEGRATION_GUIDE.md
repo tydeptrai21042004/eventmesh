@@ -2,6 +2,41 @@
 
 EventMesh should be integrated as a **reconciliation boundary**, not as an application runtime. The application remains responsible for deciding whether an action is valid; EventMesh records the exact event that both operators accepted and makes the resulting evidence independently verifiable.
 
+## 0. Prefer a simple signed receipt for one-shot work
+
+For a single paid computation/delivery result, first test whether a
+provider-signed receipt and consumer countersignature are enough. The new
+`@eventmesh/adapter-sdk` receipt API does **not** require the full EventMesh
+operator service:
+
+```ts
+import {
+  createProviderReceipt, acknowledgeApplicationReceipt, verifyApplicationReceipt
+} from "@eventmesh/adapter-sdk";
+
+// Receipt body contains sessionId, requestId, serviceHash, resultHash,
+// provider/consumer compressed public keys and a validity interval.
+// A paymentHash/purposeHash may be included as a REFERENCE, not Paid proof.
+const providerProof = createProviderReceipt(receiptBody, providerPrivateKey);
+const agreedProof = acknowledgeApplicationReceipt(
+  providerProof, consumerPrivateKey, "ACCEPT", acknowledgedAt
+);
+const assurance = verifyApplicationReceipt(agreedProof, {
+  requireAcceptance: true, expectedProvider: providerPublicKey,
+  expectedConsumer: consumerPublicKey
+});
+```
+
+`verifyApplicationReceipt` validates signatures only; independent receiver-FNN
+querying remains required for payment verification. External identity-key
+pinning and application idempotency are also the integrator's responsibility.
+If receipts suffice, do not deploy the generic reconciliation protocol.
+
+For an actual Fiber-paid EventMesh transcript, choose the strict
+`applicationProfile: "paid-service"` or `"paid-service-v2"`. The older
+`"paid-service-v1"` is retained only for backwards compatibility. See
+`docs/REVIEW_RESPONSE_IMPLEMENTATION.md` for comparison and limitations.
+
 ## 1. Use EventMesh only when the boundary is real
 
 A useful integration normally has all of these properties:

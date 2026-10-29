@@ -363,7 +363,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   function requestedProfile(name?: string) {
     if (!name || name === "generic-bilateral-v1") return GENERIC_BILATERAL_PROFILE;
     if (name === "paid-service-v1") return PAID_SERVICE_PROFILE;
-    if (name === "paid-service-v2") return PAID_SERVICE_V2_PROFILE;
+    if (name === "paid-service-v2" || name === "paid-service") return PAID_SERVICE_V2_PROFILE;
     throw new Error("APPLICATION_PROFILE_UNSUPPORTED");
   }
 
@@ -880,7 +880,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
       peerUrl: z.string().url().optional(),
       expiresInSeconds: z.number().int().positive().max(86400).optional(),
       maxEvents: z.number().int().positive().max(10000).optional(),
-      applicationProfile: z.enum(["generic-bilateral-v1", "paid-service-v1", "paid-service-v2"]).optional(),
+      applicationProfile: z.enum(["generic-bilateral-v1", "paid-service", "paid-service-v1", "paid-service-v2"]).optional(),
       chainContext: ChainContextSchema.optional()
     }).parse(req.body ?? {});
     const rawPeerUrl = body.peerUrl ?? options.defaultPeerUrl;

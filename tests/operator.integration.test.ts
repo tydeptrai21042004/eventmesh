@@ -265,6 +265,14 @@ describe("reviewer evidence summary", () => {
     });
     expect(summary.ckb.anchorStatus).toBe("NONE");
   });
+  it("uses strict v2 for the new paid-service alias without changing explicit v1", async () => {
+    const { a } = await pair();
+    const preferred = await createSession(a, { applicationProfile: "paid-service" });
+    expect(preferred.session.applicationProfile?.version).toBe("2.0.0");
+    const legacy = await createSession(a, { applicationProfile: "paid-service-v1" });
+    expect(legacy.session.applicationProfile?.version).toBe("1.0.0");
+  });
+
   it("advertises strict v2 and prevents paid-service close without payment", async () => {
     const { a, b } = await pair();
     const advertised = await a.app.inject({ method: "GET", url: "/identity" });

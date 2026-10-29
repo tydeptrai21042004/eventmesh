@@ -38,3 +38,12 @@ export function validateTranscriptWithAdapter<TState>(
 }
 
 export { paidServiceReferenceAdapter, PAID_SERVICE_EVENT_TYPES, PAID_SERVICE_PROFILE, PAID_SERVICE_V2_PROFILE, paidServiceStrictAdapter } from "./paid-service.js";
+
+// Optional lightweight evidence format: no transcript/operator service required.
+export {
+  ApplicationReceiptSchema, ProviderSignedReceiptSchema, ReceiptAcknowledgementSchema, CountersignedReceiptSchema,
+  applicationReceiptHash, createProviderReceipt, acknowledgeApplicationReceipt, verifyApplicationReceipt
+} from "./receipt.js";
+export type {
+  ApplicationReceipt, ProviderSignedReceipt, ReceiptAcknowledgement, CountersignedReceipt, ReceiptVerification
+} from "./receipt.js";
