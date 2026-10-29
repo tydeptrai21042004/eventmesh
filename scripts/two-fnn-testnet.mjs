@@ -140,6 +140,9 @@ export async function runTwoFnn({ env = process.env, args = process.argv.slice(2
   if (!onlyPreflight && !executePayment) throw new Error('RUN_REQUIRES_ALLOW_PAYMENT');
   validateApproval({ executePayment, env, amount });
   const prepared = await preflight(a, b, tokens, transport);
+  if (env.EVENTMESH_VERBOSE_DIAGNOSTICS === 'true') {
+    console.log('[FNN_FLOW] PREFLIGHT_IDENTITIES_OK', JSON.stringify({ operators: prepared.operators, fnnPubkeys: prepared.fnnPubkeys, networkIndependentlyVerified: false }));
+  }
   if (onlyPreflight) return { status: 'PREFLIGHT_ONLY', ...prepared, warning: 'No payment or session was created. Verify each FNN is on Pudge Testnet out of band.' };
 
   const path = resolve(env.EVENTMESH_RUN_STATE ?? 'artifacts/reviewer-two-fnn/state.json');
@@ -147,7 +150,12 @@ export async function runTwoFnn({ env = process.env, args = process.argv.slice(2
   if (state.version !== 1 || state.amount !== amount || state.service !== service || state.currency !== 'Fibt' || !STEP.includes(state.step)) {
     throw new Error('INCOMPATIBLE_EXISTING_JOURNAL_REFUSING_NEW_PAYMENT');
   }
-  const save = (step, fields = {}) => { setStep(state, step); remember(state, path, fields); };
+  const save = (step, fields = {}) => {
+    setStep(state, step); remember(state, path, fields);
+    if (env.EVENTMESH_VERBOSE_DIAGNOSTICS === 'true') {
+      console.log('[FNN_FLOW] JOURNAL_SAVED', JSON.stringify({ step: state.step, sessionId: state.sessionId ?? null, paymentSendAttempts: state.paymentSendAttempts }));
+    }
+  };
   if (state.operatorIdentityPin) {
     if (JSON.stringify(state.operatorIdentityPin.operators) !== JSON.stringify(prepared.operators)
       || JSON.stringify(state.operatorIdentityPin.fnnPubkeys) !== JSON.stringify(prepared.fnnPubkeys)

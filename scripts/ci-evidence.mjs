@@ -15,7 +15,9 @@ const hash = existsSync(path)
   : null;
 const install = process.env.INSTALL_OUTCOME || 'unknown';
 const verify = process.env.CHECK_OUTCOME || 'unknown';
-const success = install === 'success' && verify === 'success';
+const faults = process.env.FAULT_OUTCOME || 'unknown';
+const comparison = process.env.COMPARE_OUTCOME || 'unknown';
+const success = install === 'success' && verify === 'success' && faults === 'success' && comparison === 'success';
 const lock = resolve('package-lock.json');
 const lockSha256 = existsSync(lock) ? createHash('sha256').update(readFileSync(lock)).digest('hex') : null;
 const version = (executable, args) => {
@@ -24,9 +26,9 @@ const version = (executable, args) => {
 };
 const manifest = {
   schema: 'eventmesh-ci-evidence-v1',
-  scope: 'BUILD_TYPECHECK_VITEST_NODE_REGRESSIONS_DEMO_ONLY',
+  scope: 'BUILD_TYPECHECK_VITEST_FAULT_COMPARISON_DEMO_ONLY',
   result: success ? 'PASS' : 'FAIL',
-  checks: { install, npmRunCheckAll: verify },
+  checks: { install, npmRunCheckAll: verify, faultMatrix: faults, alternativesComparison: comparison },
   reproducibleInstall: process.env.REPRODUCIBLE_INSTALL === 'true',
   dependencyLockSha256: lockSha256,
   repository: process.env.GITHUB_REPOSITORY || null,
@@ -48,5 +50,5 @@ console.log(`CI evidence manifest: ${manifest.result} (${manifest.scope})`);
 if (process.env.GITHUB_STEP_SUMMARY) {
   const { appendFileSync } = await import('node:fs');
   appendFileSync(process.env.GITHUB_STEP_SUMMARY,
-    `### EventMesh CI\n\nOutcome: **${manifest.result}**  \nCommit: \`${manifest.commitSha || 'unavailable'}\`  \nLog SHA-256: \`${hash || 'no log'}\`\n\n**Scope:** compile, typecheck, Vitest, Node regression tests and demo build. No Fiber/CKB live proof.\n`);
+    `### EventMesh CI\n\nOutcome: **${manifest.result}**  \nCommit: \`${manifest.commitSha || 'unavailable'}\`  \nLog SHA-256: \`${hash || 'no log'}\`\n\n**Scope:** compile, typecheck, Vitest, fault regression, comparison, Node regression tests and demo build. No Fiber/CKB live proof.\n`);
 }
