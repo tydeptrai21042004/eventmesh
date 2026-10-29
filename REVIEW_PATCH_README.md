@@ -32,3 +32,19 @@ limitations, alternatives, and the required real-FNN validation milestone.
 are unchanged. The opt-in `applicationProfile: "paid-service"` maps to the
 existing strict v2 rules. No CKB/Fiber mainnet transaction is created by the
 new receipt demo or comparison suite.
+
+
+## Reviewer follow-up: failure matrix and real two-FNN Testnet path
+
+See `docs/CKBUILDERS_FIBER_VALIDATION.md` for the exact distinction between
+local fault injection and a real Testnet payment. New commands:
+
+```sh
+npm run compare:failures
+npm run testnet:two-fnn -- --preflight
+```
+
+Payment is OFF by default and additionally requires both `--run --allow-payment`
+and two explicit Testnet/one-payment environment confirmations. The journal
+fails closed after an ambiguous payment send and NEVER automatically resends.
+No real FNN payment was made in preparing this patch.

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   CkbScriptSchema,
   FiberPaymentClaimSchema,
@@ -80,6 +81,11 @@ export class FiberRpcClient {
     return body.result;
   }
 
+  /** Public FNN node metadata used to prove that A and B have distinct configured peers. */
+  getNodeInfo() {
+    return this.call<any>("node_info", []);
+  }
+
   async newInvoice(input: {
     amount: string;
     currency?: "Fibb" | "Fibt" | "Fibd";
@@ -110,7 +116,12 @@ export class FiberRpcClient {
       input.settlesEventHash ? `eventmesh-settles:${input.settlesEventHash.toLowerCase()}` : undefined,
       effectivePurposeHash ? `eventmesh-purpose:${effectivePurposeHash.toLowerCase()}` : undefined
     ].filter(Boolean).join(" | ");
+    // FNN requires a unique payment preimage. It remains inside the receiver's node; never return it in an application artifact.
+    const paymentPreimage = `0x${randomBytes(32).toString("hex")}`;
     const result = await this.call<any>("new_invoice", [{
+      payment_preimage: paymentPreimage,
+      hash_algorithm: "sha256",
+      final_cltv: "0x28",
       amount: quantity(input.amount),
       currency: input.currency ?? "Fibt",
       description,

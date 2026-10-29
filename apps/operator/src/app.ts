@@ -1406,6 +1406,14 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
     return options.fiber.sendPayment(invoice);
   };
 
+  const fiberNodeInfo: Handler = async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    if (!options.fiber) return reply.code(503).send({ error: "FIBER_DISABLED" });
+    const info = await options.fiber.getNodeInfo();
+    // Do not leak configuration or financial details through the operator.
+    return { pubkey: info.pubkey ?? info.node_id ?? null, version: info.version ?? null };
+  };
+
   const getPayment: Handler = async (req, reply) => {
     if (!requireAdmin(req, reply)) return;
     if (!options.fiber) return reply.code(503).send({ error: "FIBER_DISABLED" });
@@ -1435,6 +1443,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.post("/admin/sessions/:id/anchor", serialized(createAnchor));
   app.post("/admin/sessions/:id/anchor/reconcile", serialized(reconcileAnchorHandler));
   app.post("/admin/sessions/:id/anchor/retry-peer", serialized(retryAnchorPeer));
+  app.get("/admin/fiber/node-info", fiberNodeInfo);
   app.post("/admin/fiber/new-invoice", newInvoice);
   app.post("/admin/fiber/send-payment", sendPayment);
   app.get("/admin/fiber/payments/:hash", getPayment);
@@ -1466,6 +1475,7 @@ export async function buildOperatorApp(options: OperatorAppOptions): Promise<{
   app.post("/sessions/:id/anchor/receive", serialized(receiveAnchor));
   app.post("/sessions/:id/anchor/reconcile", serialized(reconcileAnchorHandler));
   app.post("/sessions/:id/anchor/retry-peer", serialized(retryAnchorPeer));
+  app.get("/fiber/node-info", fiberNodeInfo);
   app.post("/fiber/new-invoice", newInvoice);
   app.post("/fiber/send-payment", sendPayment);
   app.get("/fiber/payments/:hash", getPayment);

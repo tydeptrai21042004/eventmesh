@@ -18,6 +18,8 @@
     "dev:b": "OPERATOR_NAME=operator-b PORT=4002 SELF_URL=http://localhost:4002 DEFAULT_PEER_URL=http://localhost:4001 DATA_DIR=.data/operator-b tsx apps/operator/src/index.ts",
     "dev:demo": "npm --workspace @eventmesh/demo run dev",
     "verify": "tsx apps/verifier/src/index.ts",
+    "compare:failures": "npm run build:runtime && tsx benchmarks/failure-matrix.ts",
+    "testnet:two-fnn": "npm run build:runtime && node scripts/two-fnn-testnet.mjs",
     "compare:alternatives": "npm run build:runtime && tsx benchmarks/compare-alternatives.ts",
     "demo:receipt": "npm run build:runtime && tsx scripts/demo-receipt.ts",
     "verify:receipt": "npm run build:runtime && tsx scripts/verify-receipt.ts",
