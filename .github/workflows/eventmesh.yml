@@ -9,6 +9,12 @@ on:
     # Runs roughly every 6 hours to detect faucet funding and follow up on pending TX.
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      broadcast_synthetic_anchor:
+        description: 'Opt in to ONE synthetic CKB Testnet checkpoint (NOT a real Fiber payment)'
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -128,12 +134,20 @@ jobs:
         run: |
           if [ -f package-lock.json ]; then npm ci --no-fund --no-audit; else npm install --no-fund --no-audit; fi
           npm run build:runtime
-      # This uses a deliberately public TESTNET-ONLY key from config/testnet-wallet.json.
-      - name: Auto-check funding and submit at most one checkpoint
+      # Probe automatically; broadcast synthetic test data ONLY after manual opt-in.
+      - name: Check wallet and optionally submit one explicitly approved synthetic checkpoint
         id: testnet
         env:
           CKB_RPC_URL: ${{ vars.CKB_RPC_URL || 'https://testnet.ckbapp.dev/' }}
-        run: node scripts/auto-testnet.mjs run
+          CKB_TESTNET_PRIVATE_KEY: ${{ secrets.CKB_TESTNET_PRIVATE_KEY }}
+          EVENTMESH_SYNTHETIC_BROADCAST_APPROVED: ${{ github.event_name == 'workflow_dispatch' && inputs.broadcast_synthetic_anchor || false }}
+        shell: bash
+        run: |
+          if [[ "$EVENTMESH_SYNTHETIC_BROADCAST_APPROVED" == "true" ]]; then
+            node scripts/auto-testnet.mjs run
+          else
+            node scripts/auto-testnet.mjs probe
+          fi
       - name: Save transaction identity after any attempted broadcast
         if: always() && steps.restore.outputs.cache-hit != 'true' && steps.testnet.outputs.state_written == 'true'
         uses: actions/cache/save@v4
